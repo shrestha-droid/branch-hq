@@ -1,11 +1,18 @@
 import * as fs from 'fs/promises'
 import * as path from 'path'
-import { saveCodeChunk } from './vectorStore'
+import { saveCodeChunk, deleteChunksForFile, getAllIndexedFilePaths } from './vectorStore'
 import * as crypto from 'crypto'
 import { parse as babelParse } from '@babel/parser'
 
 const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'out'])
 const ALLOWED_EXT = new Set(['.ts', '.tsx', '.js', '.jsx', '.json', '.css'])
+// NEW: .json was allowed for things like tsconfig.json, but that also let
+// package-lock.json (and friends) through -- often thousands of lines with
+// near-zero semantic value for code retrieval, each chunked 50 lines at a
+// time and each chunk costing a real embedding API call. Excluded by exact
+// filename rather than dropping .json entirely, since tsconfig.json etc.
+// are still worth indexing.
+const IGNORE_FILES = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'])
 
 // 1. Recursive File Scanner
 export async function getProjectFiles(dir: string): Promise<string[]> {
@@ -14,6 +21,7 @@ export async function getProjectFiles(dir: string): Promise<string[]> {
 
   for (const file of list) {
     if (IGNORE_DIRS.has(file.name)) continue
+    if (IGNORE_FILES.has(file.name)) continue
 
     const fullPath = path.join(dir, file.name)
     if (file.isDirectory()) {
@@ -66,7 +74,7 @@ function extractASTChunks(code: string, relativePath: string): string[] {
       })
 
       for (const node of ast.program.body) {
-        // FIXED: Check strictly for 'number' to satisfy TS and avoid passing null to slice()
+        // Strict 'number' check satisfies TS and avoids passing null to slice()
         if (typeof node.start === 'number' && typeof node.end === 'number') {
           const rawBlock = code.slice(node.start, node.end).trim()
           // Only index meaningful blocks (ignoring trivial one-liners)
@@ -101,6 +109,12 @@ export async function indexFile(filePath: string, projectRoot: string) {
   const relativePath = path.relative(projectRoot, filePath)
   const chunks = extractASTChunks(content, relativePath)
 
+  // NEW: clear this file's previous chunks before writing its new ones.
+  // Handles the "file shrank" case that INSERT OR REPLACE alone can't --
+  // if this file previously produced 5 chunks and now produces 3, chunks
+  // 3 and 4 from the old version would otherwise never get overwritten.
+  deleteChunksForFile(relativePath)
+
   for (let i = 0; i < chunks.length; i++) {
     const chunkText = chunks[i]
     const vector = await generateEmbedding(chunkText)
@@ -111,14 +125,42 @@ export async function indexFile(filePath: string, projectRoot: string) {
 }
 
 // 5. Index Entire Project Workspace
-export async function indexWorkspace(projectRoot: string): Promise<number> {
+export async function indexWorkspace(projectRoot: string): Promise<{ indexed: number; failed: string[]; pruned: number }> {
   const files = await getProjectFiles(projectRoot)
-  let count = 0
+  const currentRelativePaths = new Set(files.map(f => path.relative(projectRoot, f)))
 
-  for (const file of files) {
-    await indexFile(file, projectRoot)
-    count++
+  // NEW: prune chunks for files that were indexed before but no longer
+  // exist on disk. Per-file delete-then-insert in indexFile() only fires
+  // for files that still exist and get re-indexed -- a deleted file is
+  // never visited again, so its old chunks would sit in the table forever
+  // without this pass.
+  let pruned = 0
+  for (const oldPath of getAllIndexedFilePaths()) {
+    if (!currentRelativePaths.has(oldPath)) {
+      deleteChunksForFile(oldPath)
+      pruned++
+    }
   }
 
-  return count
+  let indexed = 0
+  const failed: string[] = []
+
+  for (const file of files) {
+    // NEW: isolated per-file. Previously one failed embedding call (rate
+    // limit, transient network error, anything) threw out of indexFile()
+    // uncaught, which rejected the whole indexWorkspace() call -- files
+    // already processed stayed indexed (SQLite writes happen per chunk,
+    // not in one batch), but every file after the failure was silently
+    // never attempted, with no signal that the run stopped short.
+    try {
+      await indexFile(file, projectRoot)
+      indexed++
+    } catch (err: any) {
+      const relativePath = path.relative(projectRoot, file)
+      failed.push(relativePath)
+      console.error(`[indexer] Failed to index ${relativePath}:`, err.message || err)
+    }
+  }
+
+  return { indexed, failed, pruned }
 }

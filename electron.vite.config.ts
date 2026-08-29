@@ -16,13 +16,14 @@ export default defineConfig({
         '@renderer': resolve('src/renderer/src')
       }
     },
-    plugins: [react(), tailwindcss()],
-    // Force Vite to enable SharedArrayBuffer for WebContainers
-    server: {
-      headers: {
-        'Cross-Origin-Embedder-Policy': 'require-corp',
-        'Cross-Origin-Opener-Policy': 'same-origin'
-      }
-    }
+    plugins: [react(), tailwindcss()]
+    // Cross-origin isolation headers (COEP/COOP) removed from here.
+    // This block only ever applied during `npm run dev` -- it's a no-op in
+    // a packaged build, since there's no Vite dev server at that point.
+    // index.ts's `onHeadersReceived` handler runs in both dev and packaged
+    // builds and was silently overwriting this file's `require-corp` with
+    // `credentialless` anyway (whichever handler runs last on the actual
+    // network response wins). That's now the single source of truth for
+    // cross-origin isolation -- see index.ts.
   }
 })

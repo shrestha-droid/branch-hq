@@ -1,5 +1,6 @@
 import { app, BrowserWindow, ipcMain, session } from 'electron'
 import * as path from 'path'
+import * as fs from 'fs/promises'
 import * as dotenv from 'dotenv'
 import { parse as babelParse } from '@babel/parser'
 import {
@@ -11,6 +12,8 @@ import {
   addMessage,
   ConversationMode
 } from './conversationStore'
+import { searchRelevantCode } from './vectorStore'
+import { generateEmbedding, indexWorkspace } from './indexer'
 
 dotenv.config()
 
@@ -25,6 +28,7 @@ async function fetchFrontierAI(systemPrompt: string, userPrompt: string): Promis
   const timeoutId = setTimeout(() => controller.abort(), 40000)
 
   try {
+    // Fixed: Using proper backticks so `${model}` interpolates correctly without breaking interchangeability
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`
 
     const response = await fetch(url, {
@@ -131,14 +135,19 @@ function auditSingleFile(filename: string, rawCode: string): FileAuditResult {
   const warnings: string[] = []
   const code = stripComments(rawCode)
 
-  try {
-    babelParse(rawCode, {
-      sourceType: 'module',
-      plugins: ['typescript', 'jsx']
-    })
-  } catch (err: any) {
-    blockers.push(`PARSE ERROR: ${err.message || 'Code failed to parse.'} Rejected prior to security scan.`)
-    return { file: filename, passed: false, blockers, warnings }
+  // FIX: Only run Babel AST parsing on JavaScript/TypeScript files
+  const isJsOrTs = /\.(ts|tsx|js|jsx)$/i.test(filename)
+
+  if (isJsOrTs) {
+    try {
+      babelParse(rawCode, {
+        sourceType: 'module',
+        plugins: ['typescript', 'jsx']
+      })
+    } catch (err: any) {
+      blockers.push(`PARSE ERROR: ${err.message || 'Code failed to parse.'} Rejected prior to security scan.`)
+      return { file: filename, passed: false, blockers, warnings }
+    }
   }
 
   const secretDeclRegex = /\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(['"`])(?:(?!\2).)+\2/g
@@ -190,17 +199,26 @@ function runMechanicalAudit(extractedFiles: Record<string, string>): AuditResult
 }
 
 // 3. Robust Artifact Extractor with Path Normalization
+function normalizeFilePath(rawPath: string): string {
+  let filename = rawPath.trim()
+  if (
+    (filename.endsWith('.tsx') || filename.endsWith('.ts')) &&
+    !filename.startsWith('src/') &&
+    filename !== 'vite.config.ts'
+  ) {
+    filename = `src/${filename}`
+  }
+  return filename
+}
+
 function extractCodeBlocks(markdown: string): Record<string, string> {
   const files: Record<string, string> = {}
-  
+
   const regex = /```(?:\w+)?\s+([\w./-]+)\n([\s\S]*?)```/g
   let match: RegExpExecArray | null
 
   while ((match = regex.exec(markdown)) !== null) {
-    let filename = match[1].trim()
-    if ((filename.endsWith('.tsx') || filename.endsWith('.ts')) && !filename.includes('/') && filename !== 'vite.config.ts') {
-      filename = `src/${filename}`
-    }
+    const filename = normalizeFilePath(match[1])
     files[filename] = match[2].trim()
   }
 
@@ -208,12 +226,12 @@ function extractCodeBlocks(markdown: string): Record<string, string> {
   while ((match = genericRegex.exec(markdown)) !== null) {
     const content = match[1].trim()
     const firstLine = content.split('\n')[0].trim()
-    const commentMatch = firstLine.match(/^(?:\/\/|#|\/\*)\s*([\w./-]+)\s*\*?\/?$/)
+    
+    // Optional "File:" or "Filename:" prefix support
+    const commentMatch = firstLine.match(/^(?:\/\/|#|\/\*)\s*(?:(?:file|filename):\s*)?([\w./-]+)\s*\*?\/?$/i)
+    
     if (commentMatch) {
-      let filename = commentMatch[1].trim()
-      if ((filename.endsWith('.tsx') || filename.endsWith('.ts')) && !filename.includes('/') && filename !== 'vite.config.ts') {
-        filename = `src/${filename}`
-      }
+      const filename = normalizeFilePath(commentMatch[1])
       if (!files[filename]) {
         const cleanContent = content.split('\n').slice(1).join('\n').trim()
         files[filename] = cleanContent
@@ -225,8 +243,22 @@ function extractCodeBlocks(markdown: string): Record<string, string> {
 }
 
 // 4. Virtual Environment Scaffolder
-function injectBoilerplate(extractedFiles: Record<string, string>): Record<string, string> {
-  if (Object.keys(extractedFiles).length === 0) return extractedFiles
+function isFrontendOutput(files: Record<string, string>, agentKey?: 'jim' | 'dwight'): boolean {
+  if (agentKey) return agentKey !== 'dwight'
+  return Object.entries(files).some(([filename, content]) =>
+    filename.endsWith('.tsx') || filename.endsWith('.jsx') || /from ['"]react['"]/.test(content)
+  )
+}
+
+function findBackendEntryFile(files: Record<string, string>): string | null {
+  const listenFile = Object.entries(files).find(([, content]) => /\.listen\s*\(/.test(content))
+  if (listenFile) return listenFile[0]
+  const tsFile = Object.keys(files).find(f => f.endsWith('.ts'))
+  return tsFile ?? null
+}
+
+function injectFrontendBoilerplate(extractedFiles: Record<string, string>): Record<string, string> {
+  const hasAppComponent = Object.keys(extractedFiles).includes('src/App.tsx')
 
   return {
     ...extractedFiles,
@@ -254,13 +286,54 @@ function injectBoilerplate(extractedFiles: Record<string, string>): Record<strin
         "autoprefixer": "^10.4.17"
       }
     }, null, 2),
-    'vite.config.ts': `import { defineConfig } from 'vite'\nimport react from '@vitejs/plugin-react'\n\nexport default defineConfig({\n  plugins: [react()],\n  server: { port: 3000, strictPort: true }\n})`,
+    'vite.config.ts': `import { defineConfig } from 'vite'\nimport react from '@vitejs/plugin-react'\n\nexport default defineConfig({\n  plugins: [react()],\n  server: { port: 3000, strictPort: false }\n})`,
     'tailwind.config.js': `/** @type {import('tailwindcss').Config} */\nexport default {\n  content: [\n    "./index.html",\n    "./src/**/*.{js,ts,jsx,tsx}",\n  ],\n  theme: {\n    extend: {},\n  },\n  plugins: [],\n}`,
     'postcss.config.js': `export default {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n}`,
     'index.html': `<!DOCTYPE html>\n<html lang="en">\n  <head>\n    <meta charset="UTF-8" />\n    <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n    <title>Sandbox Preview</title>\n  </head>\n  <body>\n    <div id="root"></div>\n    <script type="module" src="/src/main.tsx"></script>\n  </body>\n</html>`,
-    'src/main.tsx': `import React from 'react'\nimport ReactDOM from 'react-dom/client'\nimport App from './App'\nimport './assets/main.css'\n\nReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(\n  <React.StrictMode>\n    <App />\n  </React.StrictMode>\n)`,
+    'src/main.tsx': hasAppComponent
+      ? `import React from 'react'\nimport ReactDOM from 'react-dom/client'\nimport App from './App'\nimport './assets/main.css'\n\nReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(\n  <React.StrictMode>\n    <App />\n  </React.StrictMode>\n)`
+      : `import './assets/main.css'\n\n// No src/App.tsx in this response -- likely a utility/non-visual file\n// (constants, types, helpers), not a renderable component. Nothing to\n// mount here; see the Code tab for what was actually generated.\nconst root = document.getElementById('root')\nif (root) {\n  root.innerHTML = '<div style="font-family: monospace; padding: 2rem; color: #888;">No root App component in this response. Check the Code tab.</div>'\n}`,
     'src/assets/main.css': `@tailwind base;\n@tailwind components;\n@tailwind utilities;\n`
   }
+}
+
+function injectBackendBoilerplate(extractedFiles: Record<string, string>): Record<string, string> {
+  const entryFile = findBackendEntryFile(extractedFiles)
+  return {
+    ...extractedFiles,
+    'package.json': JSON.stringify({
+      name: "branch-hq-preview-backend",
+      type: "module",
+      scripts: {
+        dev: entryFile
+          ? `tsx watch ${entryFile}`
+          : `echo "No runnable entry file found (no .listen() call detected in any generated file)" && exit 1`
+      },
+      dependencies: {
+        "express": "^4.19.2",
+        "cors": "^2.8.5",
+        "bcryptjs": "^2.4.3",
+        "jsonwebtoken": "^9.0.2",
+        "zod": "^3.23.8",
+        "dotenv": "^16.4.5"
+      },
+      devDependencies: {
+        "typescript": "^5.4.5",
+        "tsx": "^4.7.0",
+        "@types/express": "^4.17.21",
+        "@types/cors": "^2.8.17",
+        "@types/jsonwebtoken": "^9.0.6",
+        "@types/bcryptjs": "^2.4.6"
+      }
+    }, null, 2)
+  }
+}
+
+function injectBoilerplate(extractedFiles: Record<string, string>, agentKey?: 'jim' | 'dwight'): Record<string, string> {
+  if (Object.keys(extractedFiles).length === 0) return extractedFiles
+  return isFrontendOutput(extractedFiles, agentKey)
+    ? injectFrontendBoilerplate(extractedFiles)
+    : injectBackendBoilerplate(extractedFiles)
 }
 
 // 5. System Prompts
@@ -273,20 +346,23 @@ Format:
   "instructions": "<concise implementation instructions>"
 }`,
   JIM_FRONTEND: `You are Jim, Frontend Specialist. Write complete, functional React/TypeScript code using Tailwind CSS.
-ALWAYS declare file paths at the start of code blocks.
+ALWAYS wrap your code in standard Markdown code blocks (e.g., \`\`\`tsx ).
+ALWAYS declare file paths at the very start of the code blocks (e.g., // File: src/App.tsx).
 CRITICAL: You are ONLY allowed to use 'react', 'lucide-react', and 'canvas-confetti' as external dependencies. Do not import anything else.`,
   DWIGHT_BACKEND: `You are Dwight, Backend Specialist. Write complete, functional Node.js/TypeScript code using Express.
-ALWAYS declare file paths at the start of code blocks.`,
+ALWAYS wrap your code in standard Markdown code blocks (e.g., \`\`\`ts ).
+ALWAYS declare file paths at the very start of the code blocks (e.g., // File: src/server.ts).
+CRITICAL: You are ONLY allowed to use 'express', 'cors', 'bcryptjs', 'jsonwebtoken', 'zod', and 'dotenv' as external dependencies. Do not import anything else. In particular, never import 'bcrypt' -- use 'bcryptjs' instead, since this code runs inside a browser-based WebContainer sandbox that cannot compile native Node addons.`,
   PAM_AUDITOR_LOGIC: `You are Pam, the QA Auditor. Mechanical checks have passed.
 Review the code for logical correctness, security vulnerabilities, edge cases, and missing input validation.`
 }
 
-function auditAndStage(rawOutput: string) {
+function auditAndStage(rawOutput: string, agentKey?: 'jim' | 'dwight') {
   const extractedFiles = extractCodeBlocks(rawOutput)
   const staticAudit = runMechanicalAudit(extractedFiles)
   const stageableFiles =
     staticAudit.passed && Object.keys(extractedFiles).length > 0
-      ? injectBoilerplate(extractedFiles)
+      ? injectBoilerplate(extractedFiles, agentKey)
       : undefined
   return { extractedFiles, staticAudit, stageableFiles }
 }
@@ -316,11 +392,35 @@ typedIpc.handle('conversation:rename', async (_event: any, { id, title }: { id: 
   return { success: true }
 })
 
+typedIpc.handle('workspace:index', async (_event: any, targetPath?: string) => {
+  try {
+    const dirToIndex = targetPath || path.join(__dirname, '../../')
+    const { indexed, failed, pruned } = await indexWorkspace(dirToIndex)
+    return { success: true, indexedFiles: indexed, failedFiles: failed, prunedFiles: pruned }
+  } catch (err: any) {
+    return { success: false, error: err.message }
+  }
+})
+
 typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { conversationId: string; prompt: string }) => {
   const newMessages: any[] = []
   try {
     const userMsg = await addMessage(conversationId, 'user', prompt)
     newMessages.push(userMsg)
+
+    let projectContext = ''
+    let retrievedFiles: string[] = []
+    try {
+      const queryVector = await generateEmbedding(prompt)
+      const matches = await searchRelevantCode(queryVector, 3)
+      if (matches && matches.length > 0) {
+        retrievedFiles = matches.map((m: any) => `${m.filePath} (${m.score.toFixed(3)})`)
+        projectContext = `\n\n[RELEVANT PROJECT CONTEXT FROM MEMORY]:\n` +
+          matches.map((m: any) => `--- ${m.filePath} (Similarity: ${m.score.toFixed(3)}) ---\n${m.content}`).join('\n\n')
+      }
+    } catch {
+      // Proceed without context if retrieval fails.
+    }
 
     const managerResponse = await fetchFrontierAI(PROMPTS.MICHAEL_MANAGER, prompt)
     let delegation: { action: string; assignTo: string; instructions: string }
@@ -334,19 +434,23 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
       return { success: false, messages: [...newMessages, errMessage] }
     }
 
-    const michaelMsg = await addMessage(conversationId, 'michael', `Delegating to ${delegation.assignTo}: ${delegation.instructions}`)
+    const ragNote = retrievedFiles.length > 0
+      ? `\n\n[RAG] Retrieved context from: ${retrievedFiles.join(', ')}`
+      : `\n\n[RAG] No relevant project context retrieved.`
+    const michaelMsg = await addMessage(conversationId, 'michael', `Delegating to ${delegation.assignTo}: ${delegation.instructions}${ragNote}`)
     newMessages.push(michaelMsg)
 
-    const targetPrompt = delegation.assignTo === 'Dwight' ? PROMPTS.DWIGHT_BACKEND : PROMPTS.JIM_FRONTEND
-    const specialistOutput = await fetchFrontierAI(targetPrompt, delegation.instructions)
+    const agentKey: 'jim' | 'dwight' = delegation.assignTo === 'Dwight' ? 'dwight' : 'jim'
+    const targetPrompt = agentKey === 'dwight' ? PROMPTS.DWIGHT_BACKEND : PROMPTS.JIM_FRONTEND
+    const fullInstructions = delegation.instructions + projectContext
+    const specialistOutput = await fetchFrontierAI(targetPrompt, fullInstructions)
 
-    const { staticAudit, stageableFiles } = auditAndStage(specialistOutput)
+    const { staticAudit, stageableFiles } = auditAndStage(specialistOutput, agentKey)
     if (!staticAudit.passed) {
       const errMsg = await addMessage(conversationId, 'error', `Gate 1 Hard Blockers Enforced:\n- ${staticAudit.blockers.join('\n- ')}`)
       return { success: false, messages: [...newMessages, errMsg] }
     }
 
-    const agentKey: 'jim' | 'dwight' = delegation.assignTo === 'Dwight' ? 'dwight' : 'jim'
     const agentMsg = await addMessage(conversationId, agentKey, specialistOutput, stageableFiles)
     newMessages.push(agentMsg)
 
@@ -362,6 +466,31 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
   } catch (error: any) {
     const errMsg = await addMessage(conversationId, 'error', error.message || 'Fatal pipeline error.')
     return { success: false, messages: [...newMessages, errMsg] }
+  }
+})
+
+typedIpc.handle('fs:write', async (_event: any, { targetDirectory, files }: { targetDirectory: string; files: Record<string, string> }) => {
+  try {
+    const writtenPaths: string[] = []
+    const resolvedTarget = path.resolve(targetDirectory)
+
+    for (const [relativePath, content] of Object.entries(files)) {
+      const absolutePath = path.resolve(resolvedTarget, relativePath)
+
+      const isInsideTarget =
+        absolutePath === resolvedTarget || absolutePath.startsWith(resolvedTarget + path.sep)
+      if (!isInsideTarget) {
+        throw new Error(`Refused to write outside target directory: "${relativePath}" resolved to ${absolutePath}`)
+      }
+
+      await fs.mkdir(path.dirname(absolutePath), { recursive: true })
+      await fs.writeFile(absolutePath, content, 'utf-8')
+      writtenPaths.push(absolutePath)
+    }
+
+    return { success: true, writtenFiles: writtenPaths }
+  } catch (err: any) {
+    return { success: false, error: err.message }
   }
 })
 
