@@ -1,10 +1,8 @@
 import { useState } from 'react'
-import { useOfficeStore } from './store/officeStore'
 import ChatInterface from './components/ChatInterface'
 import SandboxPreview from './components/SandboxPreview'
-import { LayoutGrid, MessageSquare, Code2, FileCode, X, CheckCircle2, Play, HardDriveDownload, Loader2 } from 'lucide-react'
+import { LayoutGrid, Code2, FileCode, X, CheckCircle2, Play, HardDriveDownload, Loader2 } from 'lucide-react'
 
-// Same small note as ChatInterface.tsx: one place to change the accent color.
 const ACCENT = {
   text: 'text-[#c1554b]',
   bg: 'bg-[#a8443c]',
@@ -14,18 +12,17 @@ const ACCENT = {
 }
 
 export default function App() {
-  const { activeAgent, setActiveAgent } = useOfficeStore()
-  const agents = ['Michael', 'Jim', 'Dwight', 'Pam'] as const
+  // NEW: no more agent picker. Michael himself decides, per message,
+  // whether to just talk or bring in a specialist -- so there's nothing
+  // left to pick a mode for. ChatInterface's own conversation list is now
+  // the only sidebar.
   const [previewFiles, setPreviewFiles] = useState<Record<string, string> | null>(null)
   const [selectedFile, setSelectedFile] = useState<string | null>(null)
   const [viewMode, setViewMode] = useState<'code' | 'preview'>('preview')
 
-  // Phase 4: File System Sync State
   const [targetDir, setTargetDir] = useState('/Users/ShresthaPandey/branch-hq-output')
   const [isPushing, setIsPushing] = useState(false)
   const [pushStatus, setPushStatus] = useState<string | null>(null)
-  
-  // Phase 3: RAG File Scanner State
   const [isIndexing, setIsIndexing] = useState(false)
 
   const handleCodeGenerated = (files: Record<string, string>) => {
@@ -33,17 +30,16 @@ export default function App() {
       setPreviewFiles(files)
       const primary = Object.keys(files).find(f => f.includes('App.tsx')) || Object.keys(files)[0]
       if (primary) setSelectedFile(primary)
-      setViewMode('preview') // Automatically switch to the live preview when code arrives
+      setViewMode('preview')
       setPushStatus(null)
     }
   }
 
-  // Phase 3: Index Workspace Handler
   const handleIndexWorkspace = async () => {
     if (!targetDir) return
     setIsIndexing(true)
     setPushStatus('Scanning workspace...')
-    
+
     try {
       // @ts-ignore
       const res = await window.api.indexWorkspace(targetDir)
@@ -59,7 +55,6 @@ export default function App() {
     }
   }
 
-  // Phase 4: Write to Disk Handler
   const handlePushToLocal = async () => {
     if (!previewFiles || !targetDir) return
 
@@ -68,7 +63,6 @@ export default function App() {
 
     try {
       // @ts-ignore
-      // Note: Assuming your ipc renderer for fs:write is exposed as window.api.writeFiles
       const res = await window.api.writeFiles(targetDir, previewFiles)
       if (res.success) {
         setPushStatus(`Wrote ${res.writtenFiles?.length} files to disk.`)
@@ -85,46 +79,22 @@ export default function App() {
   return (
     <div className="flex h-screen w-screen bg-[#141414] text-neutral-200 overflow-hidden">
 
-      {/* Sidebar */}
-      <aside className="w-[240px] bg-[#191919] p-3 flex flex-col border-r border-white/[0.06] z-30">
-        <div className={`flex items-center gap-2 mb-6 px-3 pt-2 ${ACCENT.text}`}>
-          <LayoutGrid size={20} />
-          <h1 className="text-sm font-medium text-neutral-100">Branch HQ</h1>
-        </div>
-        <nav className="flex flex-col gap-1">
-          {agents.map((agent) => (
-            <button
-              key={agent} onClick={() => setActiveAgent(agent)}
-              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors ${
-                activeAgent === agent
-                  ? `${ACCENT.bgSoft} ${ACCENT.text}`
-                  : 'text-neutral-400 hover:bg-white/[0.04]'
-              }`}
-            >
-              <MessageSquare size={15} />
-              {agent}
-            </button>
-          ))}
-        </nav>
-      </aside>
-
-      {/* Main Chat Area */}
+      {/* Main Chat Area -- ChatInterface owns its own conversation list now;
+          this is the only sidebar in the app. */}
       <main className={`flex flex-col h-full transition-all duration-300 ${previewFiles ? 'w-1/2 border-r border-white/[0.06]' : 'flex-1'}`}>
-        <ChatInterface activeAgent={activeAgent} onCodeGenerated={handleCodeGenerated} />
+        <ChatInterface onCodeGenerated={handleCodeGenerated} />
       </main>
 
       {/* Right Split-Pane */}
       {previewFiles && (
         <section className="w-1/2 h-full flex flex-col bg-[#101010]">
 
-          {/* Panel Header */}
           <div className="flex items-center justify-between px-4 py-3 bg-[#191919] border-b border-white/[0.06] shrink-0">
             <div className="flex items-center gap-2 text-sm text-neutral-300">
               <Code2 size={16} className={ACCENT.text} />
               <span>Staged (Gate 1 passed)</span>
             </div>
 
-            {/* View Mode Toggle */}
             <div className="flex bg-black/30 rounded-lg p-0.5 border border-white/[0.06]">
               <button
                 onClick={() => setViewMode('code')}
@@ -146,10 +116,8 @@ export default function App() {
             </button>
           </div>
 
-          {/* Panel Content */}
           {viewMode === 'code' ? (
             <div className="flex flex-col flex-1 overflow-hidden">
-              {/* File Tabs */}
               <div className="flex gap-1.5 px-3 py-2 bg-[#141414] border-b border-white/[0.05] overflow-x-auto shrink-0">
                 {Object.keys(previewFiles).map((filename) => (
                   <button
@@ -161,7 +129,6 @@ export default function App() {
                 ))}
               </div>
 
-              {/* Code Viewer */}
               <div className="flex-1 p-4 overflow-auto">
                 {selectedFile && previewFiles[selectedFile] && (
                   <pre className="bg-[#0a0a0a] p-4 rounded-xl border border-white/[0.06] text-xs font-mono text-neutral-300">
@@ -171,13 +138,11 @@ export default function App() {
               </div>
             </div>
           ) : (
-            /* Live Execution Sandbox */
             <div className="flex-1 overflow-hidden relative">
               <SandboxPreview files={previewFiles} />
             </div>
           )}
 
-          {/* Phase 4 & Phase 3: Universal Sync Footer */}
           <div className="p-4 bg-[#191919] border-t border-white/[0.06] flex flex-col gap-3 shrink-0">
             <div className="flex items-center justify-between gap-4">
               <div className="flex-1 flex flex-col gap-1.5">

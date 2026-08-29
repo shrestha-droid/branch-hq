@@ -3,8 +3,13 @@ import * as path from 'path'
 import { app } from 'electron'
 import { randomUUID } from 'crypto'
 
-export type ConversationMode = 'pipeline' | 'jim' | 'dwight' | 'pam'
-export type MessageRole = 'user' | 'michael' | 'jim' | 'dwight' | 'pam' | 'error'
+// Simple JSON-backed store. This is intentionally dependency-free rather
+// than reaching for SQLite -- if Phase 3's vector store already runs on
+// SQLite, this can be migrated into two tables in that same DB file later.
+// For a single-user desktop app, a write-through JSON cache is enough.
+
+export type ConversationMode = 'pipeline' | 'jim' | 'dwight' | 'pam' | 'chat'
+export type MessageRole = 'user' | 'michael' | 'jim' | 'dwight' | 'pam' | 'riley' | 'chat' | 'error'
 
 export interface Message {
   id: string
@@ -30,12 +35,10 @@ interface StoreShape {
 
 const STORE_PATH = () => path.join(app.getPath('userData'), 'branch-hq-conversations.json')
 
-let cache: StoreShape | null = function (): StoreShape {
-  return { conversations: [], messages: [] }
-}() as StoreShape
+let cache: StoreShape | null = null
 
 async function load(): Promise<StoreShape> {
-  if (cache && cache.conversations.length > 0) return cache
+  if (cache) return cache
   try {
     const raw = await fs.readFile(STORE_PATH(), 'utf-8')
     cache = JSON.parse(raw)
@@ -56,6 +59,7 @@ function defaultTitle(mode: ConversationMode): string {
     case 'jim': return 'Chat with Jim'
     case 'dwight': return 'Chat with Dwight'
     case 'pam': return 'Chat with Pam'
+    case 'chat': return 'New Chat'
   }
 }
 
@@ -125,6 +129,7 @@ export async function addMessage(
   const convo = store.conversations.find(c => c.id === conversationId)
   if (convo) {
     convo.updatedAt = message.createdAt
+    // Auto-title from the first user message, if the conversation still has its default title.
     const isDefaultTitle = convo.title === defaultTitle(convo.mode)
     const isFirstUserMessage =
       role === 'user' &&

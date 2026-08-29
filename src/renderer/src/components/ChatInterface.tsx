@@ -1,10 +1,10 @@
 import { useState, useRef, useEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { Send, Bot, AlertCircle, MessageSquarePlus, Trash2, Menu, X } from 'lucide-react'
+import { Send, Bot, AlertCircle, MessageSquarePlus, Trash2, Menu, X, FileCode } from 'lucide-react'
 
 interface Message {
   id?: string
-  role: 'user' | 'michael' | 'jim' | 'dwight' | 'pam' | 'error'
+  role: 'user' | 'michael' | 'jim' | 'dwight' | 'pam' | 'riley' | 'chat' | 'error'
   content: string
   files?: Record<string, string>
 }
@@ -17,7 +17,6 @@ interface Conversation {
 }
 
 interface ChatInterfaceProps {
-  activeAgent: string
   onCodeGenerated?: (files: Record<string, string>) => void
 }
 
@@ -32,7 +31,7 @@ const ACCENT = {
   border: 'border-[#a8443c]/30',
 }
 
-export default function ChatInterface({ activeAgent, onCodeGenerated }: ChatInterfaceProps) {
+export default function ChatInterface({ onCodeGenerated }: ChatInterfaceProps) {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeConvoId, setActiveConvoId] = useState<string | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
@@ -62,8 +61,11 @@ export default function ChatInterface({ activeAgent, onCodeGenerated }: ChatInte
 
   const createNewConversation = async () => {
     try {
+      // One conversation type now -- Michael himself decides per message
+      // whether to chat or build something, so there's no mode to choose
+      // when starting a new one.
       // @ts-ignore
-      const newConvo = await window.api.createConversation('pipeline', 'New Pipeline Run')
+      const newConvo = await window.api.createConversation('pipeline')
       setConversations(prev => [newConvo, ...prev])
       setActiveConvoId(newConvo.id)
       setMessages([])
@@ -122,9 +124,19 @@ export default function ChatInterface({ activeAgent, onCodeGenerated }: ChatInte
 
     setMessages(prev => [...prev, { role: 'user', content: promptText }])
 
+    // Kept only so any conversation created before this change (back when
+    // "Chat" was picked as a separate mode) still works correctly. Every
+    // new conversation is 'pipeline' now, and goes through Michael, who
+    // decides for himself whether to just talk or delegate.
+    const activeConversation = conversations.find(c => c.id === activeConvoId)
+    const isChatMode = activeConversation?.mode === 'chat'
+
     try {
-      // @ts-ignore
-      const response = await window.api.invokeAI(activeConvoId, promptText)
+      const response = isChatMode
+        // @ts-ignore
+        ? await window.api.invokeAgent(activeConvoId, 'chat', promptText)
+        // @ts-ignore
+        : await window.api.invokeAI(activeConvoId, promptText)
 
       if (response.success && response.messages) {
         setMessages(response.messages)
@@ -199,7 +211,7 @@ export default function ChatInterface({ activeAgent, onCodeGenerated }: ChatInte
               </div>
               <p className="text-lg font-medium text-neutral-200">Branch HQ</p>
               <p className="text-sm mt-2 text-neutral-500 max-w-sm text-center">
-                Give Michael a task to get started.
+                Ask anything -- chat, code, research, or a document. Just start typing.
               </p>
             </div>
           ) : (
@@ -231,22 +243,40 @@ export default function ChatInterface({ activeAgent, onCodeGenerated }: ChatInte
                         <div className={`text-xs ${ACCENT.text} mb-2 font-medium capitalize`}>
                           {msg.role}
                         </div>
-                        <ReactMarkdown
-                          components={{
-                            p: ({ node, ...props }) => <p className="mb-4 last:mb-0" {...props} />,
-                            code: ({ node, inline, ...props }: any) =>
-                              inline
-                                ? <code className="bg-white/10 px-1.5 py-0.5 rounded text-[#d9847b] font-mono text-[13px]" {...props} />
-                                : <code {...props} />,
-                            pre: ({ node, ...props }) => (
-                              <div className="my-4 rounded-xl overflow-hidden border border-white/[0.06] bg-[#0f0f0f]">
-                                <pre className="p-4 overflow-x-auto text-[13px] font-mono" {...props} />
+                        {msg.files && Object.keys(msg.files).length > 0 ? (
+                          // NEW: a finished piece of work gets a short card
+                          // pointing at the panel, instead of the whole
+                          // file being pasted into the chat a second time.
+                          <button
+                            onClick={() => msg.files && onCodeGenerated?.(msg.files)}
+                            className="w-full flex items-center gap-3 bg-black/20 hover:bg-black/30 border border-white/[0.06] rounded-xl px-4 py-3 text-left transition-colors"
+                          >
+                            <FileCode size={18} className={ACCENT.text} />
+                            <div className="flex-1">
+                              <div className="text-sm text-neutral-200 font-medium">
+                                Generated {Object.keys(msg.files).length} file{Object.keys(msg.files).length === 1 ? '' : 's'}
                               </div>
-                            )
-                          }}
-                        >
-                          {msg.content}
-                        </ReactMarkdown>
+                              <div className="text-xs text-neutral-500">View in the panel &rarr;</div>
+                            </div>
+                          </button>
+                        ) : (
+                          <ReactMarkdown
+                            components={{
+                              p: ({ node, ...props }) => <p className="mb-4 last:mb-0" {...props} />,
+                              code: ({ node, inline, ...props }: any) =>
+                                inline
+                                  ? <code className="bg-white/10 px-1.5 py-0.5 rounded text-[#d9847b] font-mono text-[13px]" {...props} />
+                                  : <code {...props} />,
+                              pre: ({ node, ...props }) => (
+                                <div className="my-4 rounded-xl overflow-hidden border border-white/[0.06] bg-[#0f0f0f]">
+                                  <pre className="p-4 overflow-x-auto text-[13px] font-mono" {...props} />
+                                </div>
+                              )
+                            }}
+                          >
+                            {msg.content}
+                          </ReactMarkdown>
+                        )}
                       </div>
                     </div>
                   )}
@@ -273,7 +303,7 @@ export default function ChatInterface({ activeAgent, onCodeGenerated }: ChatInte
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter') handleSend() }}
-              placeholder={`Message ${activeAgent}...`}
+              placeholder="Message Branch HQ..."
               disabled={isTyping}
               className="flex-1 bg-transparent border-none outline-none px-4 py-2 text-sm text-neutral-100 placeholder:text-neutral-500"
             />
