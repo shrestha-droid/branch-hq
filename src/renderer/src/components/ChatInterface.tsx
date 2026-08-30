@@ -25,6 +25,11 @@ interface GeneratedResult {
 
 interface ChatInterfaceProps {
   onCodeGenerated?: (result: GeneratedResult) => void
+  // NEW: called whenever the active conversation has nothing staged of
+  // its own -- switching to it (or starting a new one) must not leave a
+  // PREVIOUS conversation's sandbox sitting open, showing content that
+  // no longer belongs to what's on screen.
+  onClearPreview?: () => void
 }
 
 // Plain-word note: this is the only place the "brand red" lives, as one
@@ -38,7 +43,7 @@ const ACCENT = {
   border: 'border-[#a8443c]/30',
 }
 
-export default function ChatInterface({ onCodeGenerated }: ChatInterfaceProps) {
+export default function ChatInterface({ onCodeGenerated, onClearPreview }: ChatInterfaceProps) {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeConvoId, setActiveConvoId] = useState<string | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
@@ -76,6 +81,9 @@ export default function ChatInterface({ onCodeGenerated }: ChatInterfaceProps) {
       setConversations(prev => [newConvo, ...prev])
       setActiveConvoId(newConvo.id)
       setMessages([])
+      // A brand new conversation never has anything staged -- don't leave
+      // whatever was open from wherever the user just was.
+      onClearPreview?.()
     } catch (err) {
       console.error('Failed to create conversation:', err)
     }
@@ -91,9 +99,16 @@ export default function ChatInterface({ onCodeGenerated }: ChatInterfaceProps) {
         const lastMsgWithFiles = [...data.messages].reverse().find(m => m.files && Object.keys(m.files).length > 0)
         if (lastMsgWithFiles?.files && onCodeGenerated) {
           onCodeGenerated({ files: lastMsgWithFiles.files, conversationId: id })
+        } else {
+          // This conversation has nothing staged -- if a PREVIOUS
+          // conversation's sandbox is still sitting open in the panel,
+          // it needs to close now rather than keep showing content that
+          // has nothing to do with what's on screen.
+          onClearPreview?.()
         }
       } else {
         setMessages([])
+        onClearPreview?.()
       }
     } catch (err) {
       console.error('Failed to fetch conversation messages:', err)

@@ -53,6 +53,18 @@ export default function App() {
     setPreviewFiles(files)
   }
 
+  // Called whenever the active conversation has nothing of its own staged
+  // -- clears the panel entirely so it can't keep showing a PREVIOUS
+  // conversation's sandbox. Setting previewFiles to null unmounts
+  // SandboxPreview, whose own cleanup effect kills whatever process was
+  // still running for it.
+  const handleClearPreview = () => {
+    setPreviewFiles(null)
+    setSelectedFile(null)
+    setHealContext(null)
+    setPushStatus(null)
+  }
+
   const handleIndexWorkspace = async () => {
     if (!targetDir) return
     setIsIndexing(true)
@@ -100,7 +112,7 @@ export default function App() {
       {/* Main Chat Area -- ChatInterface owns its own conversation list now;
           this is the only sidebar in the app. */}
       <main className={`flex flex-col h-full transition-all duration-300 ${previewFiles ? 'w-1/2 border-r border-white/[0.06]' : 'flex-1'}`}>
-        <ChatInterface onCodeGenerated={handleCodeGenerated} />
+        <ChatInterface onCodeGenerated={handleCodeGenerated} onClearPreview={handleClearPreview} />
       </main>
 
       {/* Right Split-Pane */}

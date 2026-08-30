@@ -516,6 +516,8 @@ ALWAYS declare the file path at the very start of the code block (e.g., // File:
 ALWAYS name your script exactly src/generate.ts -- this is the only file the system will run.
 CRITICAL: You are ONLY allowed to use 'pdfkit' (for PDF files) and 'pptxgenjs' (for PowerPoint files) as external dependencies. Do not import anything else.
 CRITICAL: Your script must write its output to exactly output.pdf or output.pptx in the project root when run -- that is the file that gets saved for the user.
+CRITICAL: NEVER include your own name or role ("Riley", "Research & Documents Specialist", "Published by...", etc.) anywhere in the actual document content. The document is for the user to give to their own audience -- it must never describe itself as AI-generated or reference who/what produced it.
+CRITICAL for page numbers in PDFs: if you add page numbers, add each one incrementally as its page is created (e.g. using pdfkit's 'pageAdded' event, tracking a running count), never in a separate loop after all pages already exist -- that requires switchToPage() and is a common source of every page number landing in the same spot instead of on its own page. A simple running "Page N" without a "of TOTAL" is safer and preferred, since knowing the total in advance requires that same error-prone two-pass approach.
 IMPORTANT: You do not have live internet access. Write from your own knowledge -- never claim to have searched the web or cite sources you were not actually given. If the user needs current or live information, say so plainly rather than inventing facts.`,
   // NEW: the plain chatbot -- not part of the pipeline, no code, no Gate 1,
   // just a normal back-and-forth conversation.
@@ -535,6 +537,14 @@ const MAX_AUTO_FIX_ROUNDS = 3
 // work, the problem is probably not something worth guessing at a third
 // time automatically.
 const MAX_SELF_HEAL_ROUNDS = 2
+
+// NEW: two size caps, not compression -- the goal is sending fewer words
+// to the model, not the same words in a smaller shape (which wouldn't
+// help; the model has to read actual text either way). Both trade a
+// small amount of context depth for meaningfully faster, cheaper calls
+// as conversations and RAG matches grow.
+const MAX_CONTEXT_CHUNK_CHARS = 800
+const MICHAEL_HISTORY_WINDOW = 12
 
 // NEW: Riley's script is always named src/generate.ts by convention --
 // if he forgets to declare that path on the first line (unlike Jim and
@@ -615,6 +625,7 @@ typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName,
       const existing = await getConversation(conversationId)
       const history = (existing?.messages || [])
         .filter((m: any) => m.role === 'user' || m.role === 'chat')
+        .slice(-MICHAEL_HISTORY_WINDOW)
         .map((m: any) => ({ role: (m.role === 'chat' ? 'assistant' : 'user') as 'user' | 'assistant', content: m.content }))
 
       const response = await fetchChatCompletion(PROMPTS.GENERAL_CHAT, history)
@@ -651,8 +662,16 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
       const matches = await searchRelevantCode(queryVector, 3)
       if (matches && matches.length > 0) {
         retrievedFiles = matches.map((m: any) => `${m.filePath} (${m.score.toFixed(3)})`)
+        // NEW: cap each chunk's length before sending it. Most chunks
+        // from AST-based chunking are already reasonably sized, but an
+        // occasional large function isn't -- and every extra character
+        // here is something the model has to actually read on every
+        // single delegated request, not something that compresses away.
+        const truncate = (text: string) => text.length > MAX_CONTEXT_CHUNK_CHARS
+          ? text.slice(0, MAX_CONTEXT_CHUNK_CHARS) + '\n... (truncated)'
+          : text
         projectContext = `\n\n[RELEVANT PROJECT CONTEXT FROM MEMORY]:\n` +
-          matches.map((m: any) => `--- ${m.filePath} (Similarity: ${m.score.toFixed(3)}) ---\n${m.content}`).join('\n\n')
+          matches.map((m: any) => `--- ${m.filePath} (Similarity: ${m.score.toFixed(3)}) ---\n${truncate(m.content)}`).join('\n\n')
       }
     } catch {
       // Proceed without context if retrieval fails.
@@ -662,10 +681,15 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
     // message -- otherwise casual back-and-forth ("forget the commute
     // one, just compare the other two") wouldn't work here the way it did
     // in the old separate chat mode, since he'd have no memory of what
-    // came before.
+    // came before. Capped to the most recent turns rather than sending
+    // the entire history every time -- a long-running conversation would
+    // otherwise mean every single new message resends every message that
+    // ever preceded it, growing forever and making even a quick "delegate
+    // to Jim" decision slower every time.
     const existing = await getConversation(conversationId)
     const michaelHistory = (existing?.messages || [])
       .filter((m: any) => m.role === 'user' || m.role === 'michael')
+      .slice(-MICHAEL_HISTORY_WINDOW)
       .map((m: any) => ({ role: (m.role === 'michael' ? 'assistant' : 'user') as 'user' | 'assistant', content: m.content }))
 
     const managerResponse = await fetchChatCompletion(PROMPTS.MICHAEL_MANAGER, michaelHistory)

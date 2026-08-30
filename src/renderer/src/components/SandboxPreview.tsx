@@ -56,6 +56,12 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
   const healingRef = useRef(false)
   const justHealedRef = useRef(false)
   const hasTriggeredHealForThisRunRef = useRef(false)
+  // NEW: remembers what was actually installed last time. The generated
+  // application code changes on almost every run, but the dependency
+  // list (hardcoded by the scaffolder) almost never does -- reinstalling
+  // identical packages from scratch every single time is very likely the
+  // single biggest cost in how long a run takes to start.
+  const lastInstalledPackageJsonRef = useRef<string | null>(null)
 
   const isDocumentOutput = files['package.json']?.includes('"branch-hq-preview-docs"') ?? false
   const canSelfHeal = Boolean(conversationId && agentKey && instructions)
@@ -156,26 +162,39 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
         const tree = buildFileSystemTree(files)
         await wc.mount(tree)
 
-        setStatus('installing')
-        addLog('System: Running npm install (this takes a moment on first run)...')
-        const installProcess = await wc.spawn('npm', ['install'])
-        installProcessRef.current = installProcess
+        // NEW: only reinstall if the actual dependency list changed.
+        // Mounting doesn't touch node_modules (the tree never includes
+        // it), so a prior install genuinely survives across runs in the
+        // same WebContainer session -- this just stops paying for a
+        // reinstall of packages that are already sitting there.
+        const currentPackageJson = files['package.json'] || ''
+        const depsUnchanged = lastInstalledPackageJsonRef.current === currentPackageJson
 
-        const installLogTail: string[] = []
-        installProcess.output.pipeTo(new WritableStream({
-          write(data) {
-            if (mounted) {
-              const line = data.trim()
-              addLog(line)
-              installLogTail.push(line)
+        if (depsUnchanged) {
+          addLog('System: Dependencies unchanged since last run -- skipping npm install.')
+        } else {
+          setStatus('installing')
+          addLog('System: Running npm install (dependencies changed since last run)...')
+          const installProcess = await wc.spawn('npm', ['install'])
+          installProcessRef.current = installProcess
+
+          const installLogTail: string[] = []
+          installProcess.output.pipeTo(new WritableStream({
+            write(data) {
+              if (mounted) {
+                const line = data.trim()
+                addLog(line)
+                installLogTail.push(line)
+              }
             }
-          }
-        }))
+          }))
 
-        const installExitCode = await installProcess.exit
-        if (installExitCode !== 0) {
-          if (!mounted || currentRunId !== runIdRef.current) return
-          return attemptSelfHeal(`npm install failed:\n${installLogTail.slice(-30).join('\n')}`)
+          const installExitCode = await installProcess.exit
+          if (installExitCode !== 0) {
+            if (!mounted || currentRunId !== runIdRef.current) return
+            return attemptSelfHeal(`npm install failed:\n${installLogTail.slice(-30).join('\n')}`)
+          }
+          lastInstalledPackageJsonRef.current = currentPackageJson
         }
 
         if (!mounted || currentRunId !== runIdRef.current) return
@@ -239,26 +258,34 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
         const tree = buildFileSystemTree(files)
         await wc.mount(tree)
 
-        setStatus('installing')
-        addLog('System: Running npm install (this takes a moment on first run)...')
-        const installProcess = await wc.spawn('npm', ['install'])
-        installProcessRef.current = installProcess
+        const currentPackageJson = files['package.json'] || ''
+        const depsUnchanged = lastInstalledPackageJsonRef.current === currentPackageJson
 
-        const installLogTail: string[] = []
-        installProcess.output.pipeTo(new WritableStream({
-          write(data) {
-            if (mounted) {
-              const line = data.trim()
-              addLog(line)
-              installLogTail.push(line)
+        if (depsUnchanged) {
+          addLog('System: Dependencies unchanged since last run -- skipping npm install.')
+        } else {
+          setStatus('installing')
+          addLog('System: Running npm install (dependencies changed since last run)...')
+          const installProcess = await wc.spawn('npm', ['install'])
+          installProcessRef.current = installProcess
+
+          const installLogTail: string[] = []
+          installProcess.output.pipeTo(new WritableStream({
+            write(data) {
+              if (mounted) {
+                const line = data.trim()
+                addLog(line)
+                installLogTail.push(line)
+              }
             }
-          }
-        }))
+          }))
 
-        const installExitCode = await installProcess.exit
-        if (installExitCode !== 0) {
-          if (!mounted || currentRunId !== runIdRef.current) return
-          return attemptSelfHeal(`npm install failed:\n${installLogTail.slice(-30).join('\n')}`)
+          const installExitCode = await installProcess.exit
+          if (installExitCode !== 0) {
+            if (!mounted || currentRunId !== runIdRef.current) return
+            return attemptSelfHeal(`npm install failed:\n${installLogTail.slice(-30).join('\n')}`)
+          }
+          lastInstalledPackageJsonRef.current = currentPackageJson
         }
 
         if (!mounted || currentRunId !== runIdRef.current) return
