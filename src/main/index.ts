@@ -17,106 +17,144 @@ import { generateEmbedding, indexWorkspace } from './indexer'
 
 dotenv.config()
 
-// 1. Native Google Gemini API Wrapper
-async function fetchFrontierAI(systemPrompt: string, userPrompt: string): Promise<string> {
-  const apiKey = process.env.GEMINI_API_KEY
-  const model = process.env.GEMINI_MODEL || 'gemini-1.5-flash'
+// 1. Model Provider Abstraction
+//
+// NEW: previously every call in this file went straight to Google's
+// Gemini API, hardcoded -- meaning for a regulated customer, their real
+// project code left their building the moment they typed a message, no
+// matter what the audit trail said afterward. This layer fixes that by
+// making "the model" swap-able: everything else in the pipeline
+// (Michael, Jim, Dwight, Riley, Pam, chat, self-healing) just calls
+// fetchFrontierAI/fetchChatCompletion exactly as before -- neither of
+// those function names or call sites changed. Only what happens INSIDE
+// them changed: they now go through whichever provider is configured.
+//
+// Two providers exist today:
+//   - GeminiProvider: the existing cloud path. Cheap, easy, fine for most
+//     users -- stays the default.
+//   - OpenAICompatibleProvider: talks to anything exposing an OpenAI-shaped
+//     /chat/completions endpoint -- this covers Ollama, vLLM, LM Studio,
+//     and a customer's own private Azure OpenAI tenant, all with ONE
+//     implementation, since they all agree on the same request shape.
+//     Set MODEL_PROVIDER=local and LOCAL_MODEL_BASE_URL to use this.
+//
+// Picking a provider is one environment variable, not a code change.
 
-  if (!apiKey) throw new Error('Missing GEMINI_API_KEY in environment.')
+type ChatTurn = { role: 'user' | 'assistant'; content: string }
 
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), 40000)
+interface ModelProvider {
+  generate(systemPrompt: string, history: ChatTurn[]): Promise<string>
+}
 
-  try {
-    // Fixed: Using proper backticks so `${model}` interpolates correctly without breaking interchangeability
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`
+class GeminiProvider implements ModelProvider {
+  async generate(systemPrompt: string, history: ChatTurn[]): Promise<string> {
+    const apiKey = process.env.GEMINI_API_KEY
+    const model = process.env.GEMINI_MODEL || 'gemini-1.5-flash'
+    if (!apiKey) throw new Error('Missing GEMINI_API_KEY in environment.')
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        contents: [
-          {
-            role: 'user',
-            parts: [{ text: `${systemPrompt}\n\nUser Request: ${userPrompt}` }]
-          }
-        ],
-        generationConfig: {
-          temperature: 0.2
-        }
-      }),
-      signal: controller.signal
-    })
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 40000)
 
-    clearTimeout(timeoutId)
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`
+      const contents = history.map(m => ({
+        role: m.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: m.content }]
+      }))
 
-    if (!response.ok) {
-      const errText = await response.text()
-      throw new Error(`API Error (${response.status}): ${errText}`)
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: systemPrompt }] },
+          contents,
+          generationConfig: { temperature: 0.5 }
+        }),
+        signal: controller.signal
+      })
+
+      clearTimeout(timeoutId)
+      if (!response.ok) {
+        throw new Error(`Gemini API Error (${response.status}): ${await response.text()}`)
+      }
+      const data = await response.json()
+      return data.candidates?.[0]?.content?.parts?.[0]?.text || ''
+    } catch (err: any) {
+      clearTimeout(timeoutId)
+      if (err.name === 'AbortError') throw new Error('API Request timed out after 40 seconds.')
+      throw err
     }
-
-    const data = await response.json()
-    return data.candidates?.[0]?.content?.parts?.[0]?.text || ''
-  } catch (err: any) {
-    clearTimeout(timeoutId)
-    if (err.name === 'AbortError') {
-      throw new Error('API Request timed out after 40 seconds.')
-    }
-    throw err
   }
 }
 
-// NEW: multi-turn chat completion, for the plain chatbot mode. Sends the
-// whole conversation history as proper alternating turns (Gemini's
-// `contents` array) instead of flattening everything into one blob, and
-// keeps the system prompt in its own `systemInstruction` field rather than
-// prepended into the first user message.
-async function fetchChatCompletion(systemPrompt: string, history: { role: 'user' | 'assistant'; content: string }[]): Promise<string> {
-  const apiKey = process.env.GEMINI_API_KEY
-  const model = process.env.GEMINI_MODEL || 'gemini-1.5-flash'
+// Covers any self-hosted or private model server speaking the OpenAI
+// chat-completions shape. This is the piece that actually solves the
+// data-residency problem: point LOCAL_MODEL_BASE_URL at something running
+// on the customer's own hardware or their own private cloud account, and
+// project code never has to leave it.
+class OpenAICompatibleProvider implements ModelProvider {
+  async generate(systemPrompt: string, history: ChatTurn[]): Promise<string> {
+    const baseUrl = process.env.LOCAL_MODEL_BASE_URL // e.g. http://localhost:11434/v1 for Ollama
+    const apiKey = process.env.LOCAL_MODEL_API_KEY || 'not-needed' // most local servers ignore this
+    const model = process.env.LOCAL_MODEL_NAME || 'llama3.1'
+    if (!baseUrl) throw new Error('Missing LOCAL_MODEL_BASE_URL in environment.')
 
-  if (!apiKey) throw new Error('Missing GEMINI_API_KEY in environment.')
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 60000) // local models can be slower than a cloud API
 
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), 40000)
+    try {
+      const messages = [
+        { role: 'system', content: systemPrompt },
+        ...history.map(m => ({ role: m.role, content: m.content }))
+      ]
 
-  try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`
+      const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({ model, messages, temperature: 0.5 }),
+        signal: controller.signal
+      })
 
-    const contents = history.map(m => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content }]
-    }))
-
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: systemPrompt }] },
-        contents,
-        generationConfig: { temperature: 0.5 }
-      }),
-      signal: controller.signal
-    })
-
-    clearTimeout(timeoutId)
-
-    if (!response.ok) {
-      const errText = await response.text()
-      throw new Error(`API Error (${response.status}): ${errText}`)
+      clearTimeout(timeoutId)
+      if (!response.ok) {
+        throw new Error(`Local model API Error (${response.status}): ${await response.text()}`)
+      }
+      const data = await response.json()
+      return data.choices?.[0]?.message?.content || ''
+    } catch (err: any) {
+      clearTimeout(timeoutId)
+      if (err.name === 'AbortError') throw new Error('Local model request timed out.')
+      throw err
     }
-
-    const data = await response.json()
-    return data.candidates?.[0]?.content?.parts?.[0]?.text || ''
-  } catch (err: any) {
-    clearTimeout(timeoutId)
-    if (err.name === 'AbortError') {
-      throw new Error('API Request timed out after 40 seconds.')
-    }
-    throw err
   }
+}
+
+function getModelProvider(): ModelProvider {
+  const providerName = process.env.MODEL_PROVIDER || 'gemini'
+  switch (providerName) {
+    case 'local':
+    case 'openai-compatible':
+      return new OpenAICompatibleProvider()
+    case 'gemini':
+    default:
+      return new GeminiProvider()
+  }
+}
+
+const modelProvider = getModelProvider()
+
+// Kept as the same function names/signatures every existing call site
+// already uses -- Michael, Jim, Dwight, Riley, Pam, chat, and
+// self-healing all call these exactly as before. Only the inside changed.
+async function fetchFrontierAI(systemPrompt: string, userPrompt: string): Promise<string> {
+  return modelProvider.generate(systemPrompt, [{ role: 'user', content: userPrompt }])
+}
+
+async function fetchChatCompletion(systemPrompt: string, history: ChatTurn[]): Promise<string> {
+  return modelProvider.generate(systemPrompt, history)
 }
 
 // 2. Hardened Deterministic Security Linter (Gate 1)
@@ -490,6 +528,14 @@ IMPORTANT: You do not have live internet access. Write from your own knowledge -
 // to mention is not a reason to loop forever.
 const MAX_AUTO_FIX_ROUNDS = 3
 
+// Separate, smaller cap for self-healing. This is a different kind of
+// retry than MAX_AUTO_FIX_ROUNDS -- it only fires after code has already
+// passed Gate 1 and Pam and then failed for real when actually run.
+// Kept small on purpose: if two attempts at a real runtime fix don't
+// work, the problem is probably not something worth guessing at a third
+// time automatically.
+const MAX_SELF_HEAL_ROUNDS = 2
+
 // NEW: Riley's script is always named src/generate.ts by convention --
 // if he forgets to declare that path on the first line (unlike Jim and
 // Dwight, who have that instruction spelled out and reliably follow it),
@@ -713,10 +759,77 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
       currentInstructions = `${baseInstructions}${projectContext}\n\nYour previous attempt received this QA feedback -- address it before trying again:\n${pamReview}`
     }
 
-    return { success: true, messages: newMessages, files: stageableFiles }
+    return { success: true, messages: newMessages, files: stageableFiles, agentKey, instructions: baseInstructions }
   } catch (error: any) {
     const errMsg = await addMessage(conversationId, 'error', error.message || 'Fatal pipeline error.')
     return { success: false, messages: [...newMessages, errMsg] }
+  }
+})
+
+// NEW: self-healing. Called from the renderer AFTER code has already
+// passed Gate 1 and Pam and been staged, but then actually failed when
+// run in the sandbox -- a category of failure neither of those checks
+// can see, since neither of them executes anything.
+typedIpc.handle('heal:invoke', async (_event: any, {
+  conversationId, agentKey, previousInstructions, errorLog, attempt
+}: {
+  conversationId: string
+  agentKey: 'jim' | 'dwight' | 'riley'
+  previousInstructions: string
+  errorLog: string
+  attempt: number
+}) => {
+  const newMessages: any[] = []
+  try {
+    if (attempt > MAX_SELF_HEAL_ROUNDS) {
+      const errMsg = await addMessage(
+        conversationId,
+        'error',
+        `Self-healing gave up after ${MAX_SELF_HEAL_ROUNDS} attempts -- the code still doesn't run. This needs a manual look.`
+      )
+      return { success: false, messages: [errMsg] }
+    }
+
+    const targetPrompt =
+      agentKey === 'dwight' ? PROMPTS.DWIGHT_BACKEND :
+      agentKey === 'riley' ? PROMPTS.RILEY_DOCS :
+      PROMPTS.JIM_FRONTEND
+
+    const healingInstructions = `${previousInstructions}\n\nYour previous code passed review, but FAILED WHEN ACTUALLY RUN. Here is the real error:\n\n${errorLog}\n\nFix the specific problem causing this error. Do not change anything else.`
+
+    const specialistOutput = await fetchFrontierAI(targetPrompt, healingInstructions)
+    const { staticAudit, stageableFiles } = auditAndStage(specialistOutput, agentKey)
+
+    // A self-heal fix still has to clear Gate 1 like anything else -- a
+    // repair is not a shortcut around the same safety check everything
+    // else goes through.
+    if (!staticAudit.passed) {
+      const errMsg = await addMessage(
+        conversationId,
+        'error',
+        `Self-healing attempt ${attempt} was rejected by Gate 1:\n- ${staticAudit.blockers.join('\n- ')}`
+      )
+      return { success: false, messages: [errMsg] }
+    }
+
+    const agentMsg = await addMessage(
+      conversationId,
+      agentKey,
+      `${specialistOutput}\n\n[Self-healing attempt ${attempt} of ${MAX_SELF_HEAL_ROUNDS} -- fixing a real runtime failure]`,
+      stageableFiles
+    )
+    newMessages.push(agentMsg)
+
+    // Re-run Pam too -- a runtime fix deserves the same review any other
+    // change would get, not a pass just because it's a repair.
+    const pamReview = await fetchFrontierAI(PROMPTS.PAM_AUDITOR_LOGIC, specialistOutput)
+    const pamMsg = await addMessage(conversationId, 'pam', pamReview)
+    newMessages.push(pamMsg)
+
+    return { success: true, messages: newMessages, files: stageableFiles, agentKey, instructions: previousInstructions }
+  } catch (error: any) {
+    const errMsg = await addMessage(conversationId, 'error', error.message || 'Self-healing failed.')
+    return { success: false, messages: [errMsg] }
   }
 })
 

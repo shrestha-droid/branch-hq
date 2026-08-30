@@ -3,11 +3,18 @@ import { contextBridge, ipcRenderer } from 'electron'
 contextBridge.exposeInMainWorld('api', {
   // AI Pipeline & Agent Calls
   invokeAI: (conversationId: string, prompt: string) => ipcRenderer.invoke('ai:invoke', { conversationId, prompt }),
-  // 'chat' added -- the general chatbot mode. 'jim' | 'dwight' | 'pam'
-  // stay in the type since the preload already promised them, but the
-  // main-process handler is honest that those three aren't built yet.
   invokeAgent: (conversationId: string, agentName: 'jim' | 'dwight' | 'pam' | 'chat', prompt: string) =>
     ipcRenderer.invoke('agent:invoke', { conversationId, agentName, prompt }),
+  // NEW: self-healing. Called after code has already passed review but
+  // then actually failed when run -- feeds the real error back and asks
+  // for a fix, capped at a small number of attempts on the main-process side.
+  healPipeline: (params: {
+    conversationId: string
+    agentKey: 'jim' | 'dwight' | 'riley'
+    previousInstructions: string
+    errorLog: string
+    attempt: number
+  }) => ipcRenderer.invoke('heal:invoke', params),
 
   // Workspace & File System Ops
   indexWorkspace: (targetPath?: string) => ipcRenderer.invoke('workspace:index', targetPath),
@@ -25,8 +32,15 @@ contextBridge.exposeInMainWorld('api', {
 declare global {
   interface Window {
     api: {
-      invokeAI: (conversationId: string, prompt: string) => Promise<{ success: boolean; messages?: any[]; error?: string }>;
+      invokeAI: (conversationId: string, prompt: string) => Promise<{ success: boolean; messages?: any[]; files?: Record<string, string>; agentKey?: 'jim' | 'dwight' | 'riley'; instructions?: string; error?: string }>;
       invokeAgent: (conversationId: string, agentName: 'jim' | 'dwight' | 'pam' | 'chat', prompt: string) => Promise<{ success: boolean; messages?: any[]; error?: string }>;
+      healPipeline: (params: {
+        conversationId: string
+        agentKey: 'jim' | 'dwight' | 'riley'
+        previousInstructions: string
+        errorLog: string
+        attempt: number
+      }) => Promise<{ success: boolean; messages?: any[]; files?: Record<string, string>; agentKey?: 'jim' | 'dwight' | 'riley'; instructions?: string; error?: string }>;
       indexWorkspace: (targetPath?: string) => Promise<{ success: boolean; indexedFiles?: number; error?: string }>;
       writeFiles: (targetDirectory: string, files: Record<string, string>, humanApproverId?: string) => Promise<{ success: boolean; writtenFiles?: string[]; provenanceManifest?: any; error?: string }>;
       createConversation: (mode: string, title?: string) => Promise<any>;

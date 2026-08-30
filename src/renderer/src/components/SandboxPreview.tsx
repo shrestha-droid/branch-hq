@@ -1,13 +1,19 @@
 import { useEffect, useState, useRef } from 'react'
 import { getWebContainer, buildFileSystemTree } from '../lib/webcontainer'
-import { Loader2, TerminalSquare, Globe, FileText, Download } from 'lucide-react'
+import { Loader2, TerminalSquare, Globe, FileText, Download, Wrench } from 'lucide-react'
 
 interface SandboxPreviewProps {
   files: Record<string, string>
+  // NEW: needed for self-healing. Without all three, self-healing simply
+  // can't fire (e.g. when reopening an older result card, which doesn't
+  // carry the original instructions) -- the sandbox just behaves as it
+  // did before in that case, no auto-fix attempted.
+  conversationId?: string
+  agentKey?: 'jim' | 'dwight' | 'riley'
+  instructions?: string
+  onFilesHealed?: (files: Record<string, string>) => void
 }
 
-// Same accent convention as ChatInterface.tsx / App.tsx -- one place to
-// change the brand color later.
 const ACCENT = {
   text: 'text-[#c1554b]',
   bg: 'bg-[#a8443c]',
@@ -19,24 +25,42 @@ interface DocumentResult {
   data: Uint8Array
 }
 
-export default function SandboxPreview({ files }: SandboxPreviewProps) {
-  const [status, setStatus] = useState<'booting' | 'installing' | 'starting' | 'ready' | 'error'>('booting')
+// Mirrors MAX_SELF_HEAL_ROUNDS in index.ts -- the main process enforces
+// the real cap; this is just so the UI doesn't keep retrying past it
+// client-side either.
+const MAX_SELF_HEAL_ROUNDS = 2
+
+// Known-fatal build/runtime error signatures actually seen this session.
+// A match here means the run is not going to recover on its own -- these
+// are build-breaking, not transient warnings.
+const FATAL_ERROR_PATTERNS = [
+  /Failed to resolve import/i,
+  /No matching export/i,
+  /SyntaxError/i,
+  /Pre-transform error/i,
+  /Internal server error/i,
+]
+
+export default function SandboxPreview({ files, conversationId, agentKey, instructions, onFilesHealed }: SandboxPreviewProps) {
+  const [status, setStatus] = useState<'booting' | 'installing' | 'starting' | 'ready' | 'error' | 'healing'>('booting')
   const [logs, setLogs] = useState<string[]>([])
   const [url, setUrl] = useState<string | null>(null)
   const [documentResult, setDocumentResult] = useState<DocumentResult | null>(null)
+  const [healAttempt, setHealAttempt] = useState(0)
   const logsEndRef = useRef<HTMLDivElement>(null)
-  const runIdRef = useRef<number>(0) // Prevents race conditions on rapid regenerations
+  const runIdRef = useRef<number>(0)
 
   const devProcessRef = useRef<any>(null)
   const installProcessRef = useRef<any>(null)
   const unsubscribeServerReadyRef = useRef<(() => void) | null>(null)
+  const healingRef = useRef(false)
+  const justHealedRef = useRef(false)
+  const hasTriggeredHealForThisRunRef = useRef(false)
 
-  // NEW: same marker App.tsx uses to tell a document script apart from a
-  // real webpage/server -- injectDocumentBoilerplate always sets this
-  // exact package name.
   const isDocumentOutput = files['package.json']?.includes('"branch-hq-preview-docs"') ?? false
+  const canSelfHeal = Boolean(conversationId && agentKey && instructions)
 
-  const addLog = (msg: string) => setLogs(prev => [...prev.slice(-99), msg]) // Keep last 100 logs
+  const addLog = (msg: string) => setLogs(prev => [...prev.slice(-99), msg])
 
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" })
@@ -53,9 +77,68 @@ export default function SandboxPreview({ files }: SandboxPreviewProps) {
     installProcessRef.current = null
   }
 
+  // NEW: the actual self-heal call. Feeds the real failure text back to
+  // the same specialist that wrote this code, through the main process,
+  // and -- on success -- hands the corrected files up to App.tsx, which
+  // flows back down as a new `files` prop and re-triggers a normal run.
+  const attemptSelfHeal = async (errorContext: string) => {
+    if (!canSelfHeal) {
+      addLog('System: Cannot self-heal -- missing conversation/agent context for this result.')
+      setStatus('error')
+      return
+    }
+    if (healingRef.current || hasTriggeredHealForThisRunRef.current) return
+    if (healAttempt >= MAX_SELF_HEAL_ROUNDS) {
+      addLog(`System: Already used ${MAX_SELF_HEAL_ROUNDS} self-heal attempts -- stopping rather than guessing again.`)
+      setStatus('error')
+      return
+    }
+
+    hasTriggeredHealForThisRunRef.current = true
+    healingRef.current = true
+    const nextAttempt = healAttempt + 1
+    setHealAttempt(nextAttempt)
+    setStatus('healing')
+    addLog(`System: Detected a real failure after passing review. Attempting automatic self-heal (attempt ${nextAttempt} of ${MAX_SELF_HEAL_ROUNDS})...`)
+
+    try {
+      // @ts-ignore
+      const result = await window.api.healPipeline({
+        conversationId,
+        agentKey,
+        previousInstructions: instructions,
+        errorLog: errorContext,
+        attempt: nextAttempt
+      })
+
+      if (result.success && result.files) {
+        addLog('System: Self-healing produced a fix. Reloading with the corrected version...')
+        justHealedRef.current = true
+        onFilesHealed?.(result.files)
+      } else {
+        addLog(`System: Self-healing did not succeed: ${result.error || 'unknown error'}`)
+        setStatus('error')
+      }
+    } catch (err: any) {
+      addLog(`System: Self-healing request failed: ${err.message}`)
+      setStatus('error')
+    } finally {
+      healingRef.current = false
+    }
+  }
+
   useEffect(() => {
     let mounted = true
     const currentRunId = ++runIdRef.current
+
+    // Only reset the attempt counter for a genuinely new generation, not
+    // for the re-run that happens right after a successful heal.
+    if (justHealedRef.current) {
+      justHealedRef.current = false
+    } else {
+      setHealAttempt(0)
+    }
+    hasTriggeredHealForThisRunRef.current = false
 
     async function bootWebApp() {
       try {
@@ -78,13 +161,21 @@ export default function SandboxPreview({ files }: SandboxPreviewProps) {
         const installProcess = await wc.spawn('npm', ['install'])
         installProcessRef.current = installProcess
 
+        const installLogTail: string[] = []
         installProcess.output.pipeTo(new WritableStream({
-          write(data) { if (mounted) addLog(data.trim()) }
+          write(data) {
+            if (mounted) {
+              const line = data.trim()
+              addLog(line)
+              installLogTail.push(line)
+            }
+          }
         }))
 
         const installExitCode = await installProcess.exit
         if (installExitCode !== 0) {
-          throw new Error('npm install failed')
+          if (!mounted || currentRunId !== runIdRef.current) return
+          return attemptSelfHeal(`npm install failed:\n${installLogTail.slice(-30).join('\n')}`)
         }
 
         if (!mounted || currentRunId !== runIdRef.current) return
@@ -94,12 +185,29 @@ export default function SandboxPreview({ files }: SandboxPreviewProps) {
         const devProcess = await wc.spawn('npm', ['run', 'dev'])
         devProcessRef.current = devProcess
 
+        const runLogTail: string[] = []
         devProcess.output.pipeTo(new WritableStream({
-          write(data) { if (mounted) addLog(data.trim()) }
+          write(data) {
+            if (!mounted) return
+            const line = data.trim()
+            addLog(line)
+            runLogTail.push(line)
+
+            // NEW: watch the live output for known-fatal build errors.
+            // Vite keeps the process running even after logging one of
+            // these, so there's no exit code to check here -- pattern
+            // matching on the stream is the only signal available.
+            if (currentRunId === runIdRef.current && !hasTriggeredHealForThisRunRef.current) {
+              const isFatal = FATAL_ERROR_PATTERNS.some(pattern => pattern.test(line))
+              if (isFatal) {
+                attemptSelfHeal(`The app failed to build/run with this error:\n${runLogTail.slice(-30).join('\n')}`)
+              }
+            }
+          }
         }))
 
         const unsubscribe = wc.on('server-ready', (port: number, previewUrl: string) => {
-          if (mounted && currentRunId === runIdRef.current) {
+          if (mounted && currentRunId === runIdRef.current && !hasTriggeredHealForThisRunRef.current) {
             addLog(`System: Server ready on port ${port}`)
             setUrl(previewUrl)
             setStatus('ready')
@@ -115,9 +223,6 @@ export default function SandboxPreview({ files }: SandboxPreviewProps) {
       }
     }
 
-    // NEW: a document script has no server to wait on -- it runs once,
-    // writes a file, and exits. Waiting for a 'server-ready' event here
-    // would wait forever, which is exactly the stuck panel this replaces.
     async function runDocumentScript() {
       try {
         await teardownPrevious()
@@ -139,13 +244,21 @@ export default function SandboxPreview({ files }: SandboxPreviewProps) {
         const installProcess = await wc.spawn('npm', ['install'])
         installProcessRef.current = installProcess
 
+        const installLogTail: string[] = []
         installProcess.output.pipeTo(new WritableStream({
-          write(data) { if (mounted) addLog(data.trim()) }
+          write(data) {
+            if (mounted) {
+              const line = data.trim()
+              addLog(line)
+              installLogTail.push(line)
+            }
+          }
         }))
 
         const installExitCode = await installProcess.exit
         if (installExitCode !== 0) {
-          throw new Error('npm install failed')
+          if (!mounted || currentRunId !== runIdRef.current) return
+          return attemptSelfHeal(`npm install failed:\n${installLogTail.slice(-30).join('\n')}`)
         }
 
         if (!mounted || currentRunId !== runIdRef.current) return
@@ -155,17 +268,24 @@ export default function SandboxPreview({ files }: SandboxPreviewProps) {
         const runProcess = await wc.spawn('npm', ['run', 'dev'])
         devProcessRef.current = runProcess
 
+        const runLogTail: string[] = []
         runProcess.output.pipeTo(new WritableStream({
-          write(data) { if (mounted) addLog(data.trim()) }
+          write(data) {
+            if (mounted) {
+              const line = data.trim()
+              addLog(line)
+              runLogTail.push(line)
+            }
+          }
         }))
 
-        // The real difference from the webapp path: wait for the process
-        // to actually EXIT, not for a server event that will never fire.
+        // The document path's failure signal is clean: a non-zero exit
+        // code, unlike the web app path which has no such signal.
         const runExitCode = await runProcess.exit
         if (!mounted || currentRunId !== runIdRef.current) return
 
         if (runExitCode !== 0) {
-          throw new Error('The document script did not finish successfully -- check the log below.')
+          return attemptSelfHeal(`The document script exited with an error:\n${runLogTail.slice(-30).join('\n')}`)
         }
 
         addLog('System: Script finished. Looking for the output file...')
@@ -183,7 +303,7 @@ export default function SandboxPreview({ files }: SandboxPreviewProps) {
         }
 
         if (!found) {
-          throw new Error('The script finished, but no output.pdf or output.pptx was found in the project.')
+          return attemptSelfHeal('The script finished successfully but produced no output.pdf or output.pptx file. The script must be missing the actual save/write step.')
         }
 
         addLog(`System: Found ${found.name} (${(found.data.byteLength / 1024).toFixed(1)} KB)`)
@@ -212,19 +332,11 @@ export default function SandboxPreview({ files }: SandboxPreviewProps) {
     }
   }, [files])
 
-  // NEW: triggers a real browser download of the file pulled out of the
-  // sandbox. Blob/URL.createObjectURL are plain DOM APIs, available in
-  // Electron's renderer the same as in any browser.
   const handleDownload = () => {
     if (!documentResult) return
     const mimeType = documentResult.name.endsWith('.pdf')
       ? 'application/pdf'
       : 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-    // FIXED: documentResult.data comes back from the sandbox typed as
-    // Uint8Array<ArrayBufferLike> (which could technically be backed by a
-    // SharedArrayBuffer), but Blob's constructor wants a plain ArrayBuffer
-    // specifically. Copying the bytes into a fresh, definite ArrayBuffer
-    // sidesteps the mismatch entirely instead of fighting the types.
     const buffer = new ArrayBuffer(documentResult.data.byteLength)
     new Uint8Array(buffer).set(documentResult.data)
     const blob = new Blob([buffer], { type: mimeType })
@@ -238,30 +350,38 @@ export default function SandboxPreview({ files }: SandboxPreviewProps) {
     URL.revokeObjectURL(objectUrl)
   }
 
+  const statusLabel = () => {
+    if (status === 'healing') return `Self-Healing (attempt ${healAttempt} of ${MAX_SELF_HEAL_ROUNDS})...`
+    if (isDocumentOutput && status === 'ready') return 'Document Ready'
+    return `${status} Environment...`
+  }
+
   return (
     <div className="flex flex-col h-full bg-[#141414] border-t border-white/[0.06]">
 
-      {/* Top Status Bar */}
       <div className="flex items-center justify-between px-4 py-2 bg-[#191919] border-b border-white/[0.06] text-xs">
         <div className="flex items-center gap-2">
-          {status !== 'ready' && status !== 'error' && <Loader2 size={14} className={`animate-spin ${ACCENT.text}`} />}
+          {status === 'healing' && <Wrench size={14} className={`animate-pulse ${ACCENT.text}`} />}
+          {status !== 'ready' && status !== 'error' && status !== 'healing' && <Loader2 size={14} className={`animate-spin ${ACCENT.text}`} />}
           {status === 'ready' && <Globe size={14} className="text-emerald-400" />}
-          <span className="font-medium text-neutral-300 capitalize">
-            {isDocumentOutput && status === 'ready' ? 'Document Ready' : `${status} Environment...`}
-          </span>
+          <span className="font-medium text-neutral-300 capitalize">{statusLabel()}</span>
         </div>
         {url && (
           <a href={url} target="_blank" rel="noreferrer" className={`${ACCENT.text} hover:underline`}>
-            Open Externally ↗
+            Open Externally &#8599;
           </a>
         )}
       </div>
 
-      {/* Split View: Preview (Top) / Terminal (Bottom) */}
       <div className="flex flex-col flex-1 overflow-hidden">
 
         <div className="flex-1 bg-white relative">
-          {isDocumentOutput ? (
+          {status === 'healing' ? (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-[#101010] text-center px-8">
+              <Wrench size={32} className={`animate-pulse ${ACCENT.text}`} />
+              <p className="text-neutral-300 text-sm">Fixing a real failure automatically -- attempt {healAttempt} of {MAX_SELF_HEAL_ROUNDS}</p>
+            </div>
+          ) : isDocumentOutput ? (
             status === 'ready' && documentResult ? (
               <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-[#101010]">
                 <FileText size={40} className="text-emerald-400" />
@@ -279,7 +399,7 @@ export default function SandboxPreview({ files }: SandboxPreviewProps) {
               </div>
             ) : status === 'error' ? (
               <div className="absolute inset-0 flex items-center justify-center bg-[#101010] text-red-400 text-sm px-8 text-center">
-                Failed to generate the document -- check the log below.
+                Failed to generate the document{canSelfHeal ? ' (self-healing already tried)' : ''} -- check the log below.
               </div>
             ) : (
               <div className="absolute inset-0 flex items-center justify-center bg-[#101010] text-neutral-600 text-sm">
@@ -293,6 +413,10 @@ export default function SandboxPreview({ files }: SandboxPreviewProps) {
               title="Sandbox Preview"
               sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
             />
+          ) : status === 'error' ? (
+            <div className="absolute inset-0 flex items-center justify-center bg-[#101010] text-red-400 text-sm px-8 text-center">
+              Failed to start{canSelfHeal ? ' (self-healing already tried)' : ''} -- check the log below.
+            </div>
           ) : (
             <div className="absolute inset-0 flex items-center justify-center bg-[#101010] text-neutral-600">
               Awaiting server URL...
@@ -300,7 +424,6 @@ export default function SandboxPreview({ files }: SandboxPreviewProps) {
           )}
         </div>
 
-        {/* Terminal Logs */}
         <div className="h-48 bg-[#0f0f0f] border-t border-white/[0.06] flex flex-col">
           <div className="px-3 py-1.5 border-b border-white/[0.05] bg-[#191919] flex items-center gap-2 text-[10px] text-neutral-500 font-mono uppercase tracking-wider">
             <TerminalSquare size={12} />
@@ -308,7 +431,7 @@ export default function SandboxPreview({ files }: SandboxPreviewProps) {
           </div>
           <div className="flex-1 p-3 overflow-y-auto font-mono text-[11px] text-neutral-400 leading-relaxed">
             {logs.map((log, i) => (
-              <div key={i} className={log.includes('Error') ? 'text-red-400' : ''}>{log}</div>
+              <div key={i} className={log.includes('Error') || log.toLowerCase().includes('error') ? 'text-red-400' : ''}>{log}</div>
             ))}
             <div ref={logsEndRef} />
           </div>

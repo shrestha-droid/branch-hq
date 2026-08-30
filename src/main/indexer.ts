@@ -36,8 +36,36 @@ export async function getProjectFiles(dir: string): Promise<string[]> {
   return results
 }
 
-// 2. Generate Vectors via Gemini Embedding API
+// 2. Generate Vectors -- Gemini by default, or a local/private embedding
+// server when MODEL_PROVIDER=local. Fixing generation alone wasn't
+// enough: this function is a second, separate path that was ALSO sending
+// project code (as embedding text) straight to Gemini, quietly, in the
+// background -- easy to miss since it's not part of the visible chat flow.
 export async function generateEmbedding(text: string): Promise<number[]> {
+  const providerName = process.env.MODEL_PROVIDER || 'gemini'
+
+  if (providerName === 'local' || providerName === 'openai-compatible') {
+    // Most local/private model servers (Ollama, vLLM, LM Studio) expose
+    // an OpenAI-compatible /v1/embeddings endpoint -- same base URL used
+    // for chat generation in index.ts, just a different path on it.
+    const baseUrl = process.env.LOCAL_MODEL_BASE_URL
+    const model = process.env.LOCAL_EMBEDDING_MODEL_NAME || 'nomic-embed-text'
+    if (!baseUrl) throw new Error('Missing LOCAL_MODEL_BASE_URL in environment.')
+
+    const response = await fetch(`${baseUrl}/embeddings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, input: text })
+    })
+
+    if (!response.ok) {
+      throw new Error(`Local embedding API Error (${response.status}): ${await response.text()}`)
+    }
+
+    const data = await response.json()
+    return data.data?.[0]?.embedding || []
+  }
+
   const apiKey = process.env.GEMINI_API_KEY
   if (!apiKey) throw new Error('Missing GEMINI_API_KEY in environment.')
 

@@ -20,19 +20,37 @@ export default function App() {
   const [selectedFile, setSelectedFile] = useState<string | null>(null)
   const [viewMode, setViewMode] = useState<'code' | 'preview'>('preview')
 
+  // NEW: context self-healing needs -- which conversation, which
+  // specialist, and the original instructions -- so the sandbox can ask
+  // for a real fix if the code fails when actually run, not just note
+  // that it failed.
+  const [healContext, setHealContext] = useState<{
+    conversationId: string
+    agentKey?: 'jim' | 'dwight' | 'riley'
+    instructions?: string
+  } | null>(null)
+
   const [targetDir, setTargetDir] = useState('/Users/ShresthaPandey/branch-hq-output')
   const [isPushing, setIsPushing] = useState(false)
   const [pushStatus, setPushStatus] = useState<string | null>(null)
   const [isIndexing, setIsIndexing] = useState(false)
 
-  const handleCodeGenerated = (files: Record<string, string>) => {
-    if (files && Object.keys(files).length > 0) {
-      setPreviewFiles(files)
-      const primary = Object.keys(files).find(f => f.includes('App.tsx')) || Object.keys(files)[0]
+  const handleCodeGenerated = (result: { files: Record<string, string>; conversationId: string; agentKey?: 'jim' | 'dwight' | 'riley'; instructions?: string }) => {
+    if (result.files && Object.keys(result.files).length > 0) {
+      setPreviewFiles(result.files)
+      setHealContext({ conversationId: result.conversationId, agentKey: result.agentKey, instructions: result.instructions })
+      const primary = Object.keys(result.files).find(f => f.includes('App.tsx')) || Object.keys(result.files)[0]
       if (primary) setSelectedFile(primary)
       setViewMode('preview')
       setPushStatus(null)
     }
+  }
+
+  // Called by SandboxPreview once a self-heal round produces corrected
+  // files -- updates what's staged so Code/Push to Local reflect the
+  // fixed version, not the one that just failed.
+  const handleFilesHealed = (files: Record<string, string>) => {
+    setPreviewFiles(files)
   }
 
   const handleIndexWorkspace = async () => {
@@ -139,7 +157,13 @@ export default function App() {
             </div>
           ) : (
             <div className="flex-1 overflow-hidden relative">
-              <SandboxPreview files={previewFiles} />
+              <SandboxPreview
+                files={previewFiles}
+                conversationId={healContext?.conversationId}
+                agentKey={healContext?.agentKey}
+                instructions={healContext?.instructions}
+                onFilesHealed={handleFilesHealed}
+              />
             </div>
           )}
 

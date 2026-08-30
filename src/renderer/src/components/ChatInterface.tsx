@@ -16,8 +16,15 @@ interface Conversation {
   updatedAt: number
 }
 
+interface GeneratedResult {
+  files: Record<string, string>
+  conversationId: string
+  agentKey?: 'jim' | 'dwight' | 'riley'
+  instructions?: string
+}
+
 interface ChatInterfaceProps {
-  onCodeGenerated?: (files: Record<string, string>) => void
+  onCodeGenerated?: (result: GeneratedResult) => void
 }
 
 // Plain-word note: this is the only place the "brand red" lives, as one
@@ -83,7 +90,7 @@ export default function ChatInterface({ onCodeGenerated }: ChatInterfaceProps) {
         setMessages(data.messages)
         const lastMsgWithFiles = [...data.messages].reverse().find(m => m.files && Object.keys(m.files).length > 0)
         if (lastMsgWithFiles?.files && onCodeGenerated) {
-          onCodeGenerated(lastMsgWithFiles.files)
+          onCodeGenerated({ files: lastMsgWithFiles.files, conversationId: id })
         }
       } else {
         setMessages([])
@@ -143,7 +150,12 @@ export default function ChatInterface({ onCodeGenerated }: ChatInterfaceProps) {
 
         // CRITICAL: Pass generated files up to App.tsx to trigger the sandbox split-pane
         if (response.files && Object.keys(response.files).length > 0 && onCodeGenerated) {
-          onCodeGenerated(response.files)
+          onCodeGenerated({
+            files: response.files,
+            conversationId: activeConvoId,
+            agentKey: response.agentKey,
+            instructions: response.instructions
+          })
         }
       } else if (response.messages) {
         setMessages(response.messages)
@@ -248,7 +260,15 @@ export default function ChatInterface({ onCodeGenerated }: ChatInterfaceProps) {
                           // pointing at the panel, instead of the whole
                           // file being pasted into the chat a second time.
                           <button
-                            onClick={() => msg.files && onCodeGenerated?.(msg.files)}
+                            onClick={() => msg.files && activeConvoId && onCodeGenerated?.({
+                              files: msg.files,
+                              conversationId: activeConvoId,
+                              agentKey: (msg.role === 'jim' || msg.role === 'dwight' || msg.role === 'riley') ? msg.role : undefined
+                              // Note: re-opening an older card doesn't carry the
+                              // original instructions with it (only new messages
+                              // do), so self-healing isn't available on a
+                              // reopened result -- only on one just generated.
+                            })}
                             className="w-full flex items-center gap-3 bg-black/20 hover:bg-black/30 border border-white/[0.06] rounded-xl px-4 py-3 text-left transition-colors"
                           >
                             <FileCode size={18} className={ACCENT.text} />
