@@ -58,8 +58,8 @@ declare global {
       writeFiles: (targetDirectory: string, files: Record<string, string>, overwriteConfirmed?: boolean) => Promise<{ success: boolean; writtenFiles?: string[]; skippedFiles?: string[]; error?: string }>;
       checkFileConflicts: (targetDirectory: string, files: Record<string, string>) => Promise<{ success: boolean; conflicts?: string[]; error?: string }>;
       getUsage: (conversationId?: string) => Promise<{ success: boolean; session: { callCount: number; charsIn: number; charsOut: number }; conversation: { callCount: number; charsIn: number; charsOut: number } | null }>;
-      getSettings: () => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string }>;
-      updateSettings: (partial: Record<string, any>) => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string }>;
+      getSettings: () => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; fallbackGeminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string }>;
+      updateSettings: (partial: Record<string, any>) => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; fallbackGeminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string }>;
       exportAuditReport: (conversationId: string) => Promise<{ success: boolean; report?: string; integrityHash?: string; generatedAt?: string; error?: string }>;
       createConversation: (mode: string, title?: string) => Promise<any>;
       listConversations: () => Promise<any[]>;

@@ -4,6 +4,7 @@ import { X, Save } from 'lucide-react'
 interface Settings {
   modelProvider: 'gemini' | 'local'
   geminiModel: string
+  fallbackGeminiModel: string
   localModelBaseUrl: string
   localModelName: string
   localEmbeddingModelName: string
@@ -88,15 +89,33 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
           </div>
 
           {settings.modelProvider === 'gemini' ? (
-            <div>
-              <label className="text-xs font-medium text-neutral-400 block mb-1.5">Gemini Model</label>
-              <input
-                type="text"
-                value={settings.geminiModel}
-                onChange={(e) => setSettings({ ...settings, geminiModel: e.target.value })}
-                className={`w-full bg-black/30 border border-white/[0.06] rounded-md px-3 py-2 text-xs text-neutral-200 focus:${ACCENT.border} outline-none transition-colors`}
-              />
-            </div>
+            <>
+              <div>
+                <label className="text-xs font-medium text-neutral-400 block mb-1.5">Gemini Model</label>
+                <input
+                  type="text"
+                  value={settings.geminiModel}
+                  onChange={(e) => setSettings({ ...settings, geminiModel: e.target.value })}
+                  className={`w-full bg-black/30 border border-white/[0.06] rounded-md px-3 py-2 text-xs text-neutral-200 focus:${ACCENT.border} outline-none transition-colors`}
+                />
+                <p className="text-[11px] text-neutral-500 mt-1.5">
+                  Pick based on what you're about to build -- a faster/cheaper model for simple changes, a stronger one for a complex or high-stakes build.
+                </p>
+              </div>
+              <div>
+                <label className="text-xs font-medium text-neutral-400 block mb-1.5">Fallback Model (optional)</label>
+                <input
+                  type="text"
+                  value={settings.fallbackGeminiModel}
+                  onChange={(e) => setSettings({ ...settings, fallbackGeminiModel: e.target.value })}
+                  placeholder="e.g. a different Gemini model"
+                  className={`w-full bg-black/30 border border-white/[0.06] rounded-md px-3 py-2 text-xs text-neutral-200 focus:${ACCENT.border} outline-none transition-colors`}
+                />
+                <p className="text-[11px] text-neutral-500 mt-1.5">
+                  If the model above is genuinely down (not just a bad response -- a real outage), this one is tried automatically before giving up. Leave blank to disable.
+                </p>
+              </div>
+            </>
           ) : (
             <>
               <div>

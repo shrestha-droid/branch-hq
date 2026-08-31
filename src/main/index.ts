@@ -1,8 +1,7 @@
-import { app, BrowserWindow, ipcMain, session } from 'electron'
+import { app, BrowserWindow, ipcMain, session, shell } from 'electron'
 import * as path from 'path'
 import * as fs from 'fs/promises'
 import * as dotenv from 'dotenv'
-import { parse as babelParse } from '@babel/parser'
 import {
   createConversation,
   listConversations,
@@ -16,6 +15,8 @@ import { searchRelevantCode } from './vectorStore'
 import { generateEmbedding, indexWorkspace } from './indexer'
 import { getSettings, updateSettings } from './settingsStore'
 import { recordAudit, generateAuditReport } from './auditStore'
+import { runMechanicalAudit, AuditResult } from './gate1'
+import { looksTransient } from './resilience'
 
 dotenv.config()
 
@@ -45,17 +46,20 @@ dotenv.config()
 type ChatTurn = { role: 'user' | 'assistant'; content: string }
 
 interface ModelProvider {
-  generate(systemPrompt: string, history: ChatTurn[]): Promise<string>
+  generate(systemPrompt: string, history: ChatTurn[], modelOverride?: string): Promise<string>
 }
 
 class GeminiProvider implements ModelProvider {
-  async generate(systemPrompt: string, history: ChatTurn[]): Promise<string> {
+  // NEW: optional modelOverride lets a caller (the fallback logic below)
+  // use a different model than whatever Settings has as primary, without
+  // needing a second provider instance or touching Settings itself.
+  async generate(systemPrompt: string, history: ChatTurn[], modelOverride?: string): Promise<string> {
     // Model NAME is live-configurable via Settings; the API KEY stays in
     // .env only -- a secret has no business sitting in a plain JSON
     // settings file the same way a model name does.
     const settings = await getSettings()
     const apiKey = process.env.GEMINI_API_KEY
-    const model = settings.geminiModel
+    const model = modelOverride || settings.geminiModel
     if (!apiKey) throw new Error('Missing GEMINI_API_KEY in environment.')
 
     const controller = new AbortController()
@@ -206,15 +210,6 @@ function recordUsage(charsIn: number, charsOut: number) {
 const MAX_TRANSIENT_RETRIES = 2
 const TRANSIENT_RETRY_DELAY_MS = 1000
 
-function looksTransient(err: any): boolean {
-  const message = err?.message || ''
-  // Deliberately narrow: a real, permanent problem (missing API key, bad
-  // URL) fails the same way every time and shouldn't burn retries
-  // pretending otherwise -- only retry things that plausibly resolve on
-  // their own a moment later.
-  return /timed out|network|ECONNREFUSED|ETIMEDOUT|fetch failed|error \(50\d\)/i.test(message)
-}
-
 async function withTransientRetry(fn: () => Promise<string>): Promise<string> {
   let lastError: any
   for (let attempt = 0; attempt <= MAX_TRANSIENT_RETRIES; attempt++) {
@@ -241,10 +236,29 @@ async function withTransientRetry(fn: () => Promise<string>): Promise<string> {
 const countingProvider: ModelProvider = {
   async generate(systemPrompt: string, history: ChatTurn[]): Promise<string> {
     const charsIn = systemPrompt.length + history.reduce((sum, m) => sum + m.content.length, 0)
+    const settings = await getSettings()
     const provider = await selectModelProvider()
-    const result = await withTransientRetry(() => provider.generate(systemPrompt, history))
-    recordUsage(charsIn, result.length)
-    return result
+
+    try {
+      const result = await withTransientRetry(() => provider.generate(systemPrompt, history))
+      recordUsage(charsIn, result.length)
+      return result
+    } catch (err: any) {
+      // NEW: if the primary model is persistently down (not just a bad
+      // prompt -- withTransientRetry only reaches here after genuinely
+      // exhausting retries on something that looked like a real outage)
+      // and a fallback model is configured, try that once before giving
+      // up entirely. Deliberately same-provider-only: Gemini falling
+      // back to a different Gemini model doesn't depend on anything
+      // else being set up correctly, unlike a cross-provider fallback
+      // to local routing would.
+      if (settings.modelProvider === 'gemini' && settings.fallbackGeminiModel && looksTransient(err)) {
+        const result = await withTransientRetry(() => provider.generate(systemPrompt, history, settings.fallbackGeminiModel))
+        recordUsage(charsIn, result.length)
+        return result
+      }
+      throw err
+    }
   }
 }
 
@@ -259,135 +273,8 @@ async function fetchChatCompletion(systemPrompt: string, history: ChatTurn[]): P
   return countingProvider.generate(systemPrompt, history)
 }
 
-// 2. Hardened Deterministic Security Linter (Gate 1)
-interface FileAuditResult {
-  file: string
-  passed: boolean
-  blockers: string[]
-  warnings: string[]
-}
-
-interface AuditResult {
-  passed: boolean
-  blockers: string[]
-  warnings: string[]
-  perFile: FileAuditResult[]
-}
-
-function stripComments(code: string): string {
-  let out = ''
-  let i = 0
-  let inString: '"' | "'" | '`' | null = null
-
-  while (i < code.length) {
-    const ch = code[i]
-    const next = code[i + 1]
-
-    if (inString) {
-      out += ch
-      if (ch === '\\') {
-        out += next ?? ''
-        i += 2
-        continue
-      }
-      if (ch === inString) inString = null
-      i++
-      continue
-    }
-
-    if (ch === '"' || ch === "'" || ch === '`') {
-      inString = ch
-      out += ch
-      i++
-      continue
-    }
-
-    if (ch === '/' && next === '/') {
-      while (i < code.length && code[i] !== '\n') i++
-      continue
-    }
-
-    if (ch === '/' && next === '*') {
-      i += 2
-      while (i < code.length && !(code[i] === '*' && code[i + 1] === '/')) i++
-      i += 2
-      continue
-    }
-
-    out += ch
-    i++
-  }
-
-  return out
-}
-
-function auditSingleFile(filename: string, rawCode: string): FileAuditResult {
-  const blockers: string[] = []
-  const warnings: string[] = []
-  const code = stripComments(rawCode)
-
-  // FIX: Only run Babel AST parsing on JavaScript/TypeScript files
-  const isJsOrTs = /\.(ts|tsx|js|jsx)$/i.test(filename)
-
-  if (isJsOrTs) {
-    try {
-      babelParse(rawCode, {
-        sourceType: 'module',
-        plugins: ['typescript', 'jsx']
-      })
-    } catch (err: any) {
-      blockers.push(`PARSE ERROR: ${err.message || 'Code failed to parse.'} Rejected prior to security scan.`)
-      return { file: filename, passed: false, blockers, warnings }
-    }
-  }
-
-  const secretDeclRegex = /\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(['"`])(?:(?!\2).)+\2/g
-  const secretKeywords = /pass(word)?|pwd|secret|token|api[-_]?key|credential|auth(?!or)/i
-  let secretMatch: RegExpExecArray | null
-  while ((secretMatch = secretDeclRegex.exec(code)) !== null) {
-    const [fullMatch, varName] = secretMatch
-    if (secretKeywords.test(varName) && !fullMatch.includes('process.env')) {
-      blockers.push(`SECURITY BLOCK: Hardcoded credential-like value assigned to "${varName}" without process.env.`)
-    }
-  }
-
-  if (/res\.cookie\s*\(/.test(code)) {
-    const hasHttpOnlyKey = /httpOnly\s*:/i.test(code)
-    const hasSecureKey = /secure\s*:/i.test(code)
-    const hasHttpOnlyTrue = /httpOnly\s*:\s*true/i.test(code)
-    const hasSecureTrue = /secure\s*:\s*true/i.test(code)
-
-    if (!hasHttpOnlyKey || !hasSecureKey) {
-      blockers.push('SECURITY BLOCK: res.cookie() call is missing httpOnly and/or secure flags entirely.')
-    } else if (!hasHttpOnlyTrue || !hasSecureTrue) {
-      warnings.push('HEURISTIC WARNING: Cookie flags present but not statically resolvable to `true`. Forwarded to Pam (Gate 2).')
-    }
-  }
-
-  const passwordFromBody =
-    /password\s*=\s*(req\.body|body)\.password/i.test(code) ||
-    /const\s*\{[^}]*\bpassword\b[^}]*\}\s*=\s*(req\.body|body)\b/i.test(code)
-  if (passwordFromBody && !/(bcrypt|argon2|hash)/i.test(code)) {
-    blockers.push('SECURITY BLOCK: Plaintext password handling detected without hashing.')
-  }
-
-  return { file: filename, passed: blockers.length === 0, blockers, warnings }
-}
-
-function runMechanicalAudit(extractedFiles: Record<string, string>): AuditResult {
-  const perFile: FileAuditResult[] = []
-  const blockers: string[] = []
-  const warnings: string[] = []
-
-  for (const [filename, code] of Object.entries(extractedFiles)) {
-    const result = auditSingleFile(filename, code)
-    perFile.push(result)
-    for (const b of result.blockers) blockers.push(`[${filename}] ${b}`)
-    for (const w of result.warnings) warnings.push(`[${filename}] ${w}`)
-  }
-
-  return { passed: blockers.length === 0, blockers, warnings, perFile }
-}
+// 2. Gate 1 (deterministic security linter) -- logic now lives in
+// ./gate1.ts so it can be unit tested without booting Electron.
 
 // 3. Robust Artifact Extractor with Path Normalization
 function normalizeFilePath(rawPath: string): string {
@@ -469,7 +356,8 @@ function injectFrontendBoilerplate(extractedFiles: Record<string, string>): Reco
         "react": "^18.2.0",
         "react-dom": "^18.2.0",
         "lucide-react": "^0.263.1",
-        "canvas-confetti": "^1.9.2"
+        "canvas-confetti": "^1.9.2",
+        "framer-motion": "^11.0.0"
       },
       devDependencies: {
         "@vitejs/plugin-react": "^4.2.1",
@@ -586,7 +474,7 @@ Default to "respond." Most everyday messages are conversation, not a build reque
 ALWAYS wrap your code in standard Markdown code blocks (e.g., \`\`\`tsx ).
 ALWAYS declare file paths at the very start of the code blocks (e.g., // File: src/App.tsx).
 CRITICAL: src/App.tsx must always use a DEFAULT export (export default function App() ...), never a named export (export function App() ...) -- the app's entry point imports it as a default import and will fail to load otherwise.
-CRITICAL: You are ONLY allowed to use 'react', 'lucide-react', and 'canvas-confetti' as external dependencies. Do not import anything else. For real typography (not just system fonts), you may still add a single <link> or @import for a Google Font in your CSS -- this does not require an npm package and is not a dependency violation.
+CRITICAL: You are ONLY allowed to use 'react', 'lucide-react', 'canvas-confetti', and 'framer-motion' as external dependencies. Do not import anything else. For real typography (not just system fonts), you may still add a single <link> or @import for a Google Font in your CSS -- this does not require an npm package and is not a dependency violation.
 
 DESIGN APPROACH -- follow this before writing any code:
 Act like a design lead giving every request its own distinct visual identity, never a template. In a short comment block at the top of your first file, plan: 2-4 named colors as hex values, two font roles (one characterful display face used with restraint, one plain body face), and one signature visual element specific to what's actually being built. Then build exactly that plan -- don't let the code drift back to defaults.
@@ -598,6 +486,16 @@ AVOID THESE -- they are tells of generic AI-generated UI, not real design choice
 - A cream background with a warm serif and a terracotta/clay accent (a well-known AI-default look)
 - Numbered badges (01 / 02 / 03) unless the content is genuinely an ordered sequence
 - Animation on every element -- motion should be rare and deliberate, not scattered everywhere
+
+WHEN MOTION GENUINELY SERVES THE DESIGN, you now have framer-motion available -- reach for one of these named, specific techniques rather than a generic fade-in. Pick what's genuinely appropriate to the build, not all of them at once, and never let this override the restraint rule above:
+- Scroll-triggered reveal: elements animate in once as they enter the viewport (whileInView + viewport={{ once: true }}), not on every scroll pass
+- Staggered children: a list or grid where each item's entrance is offset slightly (staggerChildren) instead of all appearing at once
+- Animated text reveal: a heading's words or characters animate in individually on mount, for a hero or title moment specifically -- not body text
+- Magnetic hover: a button or card subtly shifts toward the cursor within a small radius, using onMouseMove + a spring-based transform
+- Layout animation: an element smoothly reflows to a new position/size when content changes (the layout prop), instead of snapping
+- Shared element transition: a clicked card visually morphs into its expanded/detail view (layoutId) rather than a hard cut
+- Animated number counter: a stat counts up from 0 to its real value once, when it first enters view -- not on every render
+- Aurora/mesh gradient background: pure CSS, no dependency needed -- several large, soft, slowly-drifting blurred gradient shapes behind content, distinct from the "one glowing blue accent" AI tell above by using the build's own actual palette and genuine slow motion, not a static glow
 
 A financial dashboard, a kids' game, and a developer tool should never end up looking like the same template in different colors. Match the whole visual style to what's actually being built.`,
   DWIGHT_BACKEND: `You are Dwight, Backend Specialist. Write complete, functional Node.js/TypeScript code using Express.
@@ -621,7 +519,8 @@ CRITICAL: Your script must write its output to exactly output.pdf or output.pptx
 CRITICAL: NEVER include your own name or role ("Riley", "Research & Documents Specialist", "Published by...", etc.) anywhere in the actual document content. The document is for the user to give to their own audience -- it must never describe itself as AI-generated or reference who/what produced it.
 CRITICAL for page numbers in PDFs: if you add page numbers, add each one incrementally as its page is created (e.g. using pdfkit's 'pageAdded' event, tracking a running count), never in a separate loop after all pages already exist -- that requires switchToPage() and is a common source of every page number landing in the same spot instead of on its own page. A simple running "Page N" without a "of TOTAL" is safer and preferred, since knowing the total in advance requires that same error-prone two-pass approach.
 CRITICAL for shapes in PPTX files: every addShape() call's first argument must be a real shape type from pptxgen.ShapeType (e.g. pptxgen.ShapeType.rect, pptxgen.ShapeType.roundRect, pptxgen.ShapeType.line) -- never leave it missing or guess at a name. A confirmed real failure: calling addShape() with a missing or invalid shape type crashes the whole script. If you use the same shape type more than once, use the exact same correct constant every time -- do not vary it.
-CRITICAL for PPTX slide width: 'LAYOUT_16X9' is only 10" x 5.625" -- NOT the ~13.3" wide canvas its name suggests. A confirmed real failure: writing multi-column layouts (3-4 cards, wide titles) with x-coordinates going up to 11-12" while using LAYOUT_16X9 silently cuts off everything past x=10" -- titles, whole columns, right-edge cards. pptxgenjs writes coordinates past the slide edge without any warning; they are simply gone from the rendered file. ALWAYS set pres.layout = 'LAYOUT_WIDE' (13.3" x 7.5") for any slide with 3+ columns or a title near full-width, and keep every x + w within that actual boundary. Also: never add a vertical accent stripe or color bar down the edge of a slide or card -- this reads as AI-generated filler; use a subtle background tint or shadow instead if a card needs to stand out.
+CRITICAL for PPTX slide width: 'LAYOUT_16X9' is only 10" x 5.625" -- NOT the ~13.3" wide canvas its name suggests. A confirmed real failure: writing multi-column layouts (3-4 cards, wide titles) with x-coordinates going up to 11-12" while using LAYOUT_16X9 silently cuts off everything past x=10" -- titles, whole columns, right-edge cards. pptxgenjs writes coordinates past the slide edge without any warning; they are simply gone from the rendered file. ALWAYS set pres.layout = 'LAYOUT_WIDE' (13.3" x 7.5") for any slide with 3+ columns or a title near full-width, and keep every x + w within that actual boundary.
+CRITICAL, separate rule, do not skip this: NEVER add a decorative color bar or accent stripe anywhere in a deck. This is a confirmed, repeated real failure across multiple generations -- it keeps appearing in different forms even after being told to stop once, so read this as covering ALL of the following, not just one of them: a vertical stripe down the left edge of a slide, a horizontal bar across the top of a slide, and a thin colored stripe down the left edge of an individual card or content box (a common habit: giving every card a colored left border to "make it pop"). All three are the same mistake. If a card needs to stand out, use a subtle background color difference or a soft shadow -- never a stripe or bar of any kind, on a slide or on a card.
 IMPORTANT: You do not have live internet access. Write from your own knowledge -- never claim to have searched the web or cite sources you were not actually given. If the user needs current or live information, say so plainly rather than inventing facts.`,
   // NEW: the plain chatbot -- not part of the pipeline, no code, no Gate 1,
   // just a normal back-and-forth conversation.
@@ -1199,6 +1098,24 @@ function createWindow() {
       nodeIntegration: false,
       sandbox: false
     }
+  })
+
+  // NEW: previously nothing was configured here at all, and modern
+  // Electron blocks target="_blank"/window.open by default unless a
+  // handler explicitly allows it -- meaning the "Open Externally" link
+  // in the sandbox panel was very likely doing nothing when clicked.
+  // This routes it to the OS's real default browser. Worth knowing
+  // honestly: a WebContainer preview URL depends on cross-origin
+  // isolation and virtual networking specific to the context that
+  // booted it (see the custom COOP/COEP headers below, only applied
+  // here inside the app) -- opening it in a genuinely separate browser
+  // process may not always render correctly, since that separate
+  // process never gets those same headers. This fix makes the click
+  // actually do something real; it does not guarantee the WebContainer
+  // preview specifically will load outside the app every time.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    shell.openExternal(url)
+    return { action: 'deny' }
   })
 
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {

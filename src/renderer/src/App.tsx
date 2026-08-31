@@ -1,8 +1,8 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import ChatInterface from './components/ChatInterface'
 import SandboxPreview from './components/SandboxPreview'
 import SettingsModal from './components/SettingsModal'
-import { LayoutGrid, Code2, FileCode, X, CheckCircle2, Play, HardDriveDownload, Loader2, AlertTriangle, Activity, ShieldCheck } from 'lucide-react'
+import { Code2, FileCode, X, CheckCircle2, Play, HardDriveDownload, Loader2, AlertTriangle, Activity, ShieldCheck, Maximize2, Minimize2 } from 'lucide-react'
 
 const ACCENT = {
   text: 'text-[#c1554b]',
@@ -20,6 +20,11 @@ export default function App() {
   const [previewFiles, setPreviewFiles] = useState<Record<string, string> | null>(null)
   const [selectedFile, setSelectedFile] = useState<string | null>(null)
   const [viewMode, setViewMode] = useState<'code' | 'preview'>('preview')
+  // NEW: expands the preview to fill nearly the whole window instead of
+  // sharing the split with chat -- a real, guaranteed-to-work way to see
+  // it bigger, since a genuinely external browser window can't be
+  // promised to render a WebContainer preview correctly every time.
+  const [isPreviewMaximized, setIsPreviewMaximized] = useState(false)
 
   // NEW: context self-healing needs -- which conversation, which
   // specialist, and the original instructions -- so the sandbox can ask
@@ -43,15 +48,26 @@ export default function App() {
   // NEW: real Settings UI, and picking up whatever default folder was
   // configured there instead of only ever showing the hardcoded one.
   const [showSettings, setShowSettings] = useState(false)
+  // NEW: the configured BASE folder, kept separate from targetDir (which
+  // the user can freely edit per push) -- each new project's suggested
+  // folder is computed as a subfolder of this base.
+  const [baseTargetDir, setBaseTargetDir] = useState('/Users/ShresthaPandey/branch-hq-output')
+  // NEW: which conversation we last auto-suggested a folder for -- only
+  // suggest once per conversation becoming newly active, so a second
+  // generation in the same chat doesn't stomp on a manual edit.
+  const lastAutoNamedConvoIdRef = useRef<string | null>(null)
 
   useEffect(() => {
     // @ts-ignore
     window.api.getSettings().then((s: any) => {
-      if (s.defaultTargetDir) setTargetDir(s.defaultTargetDir)
+      if (s.defaultTargetDir) {
+        setTargetDir(s.defaultTargetDir)
+        setBaseTargetDir(s.defaultTargetDir)
+      }
     }).catch(() => {})
   }, [])
 
-  const handleCodeGenerated = (result: { files: Record<string, string>; conversationId: string; agentKey?: 'jim' | 'dwight' | 'riley'; instructions?: string }) => {
+  const handleCodeGenerated = (result: { files: Record<string, string>; conversationId: string; agentKey?: 'jim' | 'dwight' | 'riley'; instructions?: string; suggestedFolderName?: string }) => {
     if (result.files && Object.keys(result.files).length > 0) {
       setPreviewFiles(result.files)
       setHealContext({ conversationId: result.conversationId, agentKey: result.agentKey, instructions: result.instructions })
@@ -60,6 +76,17 @@ export default function App() {
       setViewMode('preview')
       setPushStatus(null)
       refreshUsage()
+
+      // NEW: give each new project its own folder automatically, rather
+      // than every push landing in the same static target and colliding.
+      // Only applied the first time THIS conversation is seen -- a
+      // second build in an already-open chat won't override a folder
+      // the user already edited by hand.
+      if (result.suggestedFolderName && lastAutoNamedConvoIdRef.current !== result.conversationId) {
+        lastAutoNamedConvoIdRef.current = result.conversationId
+        const base = baseTargetDir.replace(/\/+$/, '')
+        setTargetDir(`${base}/${result.suggestedFolderName}`)
+      }
     }
   }
 
@@ -198,13 +225,13 @@ export default function App() {
           that sidebar's own header, next to "+ new chat" -- a
           conventional spot, matching how Claude/ChatGPT/Slack place it,
           instead of floating alone in the corner of the whole window. */}
-      <main className={`flex flex-col h-full transition-all duration-300 ${previewFiles ? 'w-1/2 border-r border-white/[0.06]' : 'flex-1'}`}>
+      <main className={`flex flex-col h-full transition-all duration-300 ${previewFiles ? (isPreviewMaximized ? 'w-0 overflow-hidden' : 'w-1/2 border-r border-white/[0.06]') : 'flex-1'}`}>
         <ChatInterface onCodeGenerated={handleCodeGenerated} onClearPreview={handleClearPreview} onOpenSettings={() => setShowSettings(true)} />
       </main>
 
       {/* Right Split-Pane */}
       {previewFiles && (
-        <section className="w-1/2 h-full flex flex-col bg-[#101010]">
+        <section className={`h-full flex flex-col bg-[#101010] transition-all duration-300 ${isPreviewMaximized ? 'w-full' : 'w-1/2'}`}>
 
           <div className="flex items-center justify-between px-4 py-3 bg-[#191919] border-b border-white/[0.06] shrink-0">
             <div className="flex items-center gap-2 text-sm text-neutral-300">
@@ -212,23 +239,33 @@ export default function App() {
               <span>Staged (Gate 1 passed)</span>
             </div>
 
-            <div className="flex bg-black/30 rounded-lg p-0.5 border border-white/[0.06]">
+            <div className="flex items-center gap-2">
+              <div className="flex bg-black/30 rounded-lg p-0.5 border border-white/[0.06]">
+                <button
+                  onClick={() => setViewMode('code')}
+                  className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${viewMode === 'code' ? 'bg-white/10 text-white' : 'text-neutral-500 hover:text-neutral-300'}`}
+                >
+                  Code
+                </button>
+                <button
+                  onClick={() => setViewMode('preview')}
+                  className={`flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-md transition-colors ${viewMode === 'preview' ? `${ACCENT.bg} text-white` : 'text-neutral-500 hover:text-neutral-300'}`}
+                >
+                  <Play size={12} className={viewMode === 'preview' ? 'fill-white' : ''} />
+                  Preview
+                </button>
+              </div>
+
               <button
-                onClick={() => setViewMode('code')}
-                className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${viewMode === 'code' ? 'bg-white/10 text-white' : 'text-neutral-500 hover:text-neutral-300'}`}
+                onClick={() => setIsPreviewMaximized(!isPreviewMaximized)}
+                className="p-1.5 text-neutral-500 hover:text-white hover:bg-white/[0.06] rounded-md transition-colors"
+                title={isPreviewMaximized ? 'Restore split view' : 'Maximize -- easier to actually look at'}
               >
-                Code
-              </button>
-              <button
-                onClick={() => setViewMode('preview')}
-                className={`flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-md transition-colors ${viewMode === 'preview' ? `${ACCENT.bg} text-white` : 'text-neutral-500 hover:text-neutral-300'}`}
-              >
-                <Play size={12} className={viewMode === 'preview' ? 'fill-white' : ''} />
-                Preview
+                {isPreviewMaximized ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
               </button>
             </div>
 
-            <button onClick={() => { setPreviewFiles(null); setSelectedFile(null); }} className="text-neutral-500 hover:text-white" title="Close">
+            <button onClick={() => { setPreviewFiles(null); setSelectedFile(null); setIsPreviewMaximized(false); }} className="text-neutral-500 hover:text-white" title="Close">
               <X size={16} />
             </button>
           </div>
@@ -270,7 +307,7 @@ export default function App() {
             <div className="flex items-center justify-between gap-4">
               <div className="flex-1 flex flex-col gap-1.5">
                 <label className="text-xs font-medium text-neutral-500">
-                  Target folder
+                  Target folder <span className="font-normal text-neutral-600">(auto-named per project -- edit freely)</span>
                 </label>
                 <input
                   type="text"
