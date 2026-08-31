@@ -18,8 +18,21 @@ contextBridge.exposeInMainWorld('api', {
 
   // Workspace & File System Ops
   indexWorkspace: (targetPath?: string) => ipcRenderer.invoke('workspace:index', targetPath),
-  writeFiles: (targetDirectory: string, files: Record<string, string>, humanApproverId?: string) =>
-    ipcRenderer.invoke('fs:write', { targetDirectory, files, humanApproverId }),
+  writeFiles: (targetDirectory: string, files: Record<string, string>, overwriteConfirmed?: boolean) =>
+    ipcRenderer.invoke('fs:write', { targetDirectory, files, overwriteConfirmed }),
+  // NEW: dry-run overwrite check -- reports which files already exist
+  // without writing anything.
+  checkFileConflicts: (targetDirectory: string, files: Record<string, string>) =>
+    ipcRenderer.invoke('fs:checkConflicts', { targetDirectory, files }),
+  // NEW: model-call usage stats for the current session/conversation.
+  getUsage: (conversationId?: string) => ipcRenderer.invoke('usage:get', conversationId),
+  // NEW: live settings -- provider, model, default folder. Changing
+  // these takes effect on the next message, no restart needed.
+  getSettings: () => ipcRenderer.invoke('settings:get'),
+  updateSettings: (partial: Record<string, any>) => ipcRenderer.invoke('settings:set', partial),
+  // NEW: exports the factual Gate1/Pam record for a conversation, with
+  // an integrity hash proving the report wasn't edited after generation.
+  exportAuditReport: (conversationId: string) => ipcRenderer.invoke('audit:export', conversationId),
 
   // Conversation Store Ops
   createConversation: (mode: string, title?: string) => ipcRenderer.invoke('conversation:create', { mode, title }),
@@ -42,7 +55,12 @@ declare global {
         attempt: number
       }) => Promise<{ success: boolean; messages?: any[]; files?: Record<string, string>; agentKey?: 'jim' | 'dwight' | 'riley'; instructions?: string; error?: string }>;
       indexWorkspace: (targetPath?: string) => Promise<{ success: boolean; indexedFiles?: number; error?: string }>;
-      writeFiles: (targetDirectory: string, files: Record<string, string>, humanApproverId?: string) => Promise<{ success: boolean; writtenFiles?: string[]; provenanceManifest?: any; error?: string }>;
+      writeFiles: (targetDirectory: string, files: Record<string, string>, overwriteConfirmed?: boolean) => Promise<{ success: boolean; writtenFiles?: string[]; skippedFiles?: string[]; error?: string }>;
+      checkFileConflicts: (targetDirectory: string, files: Record<string, string>) => Promise<{ success: boolean; conflicts?: string[]; error?: string }>;
+      getUsage: (conversationId?: string) => Promise<{ success: boolean; session: { callCount: number; charsIn: number; charsOut: number }; conversation: { callCount: number; charsIn: number; charsOut: number } | null }>;
+      getSettings: () => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string }>;
+      updateSettings: (partial: Record<string, any>) => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string }>;
+      exportAuditReport: (conversationId: string) => Promise<{ success: boolean; report?: string; integrityHash?: string; generatedAt?: string; error?: string }>;
       createConversation: (mode: string, title?: string) => Promise<any>;
       listConversations: () => Promise<any[]>;
       getConversation: (id: string) => Promise<{ conversation: any; messages: any[] } | null>;

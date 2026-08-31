@@ -1,12 +1,58 @@
 import { useState, useRef, useEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { Send, Bot, AlertCircle, MessageSquarePlus, Trash2, Menu, X, FileCode } from 'lucide-react'
+import { Send, Bot, AlertCircle, MessageSquarePlus, Trash2, Menu, X, FileCode, Search, Settings as SettingsIcon } from 'lucide-react'
 
 interface Message {
   id?: string
   role: 'user' | 'michael' | 'jim' | 'dwight' | 'pam' | 'riley' | 'chat' | 'error'
   content: string
   files?: Record<string, string>
+}
+
+// Shared between the static and animated renderers so they never drift
+// out of sync with each other.
+const markdownComponents = {
+  p: ({ node, ...props }: any) => <p className="mb-4 last:mb-0" {...props} />,
+  code: ({ node, inline, ...props }: any) =>
+    inline
+      ? <code className="bg-white/10 px-1.5 py-0.5 rounded text-[#d9847b] font-mono text-[13px]" {...props} />
+      : <code {...props} />,
+  pre: ({ node, ...props }: any) => (
+    <div className="my-4 rounded-xl overflow-hidden border border-white/[0.06] bg-[#0f0f0f]">
+      <pre className="p-4 overflow-x-auto text-[13px] font-mono" {...props} />
+    </div>
+  )
+}
+
+// NEW: reveals text progressively instead of pasting the whole response
+// at once. Duration is bounded (0.3s-1.8s) regardless of message length,
+// so a short reply doesn't feel instant and a long one doesn't take
+// forever -- only used on messages that just arrived, never on history
+// being reopened.
+function TypewriterMarkdown({ text }: { text: string }) {
+  const [shown, setShown] = useState('')
+
+  useEffect(() => {
+    setShown('')
+    if (!text) return
+    const totalDurationMs = Math.min(1800, Math.max(300, text.length * 6))
+    const tickMs = 16
+    const totalTicks = Math.max(1, Math.round(totalDurationMs / tickMs))
+    const charsPerTick = Math.max(1, Math.ceil(text.length / totalTicks))
+    let i = 0
+    const interval = setInterval(() => {
+      i += charsPerTick
+      if (i >= text.length) {
+        setShown(text)
+        clearInterval(interval)
+      } else {
+        setShown(text.slice(0, i))
+      }
+    }, tickMs)
+    return () => clearInterval(interval)
+  }, [text])
+
+  return <ReactMarkdown components={markdownComponents}>{shown}</ReactMarkdown>
 }
 
 interface Conversation {
@@ -30,6 +76,9 @@ interface ChatInterfaceProps {
   // PREVIOUS conversation's sandbox sitting open, showing content that
   // no longer belongs to what's on screen.
   onClearPreview?: () => void
+  // NEW: Settings now lives here, in the sidebar's own header, instead
+  // of floating alone in the corner of the whole window.
+  onOpenSettings?: () => void
 }
 
 // Plain-word note: this is the only place the "brand red" lives, as one
@@ -43,14 +92,26 @@ const ACCENT = {
   border: 'border-[#a8443c]/30',
 }
 
-export default function ChatInterface({ onCodeGenerated, onClearPreview }: ChatInterfaceProps) {
+export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenSettings }: ChatInterfaceProps) {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeConvoId, setActiveConvoId] = useState<string | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [isTyping, setIsTyping] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  // NEW: the conversation list is already long enough from testing alone
+  // that scanning it by eye is a real annoyance -- this filters by title.
+  const [searchQuery, setSearchQuery] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  // NEW: needed to measure actual scroll position -- the old effect had
+  // no way to tell "user scrolled up to read something" from "brand new
+  // message just arrived," so it force-scrolled to bottom every single
+  // time either changed, overriding anyone reading earlier messages.
+  const messagesContainerRef = useRef<HTMLDivElement>(null)
+  // NEW: index boundary for the typewriter effect -- only messages at or
+  // past this index (the ones that just arrived) animate in; reopening
+  // or switching conversations never re-types old history.
+  const [animateFromIndex, setAnimateFromIndex] = useState<number | null>(null)
 
   useEffect(() => {
     loadConversations()
@@ -81,6 +142,7 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview }: ChatI
       setConversations(prev => [newConvo, ...prev])
       setActiveConvoId(newConvo.id)
       setMessages([])
+      setAnimateFromIndex(null)
       // A brand new conversation never has anything staged -- don't leave
       // whatever was open from wherever the user just was.
       onClearPreview?.()
@@ -91,6 +153,7 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview }: ChatI
 
   const selectConversation = async (id: string) => {
     setActiveConvoId(id)
+    setAnimateFromIndex(null)
     try {
       // @ts-ignore
       const data = await window.api.getConversation(id)
@@ -135,7 +198,17 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview }: ChatI
   }
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    // FIXED: previously scrolled to bottom unconditionally on every
+    // change, which meant scrolling up to read an earlier message got
+    // silently undone the instant anything else updated. Now it only
+    // follows along if the user was already near the bottom.
+    const container = messagesContainerRef.current
+    if (!container) return
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight
+    const wasNearBottom = distanceFromBottom < 150
+    if (wasNearBottom) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
   }, [messages, isTyping])
 
   const handleSend = async () => {
@@ -144,6 +217,11 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview }: ChatI
     setInput('')
     setIsTyping(true)
 
+    // NEW: captured before the optimistic append below, so this marks
+    // exactly where the newly-arriving messages will start once the
+    // response replaces the array -- the boundary the typewriter effect
+    // uses to know what's new vs. old history.
+    const startLen = messages.length
     setMessages(prev => [...prev, { role: 'user', content: promptText }])
 
     // Kept only so any conversation created before this change (back when
@@ -162,6 +240,7 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview }: ChatI
 
       if (response.success && response.messages) {
         setMessages(response.messages)
+        setAnimateFromIndex(startLen + 1)
 
         // CRITICAL: Pass generated files up to App.tsx to trigger the sandbox split-pane
         if (response.files && Object.keys(response.files).length > 0 && onCodeGenerated) {
@@ -174,6 +253,7 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview }: ChatI
         }
       } else if (response.messages) {
         setMessages(response.messages)
+        setAnimateFromIndex(startLen + 1)
       }
       loadConversations()
     } catch (err: any) {
@@ -183,18 +263,47 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview }: ChatI
     }
   }
 
+  const filteredConversations = searchQuery.trim()
+    ? conversations.filter(c => c.title.toLowerCase().includes(searchQuery.trim().toLowerCase()))
+    : conversations
+
   return (
     <div className="flex h-full relative bg-[#141414] text-neutral-100 overflow-hidden">
       {/* Sidebar for Conversations -- calmer, no neon border glow */}
       <div className={`${sidebarOpen ? 'w-64' : 'w-0'} transition-all duration-300 bg-[#191919] border-r border-white/[0.06] flex flex-col shrink-0 overflow-hidden z-20`}>
         <div className="p-4 border-b border-white/[0.06] flex items-center justify-between">
           <span className="text-sm text-neutral-400">Chats</span>
-          <button onClick={createNewConversation} className={`p-1.5 ${ACCENT.bgSoft} ${ACCENT.text} rounded-lg transition-colors hover:bg-[#a8443c]/20`} title="New chat">
-            <MessageSquarePlus size={16} />
-          </button>
+          <div className="flex items-center gap-1.5">
+            <button onClick={createNewConversation} className={`p-1.5 ${ACCENT.bgSoft} ${ACCENT.text} rounded-lg transition-colors hover:bg-[#a8443c]/20`} title="New chat">
+              <MessageSquarePlus size={16} />
+            </button>
+            <button onClick={() => onOpenSettings?.()} className="p-1.5 text-neutral-400 hover:text-neutral-200 hover:bg-white/[0.06] rounded-lg transition-colors" title="Settings">
+              <SettingsIcon size={16} />
+            </button>
+          </div>
+        </div>
+        <div className="px-3 pt-3 pb-1">
+          <div className="flex items-center gap-2 bg-black/20 border border-white/[0.06] rounded-lg px-2.5 py-1.5">
+            <Search size={13} className="text-neutral-500 shrink-0" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search chats..."
+              className="flex-1 bg-transparent border-none outline-none text-xs text-neutral-200 placeholder:text-neutral-600"
+            />
+            {searchQuery && (
+              <button onClick={() => setSearchQuery('')} className="text-neutral-500 hover:text-neutral-300 shrink-0">
+                <X size={12} />
+              </button>
+            )}
+          </div>
         </div>
         <div className="flex-1 overflow-y-auto p-2 space-y-1">
-          {conversations.map(convo => (
+          {filteredConversations.length === 0 && searchQuery && (
+            <p className="text-xs text-neutral-600 px-3 py-4 text-center">No chats match "{searchQuery}"</p>
+          )}
+          {filteredConversations.map(convo => (
             <div
               key={convo.id}
               onClick={() => selectConversation(convo.id)}
@@ -230,11 +339,35 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview }: ChatI
 
         {/* No background grid pattern -- plain flat background, calmer */}
 
-        <div className="flex-1 overflow-y-auto pb-40 pt-16 px-6 z-10 scrollbar-thin scrollbar-thumb-neutral-800 scrollbar-track-transparent">
+        <div ref={messagesContainerRef} className="flex-1 overflow-y-auto pb-40 pt-16 px-6 z-10 scrollbar-thin scrollbar-thumb-neutral-800 scrollbar-track-transparent">
           {messages.length === 0 ? (
             <div className="h-full flex flex-col items-center justify-center text-neutral-500">
-              <div className={`${ACCENT.bgSoft} p-4 rounded-full mb-4`}>
-                <Bot size={28} className={ACCENT.text} />
+              <style>{`
+                @keyframes branchBreathe {
+                  0%, 100% { transform: scale(1); }
+                  50% { transform: scale(1.08); }
+                }
+                @keyframes branchGlowPulse {
+                  0%, 100% { opacity: 0.5; }
+                  50% { opacity: 0.9; }
+                }
+              `}</style>
+              {/* NEW: small, contained animation on the icon that's
+                  already here -- a gentle breathing scale plus a soft
+                  pulsing glow behind it. Deliberately restrained, not a
+                  full-screen effect -- it should never sit over or hide
+                  any part of the page. */}
+              <div className="relative mb-4 p-4">
+                <div
+                  className={`absolute inset-0 ${ACCENT.bg} rounded-full blur-lg`}
+                  style={{ animation: 'branchGlowPulse 3s ease-in-out infinite' }}
+                />
+                <div
+                  className="relative"
+                  style={{ animation: 'branchBreathe 3s ease-in-out infinite' }}
+                >
+                  <Bot size={28} className={ACCENT.text} />
+                </div>
               </div>
               <p className="text-lg font-medium text-neutral-200">Branch HQ</p>
               <p className="text-sm mt-2 text-neutral-500 max-w-sm text-center">
@@ -294,21 +427,10 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview }: ChatI
                               <div className="text-xs text-neutral-500">View in the panel &rarr;</div>
                             </div>
                           </button>
+                        ) : (animateFromIndex !== null && idx >= animateFromIndex) ? (
+                          <TypewriterMarkdown text={msg.content} />
                         ) : (
-                          <ReactMarkdown
-                            components={{
-                              p: ({ node, ...props }) => <p className="mb-4 last:mb-0" {...props} />,
-                              code: ({ node, inline, ...props }: any) =>
-                                inline
-                                  ? <code className="bg-white/10 px-1.5 py-0.5 rounded text-[#d9847b] font-mono text-[13px]" {...props} />
-                                  : <code {...props} />,
-                              pre: ({ node, ...props }) => (
-                                <div className="my-4 rounded-xl overflow-hidden border border-white/[0.06] bg-[#0f0f0f]">
-                                  <pre className="p-4 overflow-x-auto text-[13px] font-mono" {...props} />
-                                </div>
-                              )
-                            }}
-                          >
+                          <ReactMarkdown components={markdownComponents}>
                             {msg.content}
                           </ReactMarkdown>
                         )}
@@ -319,10 +441,7 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview }: ChatI
               ))}
 
               {isTyping && (
-                <div className="flex items-center gap-3 text-neutral-500 text-sm">
-                  <div className={`w-8 h-8 rounded-full ${ACCENT.bgSoft} flex items-center justify-center`}>
-                    <Bot size={14} className={`${ACCENT.text} animate-pulse`} />
-                  </div>
+                <div className="flex items-center gap-3 text-neutral-500 text-sm pl-1">
                   <span className="animate-pulse">Working...</span>
                 </div>
               )}
@@ -330,7 +449,6 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview }: ChatI
             </div>
           )}
         </div>
-
         <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-[#141414] via-[#141414]/95 to-transparent z-20">
           <div className={`w-full max-w-3xl mx-auto flex items-center gap-3 bg-white/[0.04] focus-within:bg-white/[0.06] rounded-2xl p-2 border border-white/[0.06] focus-within:${ACCENT.border} transition-colors duration-200`}>
             <input

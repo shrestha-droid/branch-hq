@@ -14,6 +14,8 @@ import {
 } from './conversationStore'
 import { searchRelevantCode } from './vectorStore'
 import { generateEmbedding, indexWorkspace } from './indexer'
+import { getSettings, updateSettings } from './settingsStore'
+import { recordAudit, generateAuditReport } from './auditStore'
 
 dotenv.config()
 
@@ -48,8 +50,12 @@ interface ModelProvider {
 
 class GeminiProvider implements ModelProvider {
   async generate(systemPrompt: string, history: ChatTurn[]): Promise<string> {
+    // Model NAME is live-configurable via Settings; the API KEY stays in
+    // .env only -- a secret has no business sitting in a plain JSON
+    // settings file the same way a model name does.
+    const settings = await getSettings()
     const apiKey = process.env.GEMINI_API_KEY
-    const model = process.env.GEMINI_MODEL || 'gemini-1.5-flash'
+    const model = settings.geminiModel
     if (!apiKey) throw new Error('Missing GEMINI_API_KEY in environment.')
 
     const controller = new AbortController()
@@ -94,10 +100,11 @@ class GeminiProvider implements ModelProvider {
 // project code never has to leave it.
 class OpenAICompatibleProvider implements ModelProvider {
   async generate(systemPrompt: string, history: ChatTurn[]): Promise<string> {
-    const baseUrl = process.env.LOCAL_MODEL_BASE_URL // e.g. http://localhost:11434/v1 for Ollama
+    const settings = await getSettings()
+    const baseUrl = settings.localModelBaseUrl // e.g. http://localhost:11434/v1 for Ollama
     const apiKey = process.env.LOCAL_MODEL_API_KEY || 'not-needed' // most local servers ignore this
-    const model = process.env.LOCAL_MODEL_NAME || 'llama3.1'
-    if (!baseUrl) throw new Error('Missing LOCAL_MODEL_BASE_URL in environment.')
+    const model = settings.localModelName
+    if (!baseUrl) throw new Error('Missing local model base URL -- set it in Settings.')
 
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), 60000) // local models can be slower than a cloud API
@@ -132,11 +139,14 @@ class OpenAICompatibleProvider implements ModelProvider {
   }
 }
 
-function getModelProvider(): ModelProvider {
-  const providerName = process.env.MODEL_PROVIDER || 'gemini'
-  switch (providerName) {
+// FIXED: previously a singleton created once at startup
+// (`const modelProvider = getModelProvider()`), which meant switching
+// providers required restarting the whole app. Looking it up fresh here
+// means a change made in Settings takes effect on the very next message.
+async function selectModelProvider(): Promise<ModelProvider> {
+  const settings = await getSettings()
+  switch (settings.modelProvider) {
     case 'local':
-    case 'openai-compatible':
       return new OpenAICompatibleProvider()
     case 'gemini':
     default:
@@ -144,17 +154,109 @@ function getModelProvider(): ModelProvider {
   }
 }
 
-const modelProvider = getModelProvider()
+// NEW: usage tracking. One request can quietly fan out into a lot of
+// model calls -- Michael routes, a specialist generates, Gate 1 can
+// trigger up to 3 retries, Pam reviews each attempt, self-healing can add
+// more, and embeddings run separately in the background. Nobody -- including
+// the person running this -- could previously see how many calls or how
+// much text that actually added up to. Counting at the provider layer
+// catches every call, since they all funnel through generate().
+//
+// Character counts are a ROUGH PROXY for tokens, not real token counts:
+// neither provider returns usage data in the shape this reads, and
+// characters-per-token varies by model and content. Good enough to spot
+// "this request cost 10x what I expected"; NOT good enough to bill anyone.
+interface UsageStats {
+  callCount: number
+  charsIn: number
+  charsOut: number
+}
+
+const sessionUsage: UsageStats = { callCount: 0, charsIn: 0, charsOut: 0 }
+const perConversationUsage = new Map<string, UsageStats>()
+
+// Set around a pipeline run so provider calls can be attributed to the
+// right conversation without threading an ID through every call site.
+let currentUsageConversationId: string | null = null
+
+function recordUsage(charsIn: number, charsOut: number) {
+  sessionUsage.callCount++
+  sessionUsage.charsIn += charsIn
+  sessionUsage.charsOut += charsOut
+
+  if (currentUsageConversationId) {
+    const existing = perConversationUsage.get(currentUsageConversationId)
+      || { callCount: 0, charsIn: 0, charsOut: 0 }
+    existing.callCount++
+    existing.charsIn += charsIn
+    existing.charsOut += charsOut
+    perConversationUsage.set(currentUsageConversationId, existing)
+  }
+}
+
+// Wraps whichever provider is configured so counting happens in exactly
+// one place regardless of which backend is in use.
+// NEW: pipeline-level self-healing, distinct from the code-level version
+// elsewhere in this file. That one fixes BROKEN CODE a specialist wrote.
+// This fixes THE PIPELINE ITSELF failing to complete a call at all --
+// a timeout, a dropped connection, a transient server error. Wrapping it
+// here means every single agent (Michael, Jim, Dwight, Riley, Pam, chat,
+// even self-healing's own calls) gets this for free, since they already
+// all funnel through this one function.
+const MAX_TRANSIENT_RETRIES = 2
+const TRANSIENT_RETRY_DELAY_MS = 1000
+
+function looksTransient(err: any): boolean {
+  const message = err?.message || ''
+  // Deliberately narrow: a real, permanent problem (missing API key, bad
+  // URL) fails the same way every time and shouldn't burn retries
+  // pretending otherwise -- only retry things that plausibly resolve on
+  // their own a moment later.
+  return /timed out|network|ECONNREFUSED|ETIMEDOUT|fetch failed|error \(50\d\)/i.test(message)
+}
+
+async function withTransientRetry(fn: () => Promise<string>): Promise<string> {
+  let lastError: any
+  for (let attempt = 0; attempt <= MAX_TRANSIENT_RETRIES; attempt++) {
+    try {
+      return await fn()
+    } catch (err: any) {
+      lastError = err
+      if (!looksTransient(err)) throw err
+      if (attempt === MAX_TRANSIENT_RETRIES) {
+        // NEW: previously re-threw the original error unchanged here,
+        // so a call that WAS retried and still failed looked identical
+        // to one that was never retried at all -- no way to tell them
+        // apart from what the user saw. Now the final failure says so
+        // explicitly.
+        const totalAttempts = MAX_TRANSIENT_RETRIES + 1
+        throw new Error(`${err.message} (retried automatically ${totalAttempts} times -- this looks like a genuine outage on the provider's side, not a Branch HQ problem)`)
+      }
+      await new Promise(resolve => setTimeout(resolve, TRANSIENT_RETRY_DELAY_MS * (attempt + 1)))
+    }
+  }
+  throw lastError
+}
+
+const countingProvider: ModelProvider = {
+  async generate(systemPrompt: string, history: ChatTurn[]): Promise<string> {
+    const charsIn = systemPrompt.length + history.reduce((sum, m) => sum + m.content.length, 0)
+    const provider = await selectModelProvider()
+    const result = await withTransientRetry(() => provider.generate(systemPrompt, history))
+    recordUsage(charsIn, result.length)
+    return result
+  }
+}
 
 // Kept as the same function names/signatures every existing call site
 // already uses -- Michael, Jim, Dwight, Riley, Pam, chat, and
 // self-healing all call these exactly as before. Only the inside changed.
 async function fetchFrontierAI(systemPrompt: string, userPrompt: string): Promise<string> {
-  return modelProvider.generate(systemPrompt, [{ role: 'user', content: userPrompt }])
+  return countingProvider.generate(systemPrompt, [{ role: 'user', content: userPrompt }])
 }
 
 async function fetchChatCompletion(systemPrompt: string, history: ChatTurn[]): Promise<string> {
-  return modelProvider.generate(systemPrompt, history)
+  return countingProvider.generate(systemPrompt, history)
 }
 
 // 2. Hardened Deterministic Security Linter (Gate 1)
@@ -518,6 +620,8 @@ CRITICAL: You are ONLY allowed to use 'pdfkit' (for PDF files) and 'pptxgenjs' (
 CRITICAL: Your script must write its output to exactly output.pdf or output.pptx in the project root when run -- that is the file that gets saved for the user.
 CRITICAL: NEVER include your own name or role ("Riley", "Research & Documents Specialist", "Published by...", etc.) anywhere in the actual document content. The document is for the user to give to their own audience -- it must never describe itself as AI-generated or reference who/what produced it.
 CRITICAL for page numbers in PDFs: if you add page numbers, add each one incrementally as its page is created (e.g. using pdfkit's 'pageAdded' event, tracking a running count), never in a separate loop after all pages already exist -- that requires switchToPage() and is a common source of every page number landing in the same spot instead of on its own page. A simple running "Page N" without a "of TOTAL" is safer and preferred, since knowing the total in advance requires that same error-prone two-pass approach.
+CRITICAL for shapes in PPTX files: every addShape() call's first argument must be a real shape type from pptxgen.ShapeType (e.g. pptxgen.ShapeType.rect, pptxgen.ShapeType.roundRect, pptxgen.ShapeType.line) -- never leave it missing or guess at a name. A confirmed real failure: calling addShape() with a missing or invalid shape type crashes the whole script. If you use the same shape type more than once, use the exact same correct constant every time -- do not vary it.
+CRITICAL for PPTX slide width: 'LAYOUT_16X9' is only 10" x 5.625" -- NOT the ~13.3" wide canvas its name suggests. A confirmed real failure: writing multi-column layouts (3-4 cards, wide titles) with x-coordinates going up to 11-12" while using LAYOUT_16X9 silently cuts off everything past x=10" -- titles, whole columns, right-edge cards. pptxgenjs writes coordinates past the slide edge without any warning; they are simply gone from the rendered file. ALWAYS set pres.layout = 'LAYOUT_WIDE' (13.3" x 7.5") for any slide with 3+ columns or a title near full-width, and keep every x + w within that actual boundary. Also: never add a vertical accent stripe or color bar down the edge of a slide or card -- this reads as AI-generated filler; use a subtle background tint or shadow instead if a card needs to stand out.
 IMPORTANT: You do not have live internet access. Write from your own knowledge -- never claim to have searched the web or cite sources you were not actually given. If the user needs current or live information, say so plainly rather than inventing facts.`,
   // NEW: the plain chatbot -- not part of the pipeline, no code, no Gate 1,
   // just a normal back-and-forth conversation.
@@ -545,6 +649,81 @@ const MAX_SELF_HEAL_ROUNDS = 2
 // as conversations and RAG matches grow.
 const MAX_CONTEXT_CHUNK_CHARS = 800
 const MICHAEL_HISTORY_WINDOW = 12
+const MAX_EXISTING_FILE_CHARS = 2400
+
+// NEW: "check what's actually there first." Specialists previously
+// generated as if every request started from a blank project, even when
+// a real, existing project already sits on disk in the configured
+// target folder -- there was no step where they looked at what
+// currently exists before writing something that might silently ignore
+// or duplicate it. This is a genuinely LIVE filesystem read, done fresh
+// on every delegated request -- not a stale snapshot from the memory
+// index, which only updates when someone remembers to click Scan
+// Workspace. It's local disk I/O, not a network call, so it's fast
+// enough not to undo the pipeline-speed work already done.
+async function listProjectFilesShallow(targetDir: string): Promise<string[]> {
+  const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'out'])
+  const results: string[] = []
+
+  async function walk(dir: string, relBase: string) {
+    let entries
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (IGNORE_DIRS.has(entry.name)) continue
+      const relPath = relBase ? `${relBase}/${entry.name}` : entry.name
+      if (entry.isDirectory()) {
+        await walk(path.join(dir, entry.name), relPath)
+      } else {
+        results.push(relPath)
+      }
+    }
+  }
+
+  await walk(path.resolve(targetDir), '')
+  return results
+}
+
+async function getExistingProjectSnapshot(targetDir: string, userPrompt: string): Promise<string> {
+  if (!targetDir) return ''
+
+  try {
+    const allFiles = await listProjectFilesShallow(targetDir)
+    if (allFiles.length === 0) return ''
+
+    let snapshot = `\n\n[EXISTING PROJECT FILES -- read live from disk just now, not from memory or a stale index]:\nThis project already has these files:\n${allFiles.map(f => `- ${f}`).join('\n')}`
+
+    // If the request seems to name a specific file, fetch its REAL,
+    // current content -- not a similarity-based guess from the memory
+    // index, which can be stale the moment a file actually changes.
+    const mentionedFile = allFiles.find(f => {
+      const base = f.split('/').pop() || ''
+      const baseNoExt = base.replace(/\.(tsx?|jsx?)$/i, '')
+      return userPrompt.toLowerCase().includes(base.toLowerCase())
+        || (baseNoExt.length > 2 && userPrompt.toLowerCase().includes(baseNoExt.toLowerCase()))
+    })
+
+    if (mentionedFile) {
+      try {
+        const fullPath = path.join(path.resolve(targetDir), mentionedFile)
+        const fileContent = await fs.readFile(fullPath, 'utf-8')
+        const truncated = fileContent.length > MAX_EXISTING_FILE_CHARS
+          ? fileContent.slice(0, MAX_EXISTING_FILE_CHARS) + '\n... (truncated)'
+          : fileContent
+        snapshot += `\n\nCURRENT CONTENT of ${mentionedFile} (read live, right now, not from memory):\n${truncated}\n\nIf your task involves this file, modify it based on what is actually here -- do not silently rewrite it from scratch or ignore what already exists.`
+      } catch {
+        // Couldn't read it -- proceed with just the file listing.
+      }
+    }
+
+    return snapshot
+  } catch {
+    return ''
+  }
+}
 
 // NEW: Riley's script is always named src/generate.ts by convention --
 // if he forgets to declare that path on the first line (unlike Jim and
@@ -582,6 +761,41 @@ typedIpc.handle('conversation:create', async (_event: any, { mode, title }: { mo
 
 typedIpc.handle('conversation:list', async () => {
   return await listConversations()
+})
+
+// NEW: lets the UI show what a session/conversation has actually cost in
+// model calls. See the note on recordUsage -- char counts are a rough
+// proxy, not real token accounting.
+typedIpc.handle('usage:get', async (_event: any, conversationId?: string) => {
+  return {
+    success: true,
+    session: { ...sessionUsage },
+    conversation: conversationId
+      ? (perConversationUsage.get(conversationId) || { callCount: 0, charsIn: 0, charsOut: 0 })
+      : null
+  }
+})
+
+// NEW: Settings -- what provider/model/folder to use, live and
+// user-editable instead of only settable by hand-editing .env.
+typedIpc.handle('settings:get', async () => {
+  return await getSettings()
+})
+
+typedIpc.handle('settings:set', async (_event: any, partial: any) => {
+  return await updateSettings(partial)
+})
+
+// NEW: the actual differentiator -- a factual, unedited record of every
+// Gate 1 / Pam result for a conversation, with an integrity hash proving
+// the report wasn't altered after being generated.
+typedIpc.handle('audit:export', async (_event: any, conversationId: string) => {
+  try {
+    const result = await generateAuditReport(conversationId)
+    return { success: true, ...result }
+  } catch (err: any) {
+    return { success: false, error: err.message }
+  }
 })
 
 typedIpc.handle('conversation:get', async (_event: any, id: string) => {
@@ -651,6 +865,7 @@ typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName,
 // himself whether to just answer, or bring in a specialist.
 typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { conversationId: string; prompt: string }) => {
   const newMessages: any[] = []
+  currentUsageConversationId = conversationId
   try {
     const userMsg = await addMessage(conversationId, 'user', prompt)
     newMessages.push(userMsg)
@@ -692,15 +907,44 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
       .slice(-MICHAEL_HISTORY_WINDOW)
       .map((m: any) => ({ role: (m.role === 'michael' ? 'assistant' : 'user') as 'user' | 'assistant', content: m.content }))
 
-    const managerResponse = await fetchChatCompletion(PROMPTS.MICHAEL_MANAGER, michaelHistory)
-    let decision: { action: 'delegate' | 'respond'; assignTo?: string; instructions?: string; response?: string }
+    // NEW: pipeline self-healing for routing specifically. Previously a
+    // single malformed JSON response killed the whole request instantly
+    // -- no retry at all. This matters more now that a local model can
+    // be in the loop (see selectModelProvider): weaker/self-hosted
+    // models are known to be less reliable at strict JSON output than
+    // Gemini, so this failure just got more likely to actually happen,
+    // not less.
+    const MAX_ROUTING_JSON_RETRIES = 2
+    let decision: { action: 'delegate' | 'respond'; assignTo?: string; instructions?: string; response?: string } | null = null
+    let managerResponse = ''
 
-    try {
-      const jsonMatch = managerResponse.match(/\{[\s\S]*\}/)
-      if (!jsonMatch) throw new Error("No JSON structure found")
-      decision = JSON.parse(jsonMatch[0])
-    } catch {
-      const errMessage = await addMessage(conversationId, 'error', "Manager routing failed: malformed JSON response.")
+    for (let jsonAttempt = 1; jsonAttempt <= MAX_ROUTING_JSON_RETRIES; jsonAttempt++) {
+      const historyForAttempt = jsonAttempt === 1
+        ? michaelHistory
+        : [
+            ...michaelHistory,
+            { role: 'assistant' as const, content: managerResponse },
+            { role: 'user' as const, content: 'That was not valid JSON. Respond with ONLY the JSON object -- no explanation, no markdown formatting, nothing else.' }
+          ]
+
+      managerResponse = await fetchChatCompletion(PROMPTS.MICHAEL_MANAGER, historyForAttempt)
+
+      try {
+        const jsonMatch = managerResponse.match(/\{[\s\S]*\}/)
+        if (!jsonMatch) throw new Error("No JSON structure found")
+        decision = JSON.parse(jsonMatch[0])
+        break
+      } catch {
+        if (jsonAttempt === MAX_ROUTING_JSON_RETRIES) {
+          const errMessage = await addMessage(conversationId, 'error', `Manager routing failed after ${MAX_ROUTING_JSON_RETRIES} attempts: malformed JSON response.`)
+          return { success: false, messages: [...newMessages, errMessage] }
+        }
+        // fall through to the next attempt
+      }
+    }
+
+    if (!decision) {
+      const errMessage = await addMessage(conversationId, 'error', "Manager routing failed: no valid decision produced.")
       return { success: false, messages: [...newMessages, errMessage] }
     }
 
@@ -735,7 +979,9 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
     // again -- capped at MAX_AUTO_FIX_ROUNDS so a never-satisfied Pam
     // can't loop forever.
     const baseInstructions = decision.instructions || ''
-    let currentInstructions = baseInstructions + projectContext
+    const settingsForSnapshot = await getSettings()
+    const existingProjectSnapshot = await getExistingProjectSnapshot(settingsForSnapshot.defaultTargetDir, prompt)
+    let currentInstructions = baseInstructions + projectContext + existingProjectSnapshot
     let specialistOutput = ''
     let staticAudit: AuditResult
     let stageableFiles: Record<string, string> | undefined
@@ -755,9 +1001,13 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
             agentKey,
             `${specialistOutput}\n\n[Gate 1 blocked this attempt${roundTag} -- retrying automatically]`
           ))
-          currentInstructions = `${baseInstructions}${projectContext}\n\nYour previous attempt was rejected by the automated security check. Fix ALL of these before trying again:\n- ${staticAudit.blockers.join('\n- ')}`
+          currentInstructions = `${baseInstructions}${projectContext}${existingProjectSnapshot}\n\nYour previous attempt was rejected by the automated security check. Fix ALL of these before trying again:\n- ${staticAudit.blockers.join('\n- ')}`
           continue
         }
+        await recordAudit({
+          conversationId, agentKey, attempt: round,
+          gate1Passed: false, perFile: staticAudit.perFile, pamVerdict: 'UNKNOWN'
+        })
         const errMsg = await addMessage(conversationId, 'error', `Gate 1 Hard Blockers Enforced (after ${round} attempts):\n- ${staticAudit.blockers.join('\n- ')}`)
         return { success: false, messages: [...newMessages, errMsg] }
       }
@@ -776,11 +1026,17 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
       const verdictMatch = pamReview.match(/PAM_VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/i)
       const approved = verdictMatch ? verdictMatch[1].toUpperCase() === 'APPROVED' : false
 
+      await recordAudit({
+        conversationId, agentKey, attempt: round,
+        gate1Passed: true, perFile: staticAudit.perFile,
+        pamVerdict: verdictMatch ? (verdictMatch[1].toUpperCase() as 'APPROVED' | 'CHANGES_REQUESTED') : 'UNKNOWN'
+      })
+
       if (approved || round === MAX_AUTO_FIX_ROUNDS) {
         break
       }
 
-      currentInstructions = `${baseInstructions}${projectContext}\n\nYour previous attempt received this QA feedback -- address it before trying again:\n${pamReview}`
+      currentInstructions = `${baseInstructions}${projectContext}${existingProjectSnapshot}\n\nYour previous attempt received this QA feedback -- address it before trying again:\n${pamReview}`
     }
 
     return { success: true, messages: newMessages, files: stageableFiles, agentKey, instructions: baseInstructions }
@@ -819,7 +1075,13 @@ typedIpc.handle('heal:invoke', async (_event: any, {
       agentKey === 'riley' ? PROMPTS.RILEY_DOCS :
       PROMPTS.JIM_FRONTEND
 
-    const healingInstructions = `${previousInstructions}\n\nYour previous code passed review, but FAILED WHEN ACTUALLY RUN. Here is the real error:\n\n${errorLog}\n\nFix the specific problem causing this error. Do not change anything else.`
+    // NEW: the error only points at where execution STOPPED, which can
+    // be the first of several identical mistakes, not the only one --
+    // confirmed by watching a real case where the same bug moved to a
+    // different line between healing attempts instead of disappearing
+    // in one try, because only the one instance the error named got
+    // fixed each time.
+    const healingInstructions = `${previousInstructions}\n\nYour previous code passed review, but FAILED WHEN ACTUALLY RUN. Here is the real error:\n\n${errorLog}\n\nFix the specific problem causing this error. If this exact kind of mistake appears more than once in your code, fix EVERY occurrence, not just the one the error happened to stop at -- the error only shows where execution failed first, which may not be the only instance. Do not change anything else.`
 
     const specialistOutput = await fetchFrontierAI(targetPrompt, healingInstructions)
     const { staticAudit, stageableFiles } = auditAndStage(specialistOutput, agentKey)
@@ -857,9 +1119,38 @@ typedIpc.handle('heal:invoke', async (_event: any, {
   }
 })
 
-typedIpc.handle('fs:write', async (_event: any, { targetDirectory, files }: { targetDirectory: string; files: Record<string, string> }) => {
+// NEW: dry-run check. Reports which files already exist at the target
+// path WITHOUT writing anything, so the UI can warn before overwriting
+// rather than silently replacing someone's real work.
+typedIpc.handle('fs:checkConflicts', async (_event: any, { targetDirectory, files }: { targetDirectory: string; files: Record<string, string> }) => {
+  try {
+    const resolvedTarget = path.resolve(targetDirectory)
+    const conflicts: string[] = []
+
+    for (const relativePath of Object.keys(files)) {
+      const absolutePath = path.resolve(resolvedTarget, relativePath)
+      const isInsideTarget =
+        absolutePath === resolvedTarget || absolutePath.startsWith(resolvedTarget + path.sep)
+      if (!isInsideTarget) continue
+
+      try {
+        await fs.access(absolutePath)
+        conflicts.push(relativePath)
+      } catch {
+        // Doesn't exist -- not a conflict, nothing to warn about.
+      }
+    }
+
+    return { success: true, conflicts }
+  } catch (err: any) {
+    return { success: false, error: err.message }
+  }
+})
+
+typedIpc.handle('fs:write', async (_event: any, { targetDirectory, files, overwriteConfirmed }: { targetDirectory: string; files: Record<string, string>; overwriteConfirmed?: boolean }) => {
   try {
     const writtenPaths: string[] = []
+    const skippedPaths: string[] = []
     const resolvedTarget = path.resolve(targetDirectory)
 
     for (const [relativePath, content] of Object.entries(files)) {
@@ -871,12 +1162,26 @@ typedIpc.handle('fs:write', async (_event: any, { targetDirectory, files }: { ta
         throw new Error(`Refused to write outside target directory: "${relativePath}" resolved to ${absolutePath}`)
       }
 
+      // NEW: unless overwriting was explicitly confirmed, leave existing
+      // files alone. Previously this silently replaced whatever was
+      // there -- fine for an empty output folder, potentially destructive
+      // when pointed at a real project.
+      if (!overwriteConfirmed) {
+        try {
+          await fs.access(absolutePath)
+          skippedPaths.push(relativePath)
+          continue
+        } catch {
+          // Doesn't exist -- safe to write.
+        }
+      }
+
       await fs.mkdir(path.dirname(absolutePath), { recursive: true })
       await fs.writeFile(absolutePath, content, 'utf-8')
       writtenPaths.push(absolutePath)
     }
 
-    return { success: true, writtenFiles: writtenPaths }
+    return { success: true, writtenFiles: writtenPaths, skippedFiles: skippedPaths }
   } catch (err: any) {
     return { success: false, error: err.message }
   }

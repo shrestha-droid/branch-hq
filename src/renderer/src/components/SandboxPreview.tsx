@@ -192,7 +192,7 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
           const installExitCode = await installProcess.exit
           if (installExitCode !== 0) {
             if (!mounted || currentRunId !== runIdRef.current) return
-            return attemptSelfHeal(`npm install failed:\n${installLogTail.slice(-30).join('\n')}`)
+            return attemptSelfHeal(`npm install failed:\n${installLogTail.slice(-60).join('\n')}`)
           }
           lastInstalledPackageJsonRef.current = currentPackageJson
         }
@@ -219,7 +219,7 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
             if (currentRunId === runIdRef.current && !hasTriggeredHealForThisRunRef.current) {
               const isFatal = FATAL_ERROR_PATTERNS.some(pattern => pattern.test(line))
               if (isFatal) {
-                attemptSelfHeal(`The app failed to build/run with this error:\n${runLogTail.slice(-30).join('\n')}`)
+                attemptSelfHeal(`The app failed to build/run with this error:\n${runLogTail.slice(-60).join('\n')}`)
               }
             }
           }
@@ -283,7 +283,7 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
           const installExitCode = await installProcess.exit
           if (installExitCode !== 0) {
             if (!mounted || currentRunId !== runIdRef.current) return
-            return attemptSelfHeal(`npm install failed:\n${installLogTail.slice(-30).join('\n')}`)
+            return attemptSelfHeal(`npm install failed:\n${installLogTail.slice(-60).join('\n')}`)
           }
           lastInstalledPackageJsonRef.current = currentPackageJson
         }
@@ -312,7 +312,13 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
         if (!mounted || currentRunId !== runIdRef.current) return
 
         if (runExitCode !== 0) {
-          return attemptSelfHeal(`The document script exited with an error:\n${runLogTail.slice(-30).join('\n')}`)
+          // NEW: widened from 30 to 60 lines. A crash deep inside a
+          // library's own code (like pptxgenjs) can print a long stack
+          // trace -- the actual useful error message can end up further
+          // back than 30 lines caught, meaning self-healing was
+          // sometimes asked to fix something without ever actually
+          // seeing what broke.
+          return attemptSelfHeal(`The document script exited with an error:\n${runLogTail.slice(-60).join('\n')}`)
         }
 
         addLog('System: Script finished. Looking for the output file...')
