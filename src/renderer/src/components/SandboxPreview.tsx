@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef } from 'react'
 import { getWebContainer, buildFileSystemTree } from '../lib/webcontainer'
-import { Loader2, TerminalSquare, Globe, FileText, Download, Wrench } from 'lucide-react'
+import { Loader2, TerminalSquare, Globe, FileText, Download, Wrench, ChevronDown, ChevronUp } from 'lucide-react'
 
 interface SandboxPreviewProps {
   files: Record<string, string>
@@ -12,6 +12,16 @@ interface SandboxPreviewProps {
   agentKey?: 'jim' | 'dwight' | 'riley'
   instructions?: string
   onFilesHealed?: (files: Record<string, string>) => void
+  // NEW: the real audit record id for this generation, and whether
+  // strict verification is on. When a run genuinely succeeds, this
+  // component reports back so the audit record can be upgraded from
+  // "Pam approved" to "confirmed running" -- the actual point of this
+  // whole feature. onVerificationOutcome fires on both real success and
+  // real (post-self-heal) failure; the parent decides what's worth
+  // surfacing visibly based on whether strict mode is on.
+  auditId?: string | null
+  strictVerification?: boolean
+  onVerificationOutcome?: (success: boolean, message?: string) => void
 }
 
 const ACCENT = {
@@ -41,8 +51,17 @@ const FATAL_ERROR_PATTERNS = [
   /Internal server error/i,
 ]
 
-export default function SandboxPreview({ files, conversationId, agentKey, instructions, onFilesHealed }: SandboxPreviewProps) {
+export default function SandboxPreview({ files, conversationId, agentKey, instructions, onFilesHealed, auditId, strictVerification, onVerificationOutcome }: SandboxPreviewProps) {
   const [status, setStatus] = useState<'booting' | 'installing' | 'starting' | 'ready' | 'error' | 'healing'>('booting')
+  // NEW: the log panel used to permanently occupy a large, fixed chunk
+  // of vertical space, squeezing the actual preview into a small strip
+  // -- useful while something is booting or failing, much less useful
+  // once it's already working. Starts open (useful during boot), then
+  // auto-collapses the first time a run actually succeeds, freeing that
+  // space for the thing you actually want to look at. Always
+  // re-openable by hand regardless.
+  const [logsCollapsed, setLogsCollapsed] = useState(false)
+  const hasAutoCollapsedRef = useRef(false)
   const [logs, setLogs] = useState<string[]>([])
   const [url, setUrl] = useState<string | null>(null)
   const [documentResult, setDocumentResult] = useState<DocumentResult | null>(null)
@@ -68,9 +87,47 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
 
   const addLog = (msg: string) => setLogs(prev => [...prev.slice(-99), msg])
 
+  // NEW: the actual point of the whole execution-verification feature.
+  // Called only when the sandbox has genuinely run this generation
+  // successfully -- upgrades its audit record from "Pam approved" to
+  // "confirmed running." Best-effort: if auditId is missing (e.g. an
+  // older reopened result with no healing context) this just no-ops,
+  // same as self-healing already does in that situation.
+  const reportExecutionSuccess = async () => {
+    onVerificationOutcome?.(true)
+    if (!auditId) return
+    try {
+      // @ts-ignore
+      await window.api.markAuditExecuted(auditId)
+    } catch {
+      // Best-effort reporting -- never let this affect the actual run.
+    }
+  }
+
+  // Called when a generation could NOT be confirmed as running, even
+  // after self-healing exhausted its attempts. Always reported up;
+  // whether it's shown to the user depends on strict mode, decided by
+  // the parent, not here.
+  const reportExecutionFailure = (message: string) => {
+    onVerificationOutcome?.(false, message)
+  }
+
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [logs])
+
+  useEffect(() => {
+    if (status === 'ready' && !hasAutoCollapsedRef.current) {
+      hasAutoCollapsedRef.current = true
+      setLogsCollapsed(true)
+    }
+    // A fresh run (new files) should show its own boot log by default --
+    // reset so the next run isn't silently pre-collapsed before anyone's
+    // seen it succeed once.
+    if (status === 'booting') {
+      hasAutoCollapsedRef.current = false
+    }
+  }, [status])
 
   const teardownPrevious = async () => {
     unsubscribeServerReadyRef.current?.()
@@ -91,12 +148,14 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
     if (!canSelfHeal) {
       addLog('System: Cannot self-heal -- missing conversation/agent context for this result.')
       setStatus('error')
+      reportExecutionFailure('This result could not be verified as running -- no healing context was available to attempt a fix.')
       return
     }
     if (healingRef.current || hasTriggeredHealForThisRunRef.current) return
     if (healAttempt >= MAX_SELF_HEAL_ROUNDS) {
       addLog(`System: Already used ${MAX_SELF_HEAL_ROUNDS} self-heal attempts -- stopping rather than guessing again.`)
       setStatus('error')
+      reportExecutionFailure(`This build could not be verified as actually running, even after ${MAX_SELF_HEAL_ROUNDS} automatic repair attempts. It passed review but never ran successfully.`)
       return
     }
 
@@ -230,6 +289,7 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
             addLog(`System: Server ready on port ${port}`)
             setUrl(previewUrl)
             setStatus('ready')
+            reportExecutionSuccess()
           }
         })
         unsubscribeServerReadyRef.current = unsubscribe
@@ -343,6 +403,7 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
         if (mounted && currentRunId === runIdRef.current) {
           setDocumentResult(found)
           setStatus('ready')
+          reportExecutionSuccess()
         }
 
       } catch (err: any) {
@@ -457,17 +518,26 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
           )}
         </div>
 
-        <div className="h-48 bg-[#0f0f0f] border-t border-white/[0.06] flex flex-col">
-          <div className="px-3 py-1.5 border-b border-white/[0.05] bg-[#191919] flex items-center gap-2 text-[10px] text-neutral-500 font-mono uppercase tracking-wider">
-            <TerminalSquare size={12} />
-            Container Output
-          </div>
-          <div className="flex-1 p-3 overflow-y-auto font-mono text-[11px] text-neutral-400 leading-relaxed">
-            {logs.map((log, i) => (
-              <div key={i} className={log.includes('Error') || log.toLowerCase().includes('error') ? 'text-red-400' : ''}>{log}</div>
-            ))}
-            <div ref={logsEndRef} />
-          </div>
+        <div className={`bg-[#0f0f0f] border-t border-white/[0.06] flex flex-col transition-all duration-200 ${logsCollapsed ? 'h-9' : 'h-48'}`}>
+          <button
+            onClick={() => setLogsCollapsed(!logsCollapsed)}
+            className="px-3 py-1.5 border-b border-white/[0.05] bg-[#191919] flex items-center justify-between gap-2 text-[10px] text-neutral-500 font-mono uppercase tracking-wider shrink-0 hover:text-neutral-300 transition-colors"
+          >
+            <span className="flex items-center gap-2">
+              <TerminalSquare size={12} />
+              Container Output
+              {logsCollapsed && status === 'ready' && <span className="text-emerald-500 normal-case">-- running clean, tap to view log</span>}
+            </span>
+            {logsCollapsed ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+          </button>
+          {!logsCollapsed && (
+            <div className="flex-1 p-3 overflow-y-auto font-mono text-[11px] text-neutral-400 leading-relaxed">
+              {logs.map((log, i) => (
+                <div key={i} className={log.includes('Error') || log.toLowerCase().includes('error') ? 'text-red-400' : ''}>{log}</div>
+              ))}
+              <div ref={logsEndRef} />
+            </div>
+          )}
         </div>
       </div>
 

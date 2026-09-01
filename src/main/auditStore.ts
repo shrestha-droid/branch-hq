@@ -33,6 +33,15 @@ export interface AuditRecord {
   gate1Passed: boolean
   perFile: FileAuditEntry[]
   pamVerdict: 'APPROVED' | 'CHANGES_REQUESTED' | 'UNKNOWN'
+  // NEW: the honest gap this closes -- "Pam approved" is a text opinion
+  // formed by reading code, not proof it actually works. This starts
+  // false/pending on every record and only flips true when the sandbox
+  // has genuinely run this exact generation and it succeeded -- reported
+  // back from the renderer, the only place execution can actually
+  // happen. A record can be Pam-approved and never execution-verified;
+  // the report says so plainly rather than blurring the two together.
+  executionVerified: boolean
+  executionVerifiedAt: number | null
 }
 
 const AUDIT_LOG_PATH = () => path.join(app.getPath('userData'), 'branch-hq-audit-log.json')
@@ -55,10 +64,24 @@ async function persist(): Promise<void> {
   await fs.writeFile(AUDIT_LOG_PATH(), JSON.stringify(cache, null, 2), 'utf-8')
 }
 
-export async function recordAudit(entry: Omit<AuditRecord, 'id' | 'timestamp'>): Promise<AuditRecord> {
+export async function recordAudit(entry: Omit<AuditRecord, 'id' | 'timestamp' | 'executionVerified' | 'executionVerifiedAt'>): Promise<AuditRecord> {
   const records = await load()
-  const record: AuditRecord = { ...entry, id: randomUUID(), timestamp: Date.now() }
+  const record: AuditRecord = { ...entry, id: randomUUID(), timestamp: Date.now(), executionVerified: false, executionVerifiedAt: null }
   records.push(record)
+  await persist()
+  return record
+}
+
+// NEW: called from the renderer -- the only place a sandbox actually
+// runs -- once a generation has genuinely been executed successfully.
+// Returns null if the id doesn't exist rather than throwing, since this
+// is best-effort reporting, not something that should ever break a run.
+export async function markExecutionVerified(id: string): Promise<AuditRecord | null> {
+  const records = await load()
+  const record = records.find(r => r.id === id)
+  if (!record) return null
+  record.executionVerified = true
+  record.executionVerifiedAt = Date.now()
   await persist()
   return record
 }
@@ -90,6 +113,7 @@ export async function generateAuditReport(conversationId: string): Promise<{ rep
     lines.push(`  Attempt: ${r.attempt}`)
     lines.push(`  Gate 1 (deterministic scan): ${r.gate1Passed ? 'PASSED' : 'BLOCKED'}`)
     lines.push(`  Gate 2 (Pam QA review): ${r.pamVerdict}`)
+    lines.push(`  Execution verified (sandbox actually run): ${r.executionVerified ? `YES -- confirmed ${new Date(r.executionVerifiedAt!).toISOString()}` : 'NO -- reviewed by Pam only, never actually run'}`)
     for (const f of r.perFile) {
       lines.push(`    - ${f.file}: ${f.passed ? 'PASS' : 'FAIL'}`)
       for (const b of f.blockers) lines.push(`        BLOCKER: ${b}`)
@@ -105,6 +129,13 @@ export async function generateAuditReport(conversationId: string): Promise<{ rep
   lines.push('proves the report has not been altered since it was generated.')
   lines.push('It is not a cryptographic signature backed by a signing')
   lines.push('authority or private key.')
+  lines.push('')
+  lines.push('"Execution verified" is a separate, stronger claim than Gate 2:')
+  lines.push('Pam\'s review is an opinion formed by reading code. Execution')
+  lines.push('verification means the code was actually run in the sandbox and')
+  lines.push('genuinely worked. A generation can be Pam-approved and still say')
+  lines.push('NO here if it was never actually run -- that is reported honestly,')
+  lines.push('not blurred into a single pass/fail.')
 
   const report = lines.join('\n')
   const integrityHash = createHash('sha256').update(report).digest('hex')

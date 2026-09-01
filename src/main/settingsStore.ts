@@ -22,6 +22,15 @@ export interface AppSettings {
   localModelName: string
   localEmbeddingModelName: string
   defaultTargetDir: string
+  // NEW: off by default on purpose. When on, nothing is treated as
+  // finished until the sandbox has actually run it successfully -- the
+  // preview auto-boots the moment code is staged instead of waiting for
+  // a manual click, and a failure routes into self-healing before the
+  // result is ever shown as complete. Real cost: every generation, even
+  // a one-line change, pays for a full sandbox boot before you see
+  // anything. Off by default so everyday speed isn't traded away
+  // automatically; on for anyone who wants the stronger guarantee.
+  strictVerification: boolean
 }
 
 const SETTINGS_PATH = () => path.join(app.getPath('userData'), 'branch-hq-settings.json')
@@ -42,7 +51,8 @@ function defaults(): AppSettings {
     localModelBaseUrl: process.env.LOCAL_MODEL_BASE_URL || '',
     localModelName: process.env.LOCAL_MODEL_NAME || 'llama3.1',
     localEmbeddingModelName: process.env.LOCAL_EMBEDDING_MODEL_NAME || 'nomic-embed-text',
-    defaultTargetDir: process.env.DEFAULT_TARGET_DIR || ''
+    defaultTargetDir: process.env.DEFAULT_TARGET_DIR || '',
+    strictVerification: false
   }
 }
 

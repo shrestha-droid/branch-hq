@@ -368,55 +368,26 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
           {messages.length === 0 ? (
             <div className="h-full flex flex-col items-center justify-center text-neutral-500">
               <style>{`
+                @keyframes branchBreathe {
+                  0%, 100% { transform: scale(1); }
+                  50% { transform: scale(1.08); }
+                }
                 @keyframes branchGlowPulse {
                   0%, 100% { opacity: 0.35; }
                   50% { opacity: 0.6; }
                 }
-                @keyframes branchSpin {
-                  from { transform: rotate(0deg); }
-                  to { transform: rotate(360deg); }
-                }
               `}</style>
-              {/* NEW: an original radial burst mark -- own signature
-                  element for this spot, not a copy of anything else.
-                  Slow, continuous rotation plus a soft ambient glow
-                  behind it. Kept to a fixed, contained size -- it should
-                  never sit over or hide any part of the page. */}
-              <div className="relative w-24 h-24 mb-4">
+              <div className="relative w-24 h-24 mb-4 flex items-center justify-center">
                 <div
                   className={`absolute inset-0 ${ACCENT.bg} rounded-full blur-xl`}
                   style={{ animation: 'branchGlowPulse 4s ease-in-out infinite' }}
                 />
-                <svg
-                  viewBox="0 0 100 100"
-                  className="relative w-full h-full"
-                  style={{ animation: 'branchSpin 14s linear infinite' }}
+                <div
+                  className="relative"
+                  style={{ animation: 'branchBreathe 3s ease-in-out infinite' }}
                 >
-                  {[
-                    { len: 40, w: 3.2, tone: '#a8443c', op: 1 },
-                    { len: 30, w: 2.6, tone: '#d9847b', op: 0.85 },
-                    { len: 37, w: 3.0, tone: '#a8443c', op: 0.95 },
-                    { len: 27, w: 2.4, tone: '#d9847b', op: 0.75 },
-                    { len: 42, w: 3.2, tone: '#a8443c', op: 1 },
-                    { len: 29, w: 2.6, tone: '#d9847b', op: 0.8 },
-                    { len: 35, w: 2.8, tone: '#a8443c', op: 0.9 },
-                    { len: 26, w: 2.4, tone: '#d9847b', op: 0.7 },
-                    { len: 39, w: 3.0, tone: '#a8443c', op: 0.95 },
-                    { len: 28, w: 2.6, tone: '#d9847b', op: 0.8 }
-                  ].map((petal, i) => {
-                    const tipY = 50 - petal.len
-                    const halfW = petal.w
-                    return (
-                      <path
-                        key={i}
-                        d={`M 50,${50 - petal.len * 0.15} C ${50 - halfW * 1.6},${50 - petal.len * 0.55} ${50 - halfW},${tipY + 6} 50,${tipY} C 50,${tipY} ${50 + halfW},${tipY + 6} ${50 + halfW * 1.6},${50 - petal.len * 0.55} C ${50 + halfW * 0.6},${50 - petal.len * 0.3} 50,${50 - petal.len * 0.15} 50,${50 - petal.len * 0.15} Z`}
-                        fill={petal.tone}
-                        opacity={petal.op}
-                        transform={`rotate(${i * 36} 50 50)`}
-                      />
-                    )
-                  })}
-                </svg>
+                  <Bot size={32} className={ACCENT.text} />
+                </div>
               </div>
               <p className="text-lg font-medium text-neutral-200">Branch HQ</p>
               <p className="text-sm mt-2 text-neutral-500 max-w-sm text-center">

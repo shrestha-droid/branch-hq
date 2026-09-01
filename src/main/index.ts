@@ -14,7 +14,7 @@ import {
 import { searchRelevantCode } from './vectorStore'
 import { generateEmbedding, indexWorkspace } from './indexer'
 import { getSettings, updateSettings } from './settingsStore'
-import { recordAudit, generateAuditReport } from './auditStore'
+import { recordAudit, generateAuditReport, markExecutionVerified } from './auditStore'
 import { runMechanicalAudit, AuditResult } from './gate1'
 import { looksTransient } from './resilience'
 
@@ -253,9 +253,17 @@ const countingProvider: ModelProvider = {
       // else being set up correctly, unlike a cross-provider fallback
       // to local routing would.
       if (settings.modelProvider === 'gemini' && settings.fallbackGeminiModel && looksTransient(err)) {
-        const result = await withTransientRetry(() => provider.generate(systemPrompt, history, settings.fallbackGeminiModel))
-        recordUsage(charsIn, result.length)
-        return result
+        try {
+          const result = await withTransientRetry(() => provider.generate(systemPrompt, history, settings.fallbackGeminiModel))
+          recordUsage(charsIn, result.length)
+          return result
+        } catch (fallbackErr: any) {
+          // FIXED: previously, if the fallback ALSO failed, the original
+          // primary-model error was silently discarded -- the user would
+          // only ever see the fallback's error, with no way to tell this
+          // was actually a dual failure or what the primary problem was.
+          throw new Error(`Primary model failed (${err.message}); fallback also failed (${fallbackErr.message})`)
+        }
       }
       throw err
     }
@@ -398,7 +406,9 @@ function injectBackendBoilerplate(extractedFiles: Record<string, string>): Recor
         "bcryptjs": "^2.4.3",
         "jsonwebtoken": "^9.0.2",
         "zod": "^3.23.8",
-        "dotenv": "^16.4.5"
+        "dotenv": "^16.4.5",
+        "lowdb": "^7.0.1",
+        "express-rate-limit": "^7.2.0"
       },
       devDependencies: {
         "typescript": "^5.4.5",
@@ -501,7 +511,28 @@ A financial dashboard, a kids' game, and a developer tool should never end up lo
   DWIGHT_BACKEND: `You are Dwight, Backend Specialist. Write complete, functional Node.js/TypeScript code using Express.
 ALWAYS wrap your code in standard Markdown code blocks (e.g., \`\`\`ts ).
 ALWAYS declare file paths at the very start of the code blocks (e.g., // File: src/server.ts).
-CRITICAL: You are ONLY allowed to use 'express', 'cors', 'bcryptjs', 'jsonwebtoken', 'zod', and 'dotenv' as external dependencies. Do not import anything else. In particular, never import 'bcrypt' -- use 'bcryptjs' instead, since this code runs inside a browser-based WebContainer sandbox that cannot compile native Node addons.`,
+CRITICAL: You are ONLY allowed to use 'express', 'cors', 'bcryptjs', 'jsonwebtoken', 'zod', 'dotenv', 'lowdb', and 'express-rate-limit' as external dependencies. Do not import anything else. In particular, never import 'bcrypt' -- use 'bcryptjs' instead, since this code runs inside a browser-based WebContainer sandbox that cannot compile native Node addons. For unique IDs, use Node's built-in crypto.randomUUID() -- no separate package needed.
+
+APPROACH -- follow this before writing any code:
+Act like a senior backend engineer reviewing a junior's first draft, not someone who just wants the endpoint to respond. Before writing code, briefly consider: what actually goes wrong with this request in the real world -- bad input, a resource that doesn't exist, a duplicate submission, no auth -- and what response shape communicates that clearly, not just "it works" for the one happy path.
+
+AVOID THESE -- they are tells of a lazy, generic backend, not real engineering:
+- Returning 200 for every response regardless of what actually happened, success or failure
+- One catch-all try/catch that does res.status(500).send('Error') with no distinction between what went wrong
+- Validation that only checks a field is present, never its shape, type, or bounds
+- An endpoint that only works for the happy path, with no handling for a missing resource or a duplicate entry
+- Storing anything in a plain in-memory array or object and calling it "the database" -- real persistence is available now, use it
+- Skipping hashing or validation "for now, it's just a prototype" -- Gate 1 will block it anyway, and it's not real practice either way
+
+NEW: you now have real persistence available (lowdb) and real rate limiting (express-rate-limit) -- reach for these specific, named techniques where they genuinely fit the request, not as a checklist to force into every response:
+- Real persistence via lowdb: data written in one request is actually still there on the next one, backed by a real JSON file in the sandbox -- not an array that resets. Use this by default for anything that should survive between requests.
+- Rate limiting on anything a real attacker would abuse: login, registration, password reset, search -- apply express-rate-limit directly on that route, not globally on the whole app if only one route actually needs it.
+- Meaningful status codes: 201 for something created, 404 for a resource that doesn't exist, 409 for a duplicate/conflict, 422 for a validation failure that's well-formed but semantically wrong -- not just 200 and 500 for everything.
+- A consistent error shape across the whole API (e.g. { error: { code, message } }), not a different ad hoc string per route.
+- Pagination (?page=, ?limit=) on any endpoint that returns a list, instead of dumping the entire dataset back every time.
+- Field-level validation errors from zod surfaced clearly to the client (which field, what was wrong), not just a generic "invalid input."
+
+A login endpoint, a public search API, and an internal admin tool have real, different security and reliability needs -- match the actual engineering to what's genuinely being built, not a template.`,
   PAM_AUDITOR_LOGIC: `You are Pam, the QA Auditor. Mechanical checks have passed.
 Review the code for logical correctness, security vulnerabilities, edge cases, and missing input validation.
 End your review with exactly one line, in exactly this format and nothing else on that line, so it can be read automatically:
@@ -697,6 +728,23 @@ typedIpc.handle('audit:export', async (_event: any, conversationId: string) => {
   }
 })
 
+// NEW: called from the renderer -- the only place a sandbox actually
+// runs -- the moment a generation has genuinely been executed
+// successfully (a web app reached server-ready, or a document script
+// produced its real output file). Upgrades that specific record from
+// "Pam approved" to "confirmed running." Best-effort: a missing/unknown
+// id (e.g. an old conversation reopened without healing context) is not
+// an error, just nothing to upgrade.
+typedIpc.handle('audit:markExecuted', async (_event: any, auditId: string) => {
+  try {
+    if (!auditId) return { success: true, updated: false }
+    const record = await markExecutionVerified(auditId)
+    return { success: true, updated: !!record }
+  } catch (err: any) {
+    return { success: false, error: err.message }
+  }
+})
+
 typedIpc.handle('conversation:get', async (_event: any, id: string) => {
   return await getConversation(id)
 })
@@ -829,7 +877,13 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
       managerResponse = await fetchChatCompletion(PROMPTS.MICHAEL_MANAGER, historyForAttempt)
 
       try {
-        const jsonMatch = managerResponse.match(/\{[\s\S]*\}/)
+        // FIXED: if the model wraps its JSON in a markdown code fence
+        // (```json ... ```) with any prose before or after it, the old
+        // greedy match-from-first-{-to-last-} could swallow fence
+        // markers or extra text along with the real JSON. Stripping
+        // fences first is cheap and removes that whole class of failure.
+        const withoutFences = managerResponse.replace(/```(?:json)?/gi, '')
+        const jsonMatch = withoutFences.match(/\{[\s\S]*\}/)
         if (!jsonMatch) throw new Error("No JSON structure found")
         decision = JSON.parse(jsonMatch[0])
         break
@@ -878,12 +932,25 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
     // again -- capped at MAX_AUTO_FIX_ROUNDS so a never-satisfied Pam
     // can't loop forever.
     const baseInstructions = decision.instructions || ''
+    // FIXED: this used to run for every agent, including Riley. Riley
+    // produces a standalone document script -- there's no legitimate
+    // reason for him to see React/Express source from some other,
+    // unrelated project sitting in the target folder. Confirmed real
+    // failure pattern: after several code projects had been built, a PPT
+    // prompt sharing a word with an old project's filename (e.g. "hero
+    // section" matching a leftover Hero.tsx) fed that file's actual
+    // source code into Riley's instructions, producing broken output.
+    // Only Jim and Dwight legitimately need to see what already exists.
     const settingsForSnapshot = await getSettings()
-    const existingProjectSnapshot = await getExistingProjectSnapshot(settingsForSnapshot.defaultTargetDir, prompt)
+    const existingProjectSnapshot = agentKey === 'riley'
+      ? ''
+      : await getExistingProjectSnapshot(settingsForSnapshot.defaultTargetDir, prompt)
     let currentInstructions = baseInstructions + projectContext + existingProjectSnapshot
     let specialistOutput = ''
     let staticAudit: AuditResult
     let stageableFiles: Record<string, string> | undefined
+
+    let latestAuditId: string | null = null
 
     for (let round = 1; round <= MAX_AUTO_FIX_ROUNDS; round++) {
       const roundTag = MAX_AUTO_FIX_ROUNDS > 1 ? ` (attempt ${round} of ${MAX_AUTO_FIX_ROUNDS})` : ''
@@ -925,11 +992,12 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
       const verdictMatch = pamReview.match(/PAM_VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/i)
       const approved = verdictMatch ? verdictMatch[1].toUpperCase() === 'APPROVED' : false
 
-      await recordAudit({
+      const auditRecord = await recordAudit({
         conversationId, agentKey, attempt: round,
         gate1Passed: true, perFile: staticAudit.perFile,
         pamVerdict: verdictMatch ? (verdictMatch[1].toUpperCase() as 'APPROVED' | 'CHANGES_REQUESTED') : 'UNKNOWN'
       })
+      latestAuditId = auditRecord.id
 
       if (approved || round === MAX_AUTO_FIX_ROUNDS) {
         break
@@ -938,7 +1006,7 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
       currentInstructions = `${baseInstructions}${projectContext}${existingProjectSnapshot}\n\nYour previous attempt received this QA feedback -- address it before trying again:\n${pamReview}`
     }
 
-    return { success: true, messages: newMessages, files: stageableFiles, agentKey, instructions: baseInstructions }
+    return { success: true, messages: newMessages, files: stageableFiles, agentKey, instructions: baseInstructions, auditId: latestAuditId }
   } catch (error: any) {
     const errMsg = await addMessage(conversationId, 'error', error.message || 'Fatal pipeline error.')
     return { success: false, messages: [...newMessages, errMsg] }
@@ -1011,7 +1079,20 @@ typedIpc.handle('heal:invoke', async (_event: any, {
     const pamMsg = await addMessage(conversationId, 'pam', pamReview)
     newMessages.push(pamMsg)
 
-    return { success: true, messages: newMessages, files: stageableFiles, agentKey, instructions: previousInstructions }
+    // NEW: previously self-healing produced no audit record at all --
+    // any conversation where it fired had a genuinely incomplete audit
+    // trail, since the corrected version that actually got staged was
+    // never recorded anywhere. Recorded the same way the main pipeline
+    // does, so this generation can also be upgraded to execution-verified
+    // once the renderer confirms it actually runs.
+    const verdictMatch = pamReview.match(/PAM_VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/i)
+    const auditRecord = await recordAudit({
+      conversationId, agentKey, attempt,
+      gate1Passed: true, perFile: staticAudit.perFile,
+      pamVerdict: verdictMatch ? (verdictMatch[1].toUpperCase() as 'APPROVED' | 'CHANGES_REQUESTED') : 'UNKNOWN'
+    })
+
+    return { success: true, messages: newMessages, files: stageableFiles, agentKey, instructions: previousInstructions, auditId: auditRecord.id }
   } catch (error: any) {
     const errMsg = await addMessage(conversationId, 'error', error.message || 'Self-healing failed.')
     return { success: false, messages: [errMsg] }

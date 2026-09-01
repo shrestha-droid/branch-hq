@@ -34,7 +34,17 @@ export default function App() {
     conversationId: string
     agentKey?: 'jim' | 'dwight' | 'riley'
     instructions?: string
+    auditId?: string | null
   } | null>(null)
+  // NEW: whether "nothing counts as done until the sandbox actually
+  // confirms it runs" is on. Off by default -- see settingsStore.ts for
+  // the real tradeoff this makes.
+  const [strictVerification, setStrictVerification] = useState(false)
+  // NEW: visible only when strict mode is on and a generation ultimately
+  // could not be confirmed as actually running, even after self-healing
+  // exhausted its attempts -- surfaces that honestly instead of leaving
+  // it buried in the sandbox's own log panel.
+  const [verificationFailedNotice, setVerificationFailedNotice] = useState<string | null>(null)
 
   const [targetDir, setTargetDir] = useState('/Users/ShresthaPandey/branch-hq-output')
   const [isPushing, setIsPushing] = useState(false)
@@ -64,17 +74,19 @@ export default function App() {
         setTargetDir(s.defaultTargetDir)
         setBaseTargetDir(s.defaultTargetDir)
       }
+      setStrictVerification(!!s.strictVerification)
     }).catch(() => {})
   }, [])
 
-  const handleCodeGenerated = (result: { files: Record<string, string>; conversationId: string; agentKey?: 'jim' | 'dwight' | 'riley'; instructions?: string; suggestedFolderName?: string }) => {
+  const handleCodeGenerated = (result: { files: Record<string, string>; conversationId: string; agentKey?: 'jim' | 'dwight' | 'riley'; instructions?: string; suggestedFolderName?: string; auditId?: string | null }) => {
     if (result.files && Object.keys(result.files).length > 0) {
       setPreviewFiles(result.files)
-      setHealContext({ conversationId: result.conversationId, agentKey: result.agentKey, instructions: result.instructions })
+      setHealContext({ conversationId: result.conversationId, agentKey: result.agentKey, instructions: result.instructions, auditId: result.auditId })
       const primary = Object.keys(result.files).find(f => f.includes('App.tsx')) || Object.keys(result.files)[0]
       if (primary) setSelectedFile(primary)
       setViewMode('preview')
       setPushStatus(null)
+      setVerificationFailedNotice(null)
       refreshUsage()
 
       // NEW: give each new project its own folder automatically, rather
@@ -107,6 +119,7 @@ export default function App() {
     setSelectedFile(null)
     setHealContext(null)
     setPushStatus(null)
+    setVerificationFailedNotice(null)
   }
 
   const handleIndexWorkspace = async () => {
@@ -292,14 +305,31 @@ export default function App() {
               </div>
             </div>
           ) : (
-            <div className="flex-1 overflow-hidden relative">
-              <SandboxPreview
-                files={previewFiles}
-                conversationId={healContext?.conversationId}
-                agentKey={healContext?.agentKey}
-                instructions={healContext?.instructions}
-                onFilesHealed={handleFilesHealed}
-              />
+            <div className="flex-1 overflow-hidden relative flex flex-col">
+              {verificationFailedNotice && (
+                <div className="px-4 py-2.5 bg-red-950/40 border-b border-red-900/50 text-xs text-red-300 flex items-start gap-2 shrink-0">
+                  <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+                  <span>{verificationFailedNotice}</span>
+                </div>
+              )}
+              <div className="flex-1 overflow-hidden relative">
+                <SandboxPreview
+                  files={previewFiles}
+                  conversationId={healContext?.conversationId}
+                  agentKey={healContext?.agentKey}
+                  instructions={healContext?.instructions}
+                  auditId={healContext?.auditId}
+                  strictVerification={strictVerification}
+                  onFilesHealed={handleFilesHealed}
+                  onVerificationOutcome={(success, message) => {
+                    if (success) {
+                      setVerificationFailedNotice(null)
+                    } else if (strictVerification && message) {
+                      setVerificationFailedNotice(message)
+                    }
+                  }}
+                />
+              </div>
             </div>
           )}
 

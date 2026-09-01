@@ -9,6 +9,7 @@ interface Settings {
   localModelName: string
   localEmbeddingModelName: string
   defaultTargetDir: string
+  strictVerification: boolean
 }
 
 const ACCENT = {
@@ -161,6 +162,25 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
               className={`w-full bg-black/30 border border-white/[0.06] rounded-md px-3 py-2 text-xs text-neutral-200 focus:${ACCENT.border} outline-none transition-colors`}
             />
             <p className="text-[11px] text-neutral-500 mt-1.5">Pre-fills the target folder box on startup -- still yours to change per push.</p>
+          </div>
+
+          <div className="pt-1 border-t border-white/[0.06]">
+            <div className="flex items-center justify-between pt-4">
+              <div className="pr-4">
+                <label className="text-xs font-medium text-neutral-300 block">Strict Verification</label>
+                <p className="text-[11px] text-neutral-500 mt-1 leading-relaxed">
+                  Nothing counts as finished until the sandbox actually confirms it runs -- Pam's review alone won't be enough. Real cost: every generation waits on a full sandbox run before it's shown as done, even a one-line change. Off by default for everyday speed; worth turning on for anything headed into a real audit report.
+                </p>
+              </div>
+              <button
+                onClick={() => setSettings({ ...settings, strictVerification: !settings.strictVerification })}
+                className={`relative shrink-0 w-10 h-6 rounded-full transition-colors ${settings.strictVerification ? ACCENT.bg : 'bg-white/10'}`}
+              >
+                <span
+                  className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform ${settings.strictVerification ? 'translate-x-4' : 'translate-x-0'}`}
+                />
+              </button>
+            </div>
           </div>
         </div>
 
