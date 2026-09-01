@@ -75,6 +75,23 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
   const healingRef = useRef(false)
   const justHealedRef = useRef(false)
   const hasTriggeredHealForThisRunRef = useRef(false)
+  // NEW: whether a real Node/npm runtime is available on this machine.
+  // Detected once, on mount -- a real answer, not assumed. null means
+  // "still checking," which briefly favors WebContainers until it
+  // resolves, since that path is already proven to work everywhere.
+  const [nativeAvailable, setNativeAvailable] = useState<boolean | null>(null)
+  const nativeRunIdRef = useRef<string | null>(null)
+  const nativeUnsubscribersRef = useRef<(() => void)[]>([])
+  // Which mode actually rendered this run -- shown in the UI so this is
+  // never a hidden implementation detail. Distinct from nativeAvailable:
+  // that's the capability, this is what actually happened this run.
+  const [activeMode, setActiveMode] = useState<'webcontainer' | 'native' | null>(null)
+
+  useEffect(() => {
+    // @ts-ignore
+    window.api.detectRuntime().then((r: any) => setNativeAvailable(r.available)).catch(() => setNativeAvailable(false))
+  }, [])
+
   // NEW: remembers what was actually installed last time. The generated
   // application code changes on almost every run, but the dependency
   // list (hardcoded by the scaffolder) almost never does -- reinstalling
@@ -138,6 +155,21 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
 
     try { await installProcessRef.current?.kill?.() } catch { /* already gone, fine */ }
     installProcessRef.current = null
+  }
+
+  // Real processes need real teardown too -- otherwise switching
+  // conversations or generating something new would leave old servers
+  // running in the background indefinitely, quietly holding their ports.
+  const teardownNative = async () => {
+    for (const unsubscribe of nativeUnsubscribersRef.current) unsubscribe()
+    nativeUnsubscribersRef.current = []
+    if (nativeRunIdRef.current) {
+      try {
+        // @ts-ignore
+        await window.api.stopNativeSandbox(nativeRunIdRef.current)
+      } catch { /* best-effort -- nothing more useful to do if this fails */ }
+      nativeRunIdRef.current = null
+    }
   }
 
   // NEW: the actual self-heal call. Feeds the real failure text back to
@@ -414,17 +446,99 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
       }
     }
 
+    // NEW: the actual automatic-backend fix. When a real Node/npm runtime
+    // is available, this runs the frontend AND (if one was built
+    // alongside it) the backend as real, separate, coordinated
+    // processes -- no manual "cd server && npm run dev" needed. Falls
+    // back to WebContainers below whenever a native runtime isn't
+    // available, so nothing breaks on a machine without Node installed.
+    async function bootNative() {
+      try {
+        await teardownPrevious()
+        await teardownNative()
+        if (!mounted || currentRunId !== runIdRef.current) return
+
+        setStatus('booting')
+        setUrl(null)
+        setActiveMode('native')
+        addLog('System: Starting native runtime (real Node process, both frontend and backend if present)...')
+
+        const runId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+        nativeRunIdRef.current = runId
+        let frontendReadyReceived = false
+
+        // @ts-ignore
+        const unsubLog = window.api.onSandboxLog((data: any) => {
+          if (data.runId !== runId || !mounted) return
+          addLog(`[${data.source}] ${data.line}`)
+        })
+        // @ts-ignore
+        const unsubFrontendReady = window.api.onSandboxFrontendReady((data: any) => {
+          if (data.runId !== runId || !mounted || currentRunId !== runIdRef.current) return
+          frontendReadyReceived = true
+          setUrl(data.url)
+          setStatus('ready')
+          reportExecutionSuccess()
+        })
+        // @ts-ignore
+        const unsubBackendReady = window.api.onSandboxBackendReady((data: any) => {
+          if (data.runId !== runId || !mounted) return
+          addLog(`System: Backend confirmed running at ${data.url}`)
+        })
+        // @ts-ignore
+        const unsubError = window.api.onSandboxError((data: any) => {
+          if (data.runId !== runId || !mounted || currentRunId !== runIdRef.current) return
+          addLog(`Error [${data.source}]: ${data.message}`)
+          // A backend-only failure doesn't fail the whole run -- the
+          // frontend may still work on its own, same as the WebContainer
+          // path only ever running one process today. A frontend/system
+          // failure is fatal to the actual preview, so that's what
+          // triggers self-healing.
+          if (data.source === 'frontend' || data.source === 'system') {
+            attemptSelfHeal(`Native process failed (${data.source}): ${data.message}`)
+          }
+        })
+
+        nativeUnsubscribersRef.current = [unsubLog, unsubFrontendReady, unsubBackendReady, unsubError]
+
+        // @ts-ignore
+        const result = await window.api.startNativeSandbox(runId, files)
+        if (!mounted || currentRunId !== runIdRef.current) return
+        if (!result.success && !frontendReadyReceived) {
+          return attemptSelfHeal(`Native sandbox failed to start: ${result.error}`)
+        }
+      } catch (err: any) {
+        if (mounted) {
+          setStatus('error')
+          addLog(`Error: ${err.message || 'Native execution failed'}`)
+        }
+      }
+    }
+
     if (isDocumentOutput) {
+      // Documents are quick, one-shot scripts with no server/port
+      // involved -- no benefit to native here, and WebContainers already
+      // handle this path without hitting any of the service-worker
+      // fragility that only affects the live-preview web-app path.
       runDocumentScript()
+    } else if (nativeAvailable === null) {
+      addLog('System: Checking for a native runtime...')
+      // Effect re-runs once detection resolves, since nativeAvailable is
+      // in the dependency list below -- nothing to boot yet.
+    } else if (nativeAvailable) {
+      setActiveMode('native')
+      bootNative()
     } else {
+      setActiveMode('webcontainer')
       bootWebApp()
     }
 
     return () => {
       mounted = false
       teardownPrevious()
+      teardownNative()
     }
-  }, [files])
+  }, [files, nativeAvailable])
 
   const handleDownload = () => {
     if (!documentResult) return
@@ -459,6 +573,11 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
           {status !== 'ready' && status !== 'error' && status !== 'healing' && <Loader2 size={14} className={`animate-spin ${ACCENT.text}`} />}
           {status === 'ready' && <Globe size={14} className="text-emerald-400" />}
           <span className="font-medium text-neutral-300 capitalize">{statusLabel()}</span>
+          {activeMode && (
+            <span className={`text-[10px] px-1.5 py-0.5 rounded uppercase tracking-wide ${activeMode === 'native' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-white/10 text-neutral-400'}`}>
+              {activeMode === 'native' ? 'Native' : 'WebContainer'}
+            </span>
+          )}
         </div>
         {url && (
           <a href={url} target="_blank" rel="noreferrer" className={`${ACCENT.text} hover:underline`}>

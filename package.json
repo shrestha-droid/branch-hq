@@ -28,6 +28,8 @@
     "@webcontainer/api": "^1.6.4",
     "better-sqlite3": "^13.0.3",
     "dotenv": "^17.4.2",
+    "jszip": "^3.10.1",
+    "jzip": "^1.0.0",
     "lucide-react": "^1.35.0",
     "react-markdown": "^10.1.0",
     "zustand": "^5.0.15"

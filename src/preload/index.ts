@@ -16,6 +16,37 @@ contextBridge.exposeInMainWorld('api', {
     attempt: number
   }) => ipcRenderer.invoke('heal:invoke', params),
 
+  // NEW: native execution engine -- a real Node/npm runtime instead of
+  // WebContainers, when one is actually available on the machine.
+  detectRuntime: () => ipcRenderer.invoke('runtime:detect'),
+  startNativeSandbox: (runId: string, files: Record<string, string>) =>
+    ipcRenderer.invoke('sandbox:startNative', { runId, files }),
+  stopNativeSandbox: (runId: string) => ipcRenderer.invoke('sandbox:stopNative', { runId }),
+  // Streaming events from a native run -- log lines and readiness/error
+  // signals arrive over time, not as a single request/response. Each
+  // listener returns an unsubscribe function so the caller can clean up
+  // when it stops caring (switching runs, unmounting).
+  onSandboxLog: (callback: (data: { runId: string; source: string; line: string }) => void) => {
+    const listener = (_event: any, data: any) => callback(data)
+    ipcRenderer.on('sandbox:log', listener)
+    return () => ipcRenderer.removeListener('sandbox:log', listener)
+  },
+  onSandboxFrontendReady: (callback: (data: { runId: string; url: string; port: number }) => void) => {
+    const listener = (_event: any, data: any) => callback(data)
+    ipcRenderer.on('sandbox:frontend-ready', listener)
+    return () => ipcRenderer.removeListener('sandbox:frontend-ready', listener)
+  },
+  onSandboxBackendReady: (callback: (data: { runId: string; url: string; port: number }) => void) => {
+    const listener = (_event: any, data: any) => callback(data)
+    ipcRenderer.on('sandbox:backend-ready', listener)
+    return () => ipcRenderer.removeListener('sandbox:backend-ready', listener)
+  },
+  onSandboxError: (callback: (data: { runId: string; source: string; message: string }) => void) => {
+    const listener = (_event: any, data: any) => callback(data)
+    ipcRenderer.on('sandbox:error', listener)
+    return () => ipcRenderer.removeListener('sandbox:error', listener)
+  },
+
   // Workspace & File System Ops
   indexWorkspace: (targetPath?: string) => ipcRenderer.invoke('workspace:index', targetPath),
   writeFiles: (targetDirectory: string, files: Record<string, string>, overwriteConfirmed?: boolean) =>
@@ -24,6 +55,11 @@ contextBridge.exposeInMainWorld('api', {
   // without writing anything.
   checkFileConflicts: (targetDirectory: string, files: Record<string, string>) =>
     ipcRenderer.invoke('fs:checkConflicts', { targetDirectory, files }),
+  // NEW: a real ZIP download -- opens a native save dialog, writes a
+  // genuine .zip of the merged file set. For someone who just wants the
+  // code to take elsewhere and deploy it themselves.
+  downloadZip: (files: Record<string, string>, suggestedName?: string) =>
+    ipcRenderer.invoke('fs:downloadZip', { files, suggestedName }),
   // NEW: model-call usage stats for the current session/conversation.
   getUsage: (conversationId?: string) => ipcRenderer.invoke('usage:get', conversationId),
   // NEW: live settings -- provider, model, default folder. Changing
@@ -58,9 +94,17 @@ declare global {
         errorLog: string
         attempt: number
       }) => Promise<{ success: boolean; messages?: any[]; files?: Record<string, string>; agentKey?: 'jim' | 'dwight' | 'riley'; instructions?: string; auditId?: string; error?: string }>;
+      detectRuntime: () => Promise<{ available: boolean; nodeVersion?: string; npmVersion?: string }>;
+      startNativeSandbox: (runId: string, files: Record<string, string>) => Promise<{ success: boolean; error?: string }>;
+      stopNativeSandbox: (runId: string) => Promise<{ success: boolean }>;
+      onSandboxLog: (callback: (data: { runId: string; source: string; line: string }) => void) => () => void;
+      onSandboxFrontendReady: (callback: (data: { runId: string; url: string; port: number }) => void) => () => void;
+      onSandboxBackendReady: (callback: (data: { runId: string; url: string; port: number }) => void) => () => void;
+      onSandboxError: (callback: (data: { runId: string; source: string; message: string }) => void) => () => void;
       indexWorkspace: (targetPath?: string) => Promise<{ success: boolean; indexedFiles?: number; error?: string }>;
       writeFiles: (targetDirectory: string, files: Record<string, string>, overwriteConfirmed?: boolean) => Promise<{ success: boolean; writtenFiles?: string[]; skippedFiles?: string[]; error?: string }>;
       checkFileConflicts: (targetDirectory: string, files: Record<string, string>) => Promise<{ success: boolean; conflicts?: string[]; error?: string }>;
+      downloadZip: (files: Record<string, string>, suggestedName?: string) => Promise<{ success: boolean; savedTo?: string; canceled?: boolean; error?: string }>;
       getUsage: (conversationId?: string) => Promise<{ success: boolean; session: { callCount: number; charsIn: number; charsOut: number }; conversation: { callCount: number; charsIn: number; charsOut: number } | null }>;
       getSettings: () => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; fallbackGeminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string; strictVerification: boolean }>;
       updateSettings: (partial: Record<string, any>) => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; fallbackGeminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string; strictVerification: boolean }>;

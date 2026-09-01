@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import ChatInterface from './components/ChatInterface'
 import SandboxPreview from './components/SandboxPreview'
 import SettingsModal from './components/SettingsModal'
-import { Code2, FileCode, X, CheckCircle2, Play, HardDriveDownload, Loader2, AlertTriangle, Activity, ShieldCheck, Maximize2, Minimize2 } from 'lucide-react'
+import { Code2, FileCode, X, CheckCircle2, Play, HardDriveDownload, Loader2, AlertTriangle, Activity, ShieldCheck, Maximize2, Minimize2, Download } from 'lucide-react'
 
 const ACCENT = {
   text: 'text-[#c1554b]',
@@ -228,6 +228,26 @@ export default function App() {
     }
   }
 
+  // NEW: a real ZIP of the currently staged files, for anyone who wants
+  // to take the code elsewhere and deploy it themselves rather than
+  // using Push to Local. Suggests a filename derived from the target
+  // folder's own name, so it isn't just "branch-hq-project" every time.
+  const handleDownloadZip = async () => {
+    if (!previewFiles) return
+    try {
+      const folderName = targetDir.split('/').filter(Boolean).pop() || 'branch-hq-project'
+      // @ts-ignore
+      const res = await window.api.downloadZip(previewFiles, folderName)
+      if (res.success) {
+        setPushStatus(`Downloaded ZIP to ${res.savedTo}`)
+      } else if (!res.canceled) {
+        setPushStatus(`Failed to download ZIP: ${res.error}`)
+      }
+    } catch (err: any) {
+      setPushStatus(`Error: ${err.message}`)
+    }
+  }
+
   return (
     <div className="flex h-screen w-screen bg-[#141414] text-neutral-200 overflow-hidden">
 
@@ -365,6 +385,15 @@ export default function App() {
                 >
                   <ShieldCheck size={14} />
                   Export Audit
+                </button>
+                <button
+                  onClick={handleDownloadZip}
+                  disabled={!previewFiles}
+                  className="flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-white/20 text-white text-xs font-medium rounded-md disabled:opacity-50 transition-colors"
+                  title="Download everything as a single .zip -- for taking the code elsewhere and deploying it yourself"
+                >
+                  <Download size={14} />
+                  Download ZIP
                 </button>
                 <button
                   onClick={handlePushToLocal}

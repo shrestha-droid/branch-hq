@@ -1,6 +1,14 @@
-import { app, BrowserWindow, ipcMain, session, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, session, shell, dialog } from 'electron'
 import * as path from 'path'
+import { spawn, execFile, ChildProcess } from 'child_process'
+import * as net from 'net'
+import * as os from 'os'
 import * as fs from 'fs/promises'
+// NEW: for the real ZIP download feature. This is a dependency of Branch
+// HQ's own project (the Electron app itself), completely separate from
+// the dependency lists Jim/Dwight/Riley's generated code is allowed to
+// use -- run `npm install jszip` in the project root once for this.
+import JSZip from 'jszip'
 import * as dotenv from 'dotenv'
 import {
   createConversation,
@@ -313,14 +321,31 @@ function extractCodeBlocks(markdown: string): Record<string, string> {
     const content = match[1].trim()
     const firstLine = content.split('\n')[0].trim()
 
-    // Optional "File:" or "Filename:" prefix support
-    const commentMatch = firstLine.match(/^(?:\/\/|#|\/\*)\s*(?:(?:file|filename):\s*)?([\w./-]+)\s*\*?\/?$/i)
+    // FIXED: previously required the ENTIRE first line to be nothing but
+    // the file-path comment (anchored with $ at the end). Confirmed real
+    // failure: when a model puts the start of another comment on that
+    // same line right after the path (e.g. "// File: src/App.tsx /*
+    // DESIGN PLAN: ..."), the old regex failed to match at all -- zero
+    // files got extracted, Gate 1 trivially "passed" on an empty file
+    // set, and everything silently vanished with nothing staged, even
+    // though Pam had reviewed and approved the real underlying code (she
+    // sees the raw text, not the failed extraction). No longer anchored
+    // to end-of-line -- just capture the path and stop there.
+    const commentMatch = firstLine.match(/^(?:\/\/|#|\/\*)\s*(?:(?:file|filename):\s*)?([\w./-]+)/i)
 
     if (commentMatch) {
       const filename = normalizeFilePath(commentMatch[1])
       if (!files[filename]) {
-        const cleanContent = content.split('\n').slice(1).join('\n').trim()
-        files[filename] = cleanContent
+        // NEW: don't just drop the whole first line -- keep whatever
+        // followed the matched path on that same line (like the start of
+        // a design-plan comment) instead of losing it, which would
+        // otherwise leave a dangling, unopened closing marker later in
+        // the file.
+        const matchEndIndex = (commentMatch.index ?? 0) + commentMatch[0].length
+        const restOfFirstLine = firstLine.slice(matchEndIndex).trim()
+        const remainingLines = content.split('\n').slice(1).join('\n')
+        const cleanContent = (restOfFirstLine ? restOfFirstLine + '\n' : '') + remainingLines
+        files[filename] = cleanContent.trim()
       }
     }
   }
@@ -384,7 +409,12 @@ function injectFrontendBoilerplate(extractedFiles: Record<string, string>): Reco
     'src/main.tsx': hasAppComponent
       ? `import React from 'react'\nimport ReactDOM from 'react-dom/client'\n${appImportLine}\nimport './assets/main.css'\n\nReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(\n  <React.StrictMode>\n    <App />\n  </React.StrictMode>\n)`
       : `import './assets/main.css'\n\n// No src/App.tsx in this response -- likely a utility/non-visual file\n// (constants, types, helpers), not a renderable component. Nothing to\n// mount here; see the Code tab for what was actually generated.\nconst root = document.getElementById('root')\nif (root) {\n  root.innerHTML = '<div style="font-family: monospace; padding: 2rem; color: #888;">No root App component in this response. Check the Code tab.</div>'\n}`,
-    'src/assets/main.css': `@tailwind base;\n@tailwind components;\n@tailwind utilities;\n`
+    'src/assets/main.css': `@tailwind base;\n@tailwind components;\n@tailwind utilities;\n`,
+    // NEW: confirmed real failure -- without this, a deploy tool like
+    // Vercel or git has no way to know to skip node_modules, causing a
+    // multi-GIGABYTE upload attempt instead of a normal few-MB one, since
+    // it has nothing telling it those files aren't meant to be tracked.
+    '.gitignore': `node_modules\ndist\n.env\n.env.local\n*.log\n`
   }
 }
 
@@ -418,7 +448,11 @@ function injectBackendBoilerplate(extractedFiles: Record<string, string>): Recor
         "@types/jsonwebtoken": "^9.0.6",
         "@types/bcryptjs": "^2.4.6"
       }
-    }, null, 2)
+    }, null, 2),
+    // NEW: same real gap, same real fix as the frontend scaffold -- a
+    // deploy host or git push has no way to know to skip node_modules
+    // (or the real db.json data file) without this.
+    '.gitignore': `node_modules\ndist\n.env\ndb.json\n*.log\n`
   }
 }
 
@@ -463,14 +497,25 @@ function injectBoilerplate(extractedFiles: Record<string, string>, agentKey?: 'j
 const PROMPTS = {
   MICHAEL_MANAGER: `You are Michael -- the single point of contact for this workspace. People talk to you directly for everything: casual conversation, day-to-day questions, brainstorming, AND requests to build code or documents. For each message, decide whether it needs something actually built, or whether you can just answer it yourself.
 
-Output ONLY a valid JSON object, in ONE of these two shapes:
+Output ONLY a valid JSON object, in ONE of these three shapes:
 
-If the request needs code, an app, or a document (PDF/PowerPoint) actually built:
+If the request needs ONE piece of work -- frontend only, backend only, or a document:
 {
   "action": "delegate",
   "assignTo": "Jim" | "Dwight" | "Riley",
   "instructions": "<concise implementation instructions>"
 }
+
+If the request genuinely needs BOTH a real frontend AND a real backend built together -- e.g. "build me a full app," "build this with a working backend," or any request describing both UI and data/API needs -- delegate to both in one response instead of making the person ask twice:
+{
+  "action": "delegate",
+  "assignments": [
+    { "assignTo": "Dwight", "instructions": "<backend implementation instructions>" },
+    { "assignTo": "Jim", "instructions": "<frontend implementation instructions -- describe what data/actions it needs, Jim will be told the real endpoints separately>" }
+  ]
+}
+Only use this multi-assignment shape when the request truly needs both -- most requests still only need one specialist. Never combine Riley (documents) with the other two; a document request is always its own single delegation.
+
 Assign to Jim for frontend/React/UI work, Dwight for backend/Express/API work, and Riley for anything that should produce a PDF or PowerPoint document.
 
 If the request is conversational -- a question, advice, brainstorming, something from your own knowledge, or just talking -- answer it yourself, directly and naturally, the way a genuinely helpful person would:
@@ -507,11 +552,23 @@ WHEN MOTION GENUINELY SERVES THE DESIGN, you now have framer-motion available --
 - Animated number counter: a stat counts up from 0 to its real value once, when it first enters view -- not on every render
 - Aurora/mesh gradient background: pure CSS, no dependency needed -- several large, soft, slowly-drifting blurred gradient shapes behind content, distinct from the "one glowing blue accent" AI tell above by using the build's own actual palette and genuine slow motion, not a static glow
 
-A financial dashboard, a kids' game, and a developer tool should never end up looking like the same template in different colors. Match the whole visual style to what's actually being built.`,
+THE BAR: build like a senior product designer at a top tech company, not like someone assembling a template. This is what actually separates that level of work from generic AI output -- reach for these specifically:
+- Real spacing discipline: pick a base unit (4px or 8px) and keep every gap, padding, and margin a multiple of it throughout the whole build. Inconsistent, eyeballed spacing is one of the fastest tells of unpolished work, even when every individual value looks fine in isolation.
+- A genuine type scale, not ad hoc sizes: 3-5 font sizes total, each with a deliberate weight and line-height pairing, reused consistently. Don't introduce a new one-off size because a single heading "needs to be a bit bigger."
+- Depth through restraint: a single consistent elevation approach (e.g. one subtle shadow scale, or one border-based approach) used the same way everywhere, not glass-morphism in one section and flat cards in another.
+- Treat empty, loading, and error states as real design surfaces, not afterthoughts. A genuinely polished product gives these the same visual care as the main content -- specific to what's actually empty or wrong, not a generic spinner or "No data."
+- Purposeful, restrained color: reserve color for meaning (a status, a primary action, a real alert) rather than decoration. Top-tier products typically use fewer colors than default AI output leans toward, not more.
+- Hierarchy that actually guides the eye: not everything can be bold, large, or accented at once. Decide deliberately what matters most on a given screen and let everything else visually recede.
+- Considered interactive states: real, deliberate hover/focus/active/disabled states on every interactive element -- not just a color swap, but a state that feels intentionally designed for that specific control.
+
+A financial dashboard, a kids' game, and a developer tool should never end up looking like the same template in different colors. Match the whole visual style to what's actually being built.
+
+CRITICAL, confirmed real failure: lucide-react icon names are easy to hallucinate, especially compound names that sound plausible but don't exist -- confirmed real example: "LayoutKanban" was imported and does not exist as an export, despite sounding exactly like a real icon name (lucide-react does have LayoutGrid, LayoutDashboard, LayoutList, AND separately Kanban, SquareKanban, FolderKanban -- but never combines "Layout" with "Kanban"). When you want an icon for a board/kanban/grid-style UI concept and are not fully certain the exact name exists, prefer a simple, extremely well-established icon (LayoutGrid, List, Columns, Grid3x3) over guessing at a more specific compound name -- a plain, safe icon that definitely exists beats a precisely-named one that might not.`,
   DWIGHT_BACKEND: `You are Dwight, Backend Specialist. Write complete, functional Node.js/TypeScript code using Express.
 ALWAYS wrap your code in standard Markdown code blocks (e.g., \`\`\`ts ).
 ALWAYS declare file paths at the very start of the code blocks (e.g., // File: src/server.ts).
 CRITICAL: You are ONLY allowed to use 'express', 'cors', 'bcryptjs', 'jsonwebtoken', 'zod', 'dotenv', 'lowdb', and 'express-rate-limit' as external dependencies. Do not import anything else. In particular, never import 'bcrypt' -- use 'bcryptjs' instead, since this code runs inside a browser-based WebContainer sandbox that cannot compile native Node addons. For unique IDs, use Node's built-in crypto.randomUUID() -- no separate package needed.
+CRITICAL: your server MUST listen on process.env.PORT, with a fallback only for standalone use outside this system (e.g. const PORT = process.env.PORT || 8787; app.listen(PORT, ...)). Never hardcode a specific port number as the only option -- the actual port is assigned by the system running this, not chosen by you.
 
 APPROACH -- follow this before writing any code:
 Act like a senior backend engineer reviewing a junior's first draft, not someone who just wants the endpoint to respond. Before writing code, briefly consider: what actually goes wrong with this request in the real world -- bad input, a resource that doesn't exist, a duplicate submission, no auth -- and what response shape communicates that clearly, not just "it works" for the one happy path.
@@ -525,7 +582,7 @@ AVOID THESE -- they are tells of a lazy, generic backend, not real engineering:
 - Skipping hashing or validation "for now, it's just a prototype" -- Gate 1 will block it anyway, and it's not real practice either way
 
 NEW: you now have real persistence available (lowdb) and real rate limiting (express-rate-limit) -- reach for these specific, named techniques where they genuinely fit the request, not as a checklist to force into every response:
-- Real persistence via lowdb: data written in one request is actually still there on the next one, backed by a real JSON file in the sandbox -- not an array that resets. Use this by default for anything that should survive between requests.
+- Real persistence via lowdb: data written in one request is actually still there on the next one, backed by a real JSON file in the sandbox -- not an array that resets. Use this by default for anything that should survive between requests. CRITICAL: point the JSONFile adapter at a file directly in the project root (e.g. new JSONFile('db.json')), never inside a subfolder like 'data/db.json' -- lowdb does not create missing parent directories, and a path pointing into a folder that doesn't exist yet fails with ENOENT the first time it tries to write. The project root always exists, so this failure mode can't happen there.
 - Rate limiting on anything a real attacker would abuse: login, registration, password reset, search -- apply express-rate-limit directly on that route, not globally on the whole app if only one route actually needs it.
 - Meaningful status codes: 201 for something created, 404 for a resource that doesn't exist, 409 for a duplicate/conflict, 422 for a validation failure that's well-formed but semantically wrong -- not just 200 and 500 for everything.
 - A consistent error shape across the whole API (e.g. { error: { code, message } }), not a different ad hoc string per route.
@@ -563,6 +620,14 @@ IMPORTANT: You do not have live internet access. Write from your own knowledge -
 // every extra round is real API cost, and Pam finding one more small thing
 // to mention is not a reason to loop forever.
 const MAX_AUTO_FIX_ROUNDS = 3
+
+// NEW: fixed port the backend is told to listen on (via process.env.PORT,
+// enforced in Dwight's own prompt above) when running as a real native
+// process. Frontend dev servers pick their own port dynamically per run,
+// but the backend's port needs to be something BOTH the spawning logic
+// and Jim's generated fetch() calls agree on ahead of time -- fixed and
+// well-known beats trying to renegotiate it after the fact.
+const NATIVE_BACKEND_PORT = 8787
 
 // Separate, smaller cap for self-healing. This is a different kind of
 // retry than MAX_AUTO_FIX_ROUNDS -- it only fires after code has already
@@ -807,6 +872,90 @@ typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName,
   }
 })
 
+// NEW: extracted from what used to be inline in ai:invoke, so it can be
+// called once per delegation instead of assuming there's always exactly
+// one. Logic is unchanged from before -- same Gate1/Pam correction loop,
+// same audit recording, same message posting. newMessages is mutated in
+// place (pushed onto) so the caller sees every message from every
+// delegation in the order they actually happened.
+async function runSpecialistPipeline(params: {
+  conversationId: string
+  agentKey: 'jim' | 'dwight' | 'riley'
+  baseInstructions: string
+  projectContext: string
+  existingProjectSnapshot: string
+  newMessages: any[]
+}): Promise<{ success: boolean; stageableFiles?: Record<string, string>; auditId: string | null; specialistOutput: string; errorMessage?: string }> {
+  const { conversationId, agentKey, baseInstructions, projectContext, existingProjectSnapshot, newMessages } = params
+  const targetPrompt =
+    agentKey === 'dwight' ? PROMPTS.DWIGHT_BACKEND :
+    agentKey === 'riley' ? PROMPTS.RILEY_DOCS :
+    PROMPTS.JIM_FRONTEND
+
+  let currentInstructions = baseInstructions + projectContext + existingProjectSnapshot
+  let specialistOutput = ''
+  let staticAudit: AuditResult
+  let stageableFiles: Record<string, string> | undefined
+  let latestAuditId: string | null = null
+
+  for (let round = 1; round <= MAX_AUTO_FIX_ROUNDS; round++) {
+    const roundTag = MAX_AUTO_FIX_ROUNDS > 1 ? ` (attempt ${round} of ${MAX_AUTO_FIX_ROUNDS})` : ''
+
+    specialistOutput = await fetchFrontierAI(targetPrompt, currentInstructions)
+    const auditResult = auditAndStage(specialistOutput, agentKey)
+    staticAudit = auditResult.staticAudit
+    stageableFiles = auditResult.stageableFiles
+
+    if (!staticAudit.passed) {
+      if (round < MAX_AUTO_FIX_ROUNDS) {
+        newMessages.push(await addMessage(
+          conversationId,
+          agentKey,
+          `${specialistOutput}\n\n[Gate 1 blocked this attempt${roundTag} -- retrying automatically]`
+        ))
+        currentInstructions = `${baseInstructions}${projectContext}${existingProjectSnapshot}\n\nYour previous attempt was rejected by the automated security check. Fix ALL of these before trying again:\n- ${staticAudit.blockers.join('\n- ')}`
+        continue
+      }
+      await recordAudit({
+        conversationId, agentKey, attempt: round,
+        gate1Passed: false, perFile: staticAudit.perFile, pamVerdict: 'UNKNOWN'
+      })
+      const errMsg = await addMessage(conversationId, 'error', `Gate 1 Hard Blockers Enforced (after ${round} attempts):\n- ${staticAudit.blockers.join('\n- ')}`)
+      newMessages.push(errMsg)
+      return { success: false, auditId: null, specialistOutput, errorMessage: `Gate 1 blocked ${agentKey}'s output` }
+    }
+
+    const agentMsg = await addMessage(conversationId, agentKey, specialistOutput + roundTag, stageableFiles)
+    newMessages.push(agentMsg)
+
+    const warningContext = staticAudit.warnings.length > 0
+      ? `\n\n[Gate 1 Heuristic Warnings to Review]:\n- ${staticAudit.warnings.join('\n- ')}`
+      : ''
+
+    const pamReview = await fetchFrontierAI(PROMPTS.PAM_AUDITOR_LOGIC, specialistOutput + warningContext)
+    const pamMsg = await addMessage(conversationId, 'pam', pamReview)
+    newMessages.push(pamMsg)
+
+    const verdictMatch = pamReview.match(/PAM_VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/i)
+    const approved = verdictMatch ? verdictMatch[1].toUpperCase() === 'APPROVED' : false
+
+    const auditRecord = await recordAudit({
+      conversationId, agentKey, attempt: round,
+      gate1Passed: true, perFile: staticAudit.perFile,
+      pamVerdict: verdictMatch ? (verdictMatch[1].toUpperCase() as 'APPROVED' | 'CHANGES_REQUESTED') : 'UNKNOWN'
+    })
+    latestAuditId = auditRecord.id
+
+    if (approved || round === MAX_AUTO_FIX_ROUNDS) {
+      break
+    }
+
+    currentInstructions = `${baseInstructions}${projectContext}${existingProjectSnapshot}\n\nYour previous attempt received this QA feedback -- address it before trying again:\n${pamReview}`
+  }
+
+  return { success: true, stageableFiles, auditId: latestAuditId, specialistOutput }
+}
+
 // This is now the ONE handler every message goes through -- one chatbox,
 // no mode to pick. Michael sees the whole conversation and decides for
 // himself whether to just answer, or bring in a specialist.
@@ -862,7 +1011,7 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
     // Gemini, so this failure just got more likely to actually happen,
     // not less.
     const MAX_ROUTING_JSON_RETRIES = 2
-    let decision: { action: 'delegate' | 'respond'; assignTo?: string; instructions?: string; response?: string } | null = null
+    let decision: { action: 'delegate' | 'respond'; assignTo?: string; instructions?: string; assignments?: { assignTo: string; instructions: string }[]; response?: string } | null = null
     let managerResponse = ''
 
     for (let jsonAttempt = 1; jsonAttempt <= MAX_ROUTING_JSON_RETRIES; jsonAttempt++) {
@@ -910,103 +1059,152 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
       return { success: true, messages: newMessages }
     }
 
+    // NEW: normalize into a list regardless of which shape Michael used --
+    // the old single assignTo/instructions still works exactly as before,
+    // the new assignments array handles the "needs both" case. This is
+    // what actually fixes "I always have to give Michael a second
+    // command": both specialists now run automatically in the same turn
+    // when a request genuinely needs both, instead of only ever picking one.
+    const rawDelegations: { assignTo: string; instructions: string }[] =
+      decision.assignments && decision.assignments.length > 0
+        ? decision.assignments
+        : decision.assignTo && decision.instructions
+          ? [{ assignTo: decision.assignTo, instructions: decision.instructions }]
+          : []
+
+    if (rawDelegations.length === 0) {
+      const errMessage = await addMessage(conversationId, 'error', "Manager routing failed: delegate action had no assignment.")
+      return { success: false, messages: [...newMessages, errMessage] }
+    }
+
     const ragNote = retrievedFiles.length > 0
       ? `\n\n[RAG] Retrieved context from: ${retrievedFiles.join(', ')}`
       : `\n\n[RAG] No relevant project context retrieved.`
-    const michaelMsg = await addMessage(conversationId, 'michael', `Delegating to ${decision.assignTo}: ${decision.instructions}${ragNote}`)
+    const michaelMsg = await addMessage(
+      conversationId,
+      'michael',
+      rawDelegations.length > 1
+        ? `Delegating to ${rawDelegations.map(d => d.assignTo).join(' and ')} -- this needs both a real backend and a real frontend, so both are being built together.${ragNote}`
+        : `Delegating to ${rawDelegations[0].assignTo}: ${rawDelegations[0].instructions}${ragNote}`
+    )
     newMessages.push(michaelMsg)
 
-    const agentKey: 'jim' | 'dwight' | 'riley' =
-      decision.assignTo === 'Dwight' ? 'dwight' :
-      decision.assignTo === 'Riley' ? 'riley' :
-      'jim'
-    const targetPrompt =
-      agentKey === 'dwight' ? PROMPTS.DWIGHT_BACKEND :
-      agentKey === 'riley' ? PROMPTS.RILEY_DOCS :
-      PROMPTS.JIM_FRONTEND
+    // Dwight first when both are present -- so his actual real endpoints
+    // exist before Jim writes anything, and can be described to him
+    // instead of Jim falling back to inventing mock data with nothing
+    // real to call.
+    const orderedDelegations = [...rawDelegations].sort((a, b) => {
+      const rank = (name: string) => name === 'Dwight' ? 0 : name === 'Riley' ? 1 : 2
+      return rank(a.assignTo) - rank(b.assignTo)
+    })
 
-    // Automatic correction loop. Round 1 is the original attempt; rounds
-    // after that feed either Gate 1's blockers (structured, no parsing
-    // needed) or Pam's review text (now forced into a strict PAM_VERDICT
-    // line so code can read it) straight back to the specialist and try
-    // again -- capped at MAX_AUTO_FIX_ROUNDS so a never-satisfied Pam
-    // can't loop forever.
-    const baseInstructions = decision.instructions || ''
-    // FIXED: this used to run for every agent, including Riley. Riley
-    // produces a standalone document script -- there's no legitimate
-    // reason for him to see React/Express source from some other,
-    // unrelated project sitting in the target folder. Confirmed real
-    // failure pattern: after several code projects had been built, a PPT
-    // prompt sharing a word with an old project's filename (e.g. "hero
-    // section" matching a leftover Hero.tsx) fed that file's actual
-    // source code into Riley's instructions, producing broken output.
-    // Only Jim and Dwight legitimately need to see what already exists.
     const settingsForSnapshot = await getSettings()
-    const existingProjectSnapshot = agentKey === 'riley'
-      ? ''
-      : await getExistingProjectSnapshot(settingsForSnapshot.defaultTargetDir, prompt)
-    let currentInstructions = baseInstructions + projectContext + existingProjectSnapshot
-    let specialistOutput = ''
-    let staticAudit: AuditResult
-    let stageableFiles: Record<string, string> | undefined
+    const mergedFiles: Record<string, string> = {}
+    let dwightRawOutput: string | null = null
+    // Tracks the frontend (Jim) delegation's own results specifically --
+    // self-healing targets whichever agent's code is actually running
+    // live in the sandbox, which is always the frontend when both exist.
+    let healTargetAgentKey: 'jim' | 'dwight' | 'riley' | null = null
+    let healTargetInstructions = ''
+    let healTargetAuditId: string | null = null
 
-    let latestAuditId: string | null = null
+    for (const delegation of orderedDelegations) {
+      const agentKey: 'jim' | 'dwight' | 'riley' =
+        delegation.assignTo === 'Dwight' ? 'dwight' :
+        delegation.assignTo === 'Riley' ? 'riley' :
+        'jim'
 
-    for (let round = 1; round <= MAX_AUTO_FIX_ROUNDS; round++) {
-      const roundTag = MAX_AUTO_FIX_ROUNDS > 1 ? ` (attempt ${round} of ${MAX_AUTO_FIX_ROUNDS})` : ''
+      // FIXED: this used to run for every agent, including Riley. Riley
+      // produces a standalone document script -- there's no legitimate
+      // reason for him to see React/Express source from some other,
+      // unrelated project sitting in the target folder. Confirmed real
+      // failure pattern: after several code projects had been built, a PPT
+      // prompt sharing a word with an old project's filename (e.g. "hero
+      // section" matching a leftover Hero.tsx) fed that file's actual
+      // source code into Riley's instructions, producing broken output.
+      // Only Jim and Dwight legitimately need to see what already exists.
+      const existingProjectSnapshot = agentKey === 'riley'
+        ? ''
+        : await getExistingProjectSnapshot(settingsForSnapshot.defaultTargetDir, prompt)
 
-      specialistOutput = await fetchFrontierAI(targetPrompt, currentInstructions)
-      const auditResult = auditAndStage(specialistOutput, agentKey)
-      staticAudit = auditResult.staticAudit
-      stageableFiles = auditResult.stageableFiles
-
-      if (!staticAudit.passed) {
-        if (round < MAX_AUTO_FIX_ROUNDS) {
-          newMessages.push(await addMessage(
-            conversationId,
-            agentKey,
-            `${specialistOutput}\n\n[Gate 1 blocked this attempt${roundTag} -- retrying automatically]`
-          ))
-          currentInstructions = `${baseInstructions}${projectContext}${existingProjectSnapshot}\n\nYour previous attempt was rejected by the automated security check. Fix ALL of these before trying again:\n- ${staticAudit.blockers.join('\n- ')}`
-          continue
-        }
-        await recordAudit({
-          conversationId, agentKey, attempt: round,
-          gate1Passed: false, perFile: staticAudit.perFile, pamVerdict: 'UNKNOWN'
-        })
-        const errMsg = await addMessage(conversationId, 'error', `Gate 1 Hard Blockers Enforced (after ${round} attempts):\n- ${staticAudit.blockers.join('\n- ')}`)
-        return { success: false, messages: [...newMessages, errMsg] }
-      }
-
-      const agentMsg = await addMessage(conversationId, agentKey, specialistOutput + roundTag, stageableFiles)
-      newMessages.push(agentMsg)
-
-      const warningContext = staticAudit.warnings.length > 0
-        ? `\n\n[Gate 1 Heuristic Warnings to Review]:\n- ${staticAudit.warnings.join('\n- ')}`
+      // NEW: when Jim is running alongside a just-built Dwight backend in
+      // this same turn, tell him plainly what real endpoints now exist --
+      // otherwise he has no way to know a real backend exists at all, and
+      // (reasonably) falls back to mock/hardcoded data in React state,
+      // which is real code but not what "build this with a working
+      // backend" actually asked for.
+      const crossAgentNote = (agentKey === 'jim' && dwightRawOutput)
+        ? `\n\n[A real backend was just built for this same request, and will run at http://localhost:${NATIVE_BACKEND_PORT} -- call its actual endpoints via fetch() using that exact base URL, do not invent mock or hardcoded data. Here is exactly what Dwight wrote:]\n${dwightRawOutput}`
         : ''
 
-      const pamReview = await fetchFrontierAI(PROMPTS.PAM_AUDITOR_LOGIC, specialistOutput + warningContext)
-      const pamMsg = await addMessage(conversationId, 'pam', pamReview)
-      newMessages.push(pamMsg)
-
-      const verdictMatch = pamReview.match(/PAM_VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/i)
-      const approved = verdictMatch ? verdictMatch[1].toUpperCase() === 'APPROVED' : false
-
-      const auditRecord = await recordAudit({
-        conversationId, agentKey, attempt: round,
-        gate1Passed: true, perFile: staticAudit.perFile,
-        pamVerdict: verdictMatch ? (verdictMatch[1].toUpperCase() as 'APPROVED' | 'CHANGES_REQUESTED') : 'UNKNOWN'
+      const result = await runSpecialistPipeline({
+        conversationId,
+        agentKey,
+        baseInstructions: delegation.instructions + crossAgentNote,
+        projectContext,
+        existingProjectSnapshot,
+        newMessages
       })
-      latestAuditId = auditRecord.id
 
-      if (approved || round === MAX_AUTO_FIX_ROUNDS) {
-        break
+      if (!result.success) {
+        // One delegation failing (e.g. Gate 1 blocked it after every
+        // retry) doesn't silently discard the other -- report the
+        // failure but let any earlier-completed delegation's files still
+        // reach the user rather than losing real, passed work.
+        continue
       }
 
-      currentInstructions = `${baseInstructions}${projectContext}${existingProjectSnapshot}\n\nYour previous attempt received this QA feedback -- address it before trying again:\n${pamReview}`
+      if (agentKey === 'dwight') {
+        dwightRawOutput = result.specialistOutput
+      }
+
+      if (result.stageableFiles) {
+        // The frontend is what's actually live-previewed in the sandbox,
+        // so its files stay at the root exactly as before. Anything else
+        // (a backend built alongside it) is real, reviewed code that
+        // still needs to reach disk correctly -- namespaced under its own
+        // folder so it never collides with the frontend's files, written
+        // together on the same Push to Local rather than requiring a
+        // second manual request.
+        const prefix = agentKey === 'jim' ? '' : `${agentKey === 'dwight' ? 'server' : 'docs'}/`
+        for (const [path, content] of Object.entries(result.stageableFiles)) {
+          mergedFiles[`${prefix}${path}`] = content
+        }
+      }
+
+      if (agentKey === 'jim' || (!healTargetAgentKey)) {
+        healTargetAgentKey = agentKey
+        healTargetInstructions = delegation.instructions
+        healTargetAuditId = result.auditId
+      }
     }
 
-    return { success: true, messages: newMessages, files: stageableFiles, agentKey, instructions: baseInstructions, auditId: latestAuditId }
+    if (Object.keys(mergedFiles).length === 0) {
+      const errMsg = await addMessage(conversationId, 'error', 'All delegated work failed Gate 1 -- nothing to stage.')
+      return { success: false, messages: [...newMessages, errMsg] }
+    }
+
+    // NEW: when a backend was built alongside the frontend, say plainly
+    // what that does and doesn't mean right now -- the live sandbox
+    // preview can only run the frontend, so the backend is real,
+    // reviewed, and written to disk correctly, but isn't part of the
+    // in-app preview itself until run separately.
+    if (orderedDelegations.some(d => d.assignTo === 'Dwight') && orderedDelegations.some(d => d.assignTo === 'Jim')) {
+      newMessages.push(await addMessage(
+        conversationId,
+        'michael',
+        `Both are done -- the frontend is what you'll see in Preview, and the backend is included under server/ in the same push, written and ready to run on its own (cd server && npm run dev). They aren't wired to run together inside the live preview yet, but both are real, reviewed code you can run side by side once pushed.`
+      ))
+    }
+
+    return {
+      success: true,
+      messages: newMessages,
+      files: mergedFiles,
+      agentKey: healTargetAgentKey || 'jim',
+      instructions: healTargetInstructions,
+      auditId: healTargetAuditId
+    }
   } catch (error: any) {
     const errMsg = await addMessage(conversationId, 'error', error.message || 'Fatal pipeline error.')
     return { success: false, messages: [...newMessages, errMsg] }
@@ -1048,7 +1246,7 @@ typedIpc.handle('heal:invoke', async (_event: any, {
     // different line between healing attempts instead of disappearing
     // in one try, because only the one instance the error named got
     // fixed each time.
-    const healingInstructions = `${previousInstructions}\n\nYour previous code passed review, but FAILED WHEN ACTUALLY RUN. Here is the real error:\n\n${errorLog}\n\nFix the specific problem causing this error. If this exact kind of mistake appears more than once in your code, fix EVERY occurrence, not just the one the error happened to stop at -- the error only shows where execution failed first, which may not be the only instance. Do not change anything else.`
+    const healingInstructions = `${previousInstructions}\n\nYour previous code passed review, but FAILED WHEN ACTUALLY RUN. Here is the real error:\n\n${errorLog}\n\nFix the specific problem causing this error. If this exact kind of mistake appears more than once in your code, fix EVERY occurrence, not just the one the error happened to stop at -- the error only shows where execution failed first, which may not be the only instance. If the error says a named export doesn't exist in a library (e.g. an icon name from lucide-react that isn't real), don't guess at another specific, similarly-plausible name -- replace it with a simple, extremely well-established name from that same library that you are highly confident actually exists, since a specific-sounding guess is exactly how this kind of error happens in the first place. Do not change anything else.`
 
     const specialistOutput = await fetchFrontierAI(targetPrompt, healingInstructions)
     const { staticAudit, stageableFiles } = auditAndStage(specialistOutput, agentKey)
@@ -1127,6 +1325,271 @@ typedIpc.handle('fs:checkConflicts', async (_event: any, { targetDirectory, file
   }
 })
 
+// ============================================================================
+// NATIVE EXECUTION ENGINE (foundation only -- not yet wired to the
+// renderer's SandboxPreview, which still runs entirely on WebContainers
+// today. This is the main-process half: detecting a real runtime, writing
+// real files to a real scratch directory, and spawning/coordinating real
+// child processes for frontend + backend together. The renderer-side
+// wiring -- deciding when to use this instead of WebContainers, and
+// falling back cleanly when it isn't available -- is the next piece, kept
+// separate on purpose rather than rushed in alongside this.
+//
+// HONESTY NOTE, worth reading before trusting this blindly: this is
+// fundamentally different from most of what's been built this session.
+// Adding a dependency or a prompt section can be traced by hand with real
+// confidence. Spawning real OS processes and coordinating two of them
+// over real ports cannot be verified the same way without actually
+// running it on a real machine. Treat this as a solid, carefully-reasoned
+// first version -- not something to trust untested.
+// ============================================================================
+
+// NEW: checks for a real Node/npm on PATH. If this comes back false, the
+// native engine simply isn't usable and the renderer should stay on
+// WebContainers -- no partial/broken native attempt.
+function detectNativeRuntime(): Promise<{ available: boolean; nodeVersion?: string; npmVersion?: string }> {
+  return new Promise((resolve) => {
+    execFile('node', ['--version'], (nodeErr: Error | null, nodeOut: string) => {
+      if (nodeErr) return resolve({ available: false })
+      execFile('npm', ['--version'], (npmErr: Error | null, npmOut: string) => {
+        if (npmErr) return resolve({ available: false })
+        resolve({ available: true, nodeVersion: nodeOut.trim(), npmVersion: npmOut.trim() })
+      })
+    })
+  })
+}
+
+typedIpc.handle('runtime:detect', async () => {
+  return await detectNativeRuntime()
+})
+
+// NEW: cached once at startup, not re-checked per-request. Used to
+// decide whether Branch HQ's OWN outer page needs COEP/COOP forced onto
+// it -- only true when native mode won't be available and WebContainers
+// will actually be the thing running, since that's the only case that
+// genuinely needs this. Confirmed via a real isolating experiment that
+// forcing this unconditionally was the actual cause of a real
+// ERR_BLOCKED_BY_RESPONSE failure blocking native mode's own frontend.
+let willUseWebContainerFallback = true
+detectNativeRuntime().then(r => { willUseWebContainerFallback = !r.available })
+
+// Tracks every process spawned for a given run, so it can be torn down
+// cleanly -- switching conversations, a fresh generation replacing an old
+// one, or the app quitting should never leave orphaned servers running.
+interface NativeRun {
+  scratchDir: string
+  frontend?: ChildProcess
+  backend?: ChildProcess
+  frontendPort?: number
+}
+const activeNativeRuns = new Map<string, NativeRun>()
+// NEW: which ports are genuinely real native servers right now -- used
+// by onHeadersReceived below to exempt them from header rewriting that
+// was written for WebContainer's needs, not theirs. The fixed backend
+// port is always native whenever it's in use; the frontend's port is
+// dynamic (Vite can land on a different one each run), so it's tracked
+// here as soon as it's actually known.
+const activeNativePorts = new Set<number>([NATIVE_BACKEND_PORT])
+
+async function writeFilesToScratch(scratchDir: string, files: Record<string, string>): Promise<void> {
+  for (const [relativePath, content] of Object.entries(files)) {
+    const absolutePath = path.join(scratchDir, relativePath)
+    await fs.mkdir(path.dirname(absolutePath), { recursive: true })
+    await fs.writeFile(absolutePath, content, 'utf-8')
+  }
+}
+
+// Genuinely probes the port with a real TCP connection, retried on an
+// interval, rather than trusting Express's own log wording -- which
+// varies across generations and can't be relied on the way Vite's
+// standard "Local: http://..." banner can. This is the same underlying
+// principle as execution verification elsewhere in this file: a
+// successful connection is real proof, not an inferred signal.
+function waitForPort(port: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  return new Promise((resolve) => {
+    const attempt = () => {
+      const socket = net.connect({ port, host: '127.0.0.1' }, () => {
+        socket.end()
+        resolve(true)
+      })
+      socket.on('error', () => {
+        socket.destroy()
+        if (Date.now() > deadline) return resolve(false)
+        setTimeout(attempt, 300)
+      })
+    }
+    attempt()
+  })
+}
+
+// NEW: confirmed real cause of a genuine failure (npm/cli#9783) -- a
+// persistent user-level `allow-scripts` npm config (set earlier for an
+// unrelated global install) gets forwarded into every later npm install
+// as an environment variable, and a plain project-scoped install
+// explicitly rejects that same setting, failing with EALLOWSCRIPTS. Not
+// something Branch HQ's own installs should be fragile to just because
+// of an unrelated global setting on the host machine -- this strips
+// specifically that one inherited value for installs this file spawns,
+// without touching the user's actual npm configuration or any other
+// legitimately-inherited settings (registry mirrors, auth tokens, etc).
+function cleanInstallEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env }
+  delete env.npm_config_allow_scripts
+  return env
+}
+
+// NEW: the actual coordination. Writes real files to a real scratch
+// directory, then spawns npm install + npm run dev for the frontend
+// (root) and, if a server/ subfolder is present in the merged files,
+// separately for the backend -- with a fixed, known PORT env var so both
+// the process and Jim's generated fetch() calls agree on where it lives.
+// Every log line and every readiness signal streams back to the renderer
+// via webContents.send, rather than being collected and returned only at
+// the end -- the caller needs to see output as it happens, the same way
+// the WebContainer path already does.
+async function stopNativeRun(runId: string): Promise<void> {
+  const run = activeNativeRuns.get(runId)
+  if (!run) return
+  try { run.frontend?.kill() } catch { /* already gone */ }
+  try { run.backend?.kill() } catch { /* already gone */ }
+  if (run.frontendPort) activeNativePorts.delete(run.frontendPort)
+  await fs.rm(run.scratchDir, { recursive: true, force: true }).catch(() => {})
+  activeNativeRuns.delete(runId)
+}
+
+typedIpc.handle('sandbox:startNative', async (event: any, { runId, files }: { runId: string; files: Record<string, string> }) => {
+  const sender = event.sender
+  const send = (channel: string, payload: any) => {
+    if (!sender.isDestroyed()) sender.send(channel, { runId, ...payload })
+  }
+
+  try {
+    // A stale run under the same id (e.g. a fresh generation replacing an
+    // old one) must be fully torn down first -- two processes racing for
+    // the same port would just fail confusingly for both.
+    await stopNativeRun(runId)
+
+    const scratchDir = path.join(os.tmpdir(), 'branch-hq-sandbox', runId)
+    await fs.rm(scratchDir, { recursive: true, force: true }).catch(() => {})
+    await fs.mkdir(scratchDir, { recursive: true })
+
+    const hasBackend = Object.keys(files).some(f => f.startsWith('server/'))
+    const frontendFiles: Record<string, string> = {}
+    const backendFiles: Record<string, string> = {}
+    for (const [p, content] of Object.entries(files)) {
+      if (p.startsWith('server/')) backendFiles[p.slice('server/'.length)] = content
+      else frontendFiles[p] = content
+    }
+
+    await writeFilesToScratch(scratchDir, frontendFiles)
+    if (hasBackend) await writeFilesToScratch(path.join(scratchDir, 'server'), backendFiles)
+
+    const run: NativeRun = { scratchDir }
+    activeNativeRuns.set(runId, run)
+
+    // -------- Frontend --------
+    send('sandbox:log', { source: 'frontend', line: 'Installing frontend dependencies...' })
+    await new Promise<void>((resolve, reject) => {
+      const install = spawn('npm', ['install'], { cwd: scratchDir, shell: true, env: cleanInstallEnv() })
+      install.stdout.on('data', (d: Buffer) => send('sandbox:log', { source: 'frontend', line: d.toString() }))
+      install.stderr.on('data', (d: Buffer) => send('sandbox:log', { source: 'frontend', line: d.toString() }))
+      install.on('exit', (code: number | null) => code === 0 ? resolve() : reject(new Error(`Frontend npm install exited with code ${code}`)))
+    })
+
+    const frontendDev = spawn('npm', ['run', 'dev'], { cwd: scratchDir, shell: true })
+    run.frontend = frontendDev
+    let frontendReady = false
+    // FIXED: previously matched each stdout chunk in isolation. Node
+    // delivers process output in arbitrary chunks, not guaranteed to
+    // break on line boundaries -- "Local: http://localhost:3001/" could
+    // arrive split across two separate chunks, and a regex checked
+    // against each chunk alone would never match either half. Confirmed
+    // real failure: Vite genuinely started and reported ready, but
+    // detection never fired, so the iframe never got a URL and the
+    // preview stayed blank despite the server actually running.
+    // Accumulating into a rolling buffer and matching against that
+    // survives a split landing anywhere. Only accumulated while not yet
+    // ready, so this doesn't grow unbounded for a long-running server.
+    let frontendOutputBuffer = ''
+    frontendDev.stdout.on('data', (d: Buffer) => {
+      const line = d.toString()
+      send('sandbox:log', { source: 'frontend', line })
+      if (frontendReady) return
+      frontendOutputBuffer += line
+      // Capped -- Vite's ready banner appears within the first couple KB
+      // of output; no reason to keep an ever-growing buffer around while
+      // waiting for something that should show up almost immediately.
+      if (frontendOutputBuffer.length > 8000) {
+        frontendOutputBuffer = frontendOutputBuffer.slice(-8000)
+      }
+      const match = frontendOutputBuffer.match(/Local:\s+https?:\/\/localhost:(\d+)/)
+      if (match) {
+        frontendReady = true
+        const port = Number(match[1])
+        activeNativePorts.add(port)
+        run.frontendPort = port
+        send('sandbox:frontend-ready', { url: `http://localhost:${port}`, port })
+      }
+    })
+    frontendDev.stderr.on('data', (d: Buffer) => send('sandbox:log', { source: 'frontend', line: d.toString() }))
+    frontendDev.on('exit', (code: number | null) => {
+      if (code !== null && code !== 0) send('sandbox:error', { source: 'frontend', message: `Frontend dev server exited with code ${code}` })
+    })
+
+    // -------- Backend (only if one was actually built alongside it) --------
+    if (hasBackend) {
+      const serverDir = path.join(scratchDir, 'server')
+      send('sandbox:log', { source: 'backend', line: 'Installing backend dependencies...' })
+      await new Promise<void>((resolve, reject) => {
+        const install = spawn('npm', ['install'], { cwd: serverDir, shell: true, env: cleanInstallEnv() })
+        install.stdout.on('data', (d: Buffer) => send('sandbox:log', { source: 'backend', line: d.toString() }))
+        install.stderr.on('data', (d: Buffer) => send('sandbox:log', { source: 'backend', line: d.toString() }))
+        install.on('exit', (code: number | null) => code === 0 ? resolve() : reject(new Error(`Backend npm install exited with code ${code}`)))
+      })
+
+      const backendDev = spawn('npm', ['run', 'dev'], {
+        cwd: serverDir,
+        shell: true,
+        env: { ...process.env, PORT: String(NATIVE_BACKEND_PORT) }
+      })
+      run.backend = backendDev
+      backendDev.stdout.on('data', (d: Buffer) => send('sandbox:log', { source: 'backend', line: d.toString() }))
+      backendDev.stderr.on('data', (d: Buffer) => send('sandbox:log', { source: 'backend', line: d.toString() }))
+      backendDev.on('exit', (code: number | null) => {
+        if (code !== null && code !== 0) send('sandbox:error', { source: 'backend', message: `Backend server exited with code ${code}` })
+      })
+
+      // Genuine port probe, not a log-line guess -- see waitForPort's own
+      // note on why this is the more trustworthy signal here.
+      const backendUp = await waitForPort(NATIVE_BACKEND_PORT, 30000)
+      if (backendUp) {
+        send('sandbox:backend-ready', { url: `http://localhost:${NATIVE_BACKEND_PORT}`, port: NATIVE_BACKEND_PORT })
+      } else {
+        send('sandbox:error', { source: 'backend', message: `Backend did not start listening on port ${NATIVE_BACKEND_PORT} within 30s.` })
+      }
+    }
+
+    return { success: true }
+  } catch (err: any) {
+    send('sandbox:error', { source: 'system', message: err.message })
+    return { success: false, error: err.message }
+  }
+})
+
+typedIpc.handle('sandbox:stopNative', async (_event: any, { runId }: { runId: string }) => {
+  await stopNativeRun(runId)
+  return { success: true }
+})
+
+// Nothing left running in the background after the app itself closes.
+app.on('before-quit', () => {
+  for (const runId of activeNativeRuns.keys()) {
+    stopNativeRun(runId)
+  }
+})
+
+
 typedIpc.handle('fs:write', async (_event: any, { targetDirectory, files, overwriteConfirmed }: { targetDirectory: string; files: Record<string, string>; overwriteConfirmed?: boolean }) => {
   try {
     const writtenPaths: string[] = []
@@ -1162,6 +1625,37 @@ typedIpc.handle('fs:write', async (_event: any, { targetDirectory, files, overwr
     }
 
     return { success: true, writtenFiles: writtenPaths, skippedFiles: skippedPaths }
+  } catch (err: any) {
+    return { success: false, error: err.message }
+  }
+})
+
+// NEW: a real ZIP download -- for someone who wants the code to take
+// elsewhere and deploy themselves, without needing to know or care what
+// "target folder" or "Push to Local" mean. Opens a real native save
+// dialog and writes a genuine, complete .zip -- same merged file set
+// (including a server/ subfolder when a backend was built alongside the
+// frontend) that Push to Local would write, just packaged as one
+// portable file instead of a live folder.
+typedIpc.handle('fs:downloadZip', async (_event: any, { files, suggestedName }: { files: Record<string, string>; suggestedName?: string }) => {
+  try {
+    const zip = new JSZip()
+    for (const [relativePath, content] of Object.entries(files)) {
+      zip.file(relativePath, content)
+    }
+    const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' })
+
+    const { canceled, filePath } = await dialog.showSaveDialog({
+      title: 'Download Project as ZIP',
+      defaultPath: `${suggestedName || 'branch-hq-project'}.zip`,
+      filters: [{ name: 'ZIP Archive', extensions: ['zip'] }]
+    })
+    if (canceled || !filePath) {
+      return { success: false, canceled: true }
+    }
+
+    await fs.writeFile(filePath, buffer)
+    return { success: true, savedTo: filePath }
   } catch (err: any) {
     return { success: false, error: err.message }
   }
@@ -1205,7 +1699,67 @@ function createWindow() {
     delete responseHeaders['Content-Security-Policy']
     delete responseHeaders['content-security-policy']
 
-    if (details.url.includes('localhost') || details.url.includes('127.0.0.1')) {
+    // FIXED: this used to apply to any URL containing "localhost" at
+    // all, with no way to tell a WebContainer preview (which genuinely
+    // needs this) apart from a real native dev server (which doesn't --
+    // and gets broken by it). Confirmed real failure: the native
+    // engine's frontend loaded and reported ready, but Electron blocked
+    // the actual page load with ERR_BLOCKED_BY_RESPONSE, because this
+    // handler was forcing Cross-Origin-Opener-Policy onto its response
+    // regardless. Real native ports are tracked as they're discovered
+    // (see activeNativePorts above) and explicitly exempted here.
+    const urlPort = Number(new URL(details.url).port || (details.url.startsWith('https') ? 443 : 80))
+    const isKnownNativePort = activeNativePorts.has(urlPort)
+
+    // FIXED: the port-based exemption above was correctly wired but
+    // still let a real failure through -- Console showed no more
+    // specific framing-block message at all when tested, which pointed
+    // at a more fundamental scoping problem than a bookkeeping bug.
+    // This was always only supposed to apply to Branch HQ's OWN
+    // top-level page, which genuinely needs cross-origin isolation on
+    // itself for WebContainers to work -- never to anything loaded
+    // INSIDE an iframe, WebContainer's or native's. The original "any
+    // localhost URL" condition never actually caused a visible problem
+    // before, because WebContainer's real preview URLs don't typically
+    // match a plain localhost pattern in the first place -- native mode
+    // is the first time real localhost content has ever lived inside
+    // the iframe. resourceType is a structural signal Electron provides
+    // directly, not bookkeeping Branch HQ has to maintain correctly --
+    // use it as the real gate; the port-based check stays as an
+    // additional, redundant safety net, not the primary decision.
+    const isTopLevelPage = details.resourceType === 'mainFrame'
+
+    // NEW: two reasoned fixes targeting COOP/COEP have now both failed
+    // to resolve a real ERR_BLOCKED_BY_RESPONSE on native mode's
+    // frontend -- rather than guess a third time, log the actual raw
+    // headers for any request to a known native port, specifically the
+    // ones that can cause exactly this error (X-Frame-Options, a CSP
+    // frame-ancestors directive, Cross-Origin-Resource-Policy, and COOP/
+    // COEP themselves). Plain console.log, not the IPC log stream --
+    // shows up directly in the same terminal already being shared here,
+    // no DevTools digging required to get real evidence this time.
+    if (isKnownNativePort && (details.resourceType === 'mainFrame' || details.resourceType === 'subFrame')) {
+      const headerKeys = Object.keys(details.responseHeaders || {})
+      const relevant = ['x-frame-options', 'content-security-policy', 'cross-origin-resource-policy', 'cross-origin-opener-policy', 'cross-origin-embedder-policy']
+      const found: Record<string, string[]> = {}
+      for (const key of headerKeys) {
+        if (relevant.includes(key.toLowerCase())) {
+          found[key] = (details.responseHeaders as any)[key]
+        }
+      }
+      console.log(`[DIAGNOSTIC] Headers for ${details.url} (resourceType: ${details.resourceType}):`, Object.keys(found).length > 0 ? found : '(none of the relevant headers were present at all)')
+    }
+
+    // FIXED: confirmed via a real isolating experiment that forcing
+    // this unconditionally onto Branch HQ's own outer page was the
+    // actual cause of a real ERR_BLOCKED_BY_RESPONSE blocking native
+    // mode's frontend iframe -- even in COEP's "credentialless" mode,
+    // which is specifically designed not to need cooperation from what
+    // it embeds. The correct scope: this is only genuinely needed when
+    // WebContainers will actually be what's running this session, never
+    // when native mode is available, since native mode has no
+    // cross-origin-isolation requirement at all.
+    if (willUseWebContainerFallback && isTopLevelPage && !isKnownNativePort && (details.url.includes('localhost') || details.url.includes('127.0.0.1'))) {
       responseHeaders['Cross-Origin-Embedder-Policy'] = ['credentialless']
       responseHeaders['Cross-Origin-Opener-Policy'] = ['same-origin']
       responseHeaders['Content-Security-Policy'] = [
@@ -1225,5 +1779,32 @@ function createWindow() {
 
 app.disableHardwareAcceleration()
 
-app.whenReady().then(createWindow)
+// NEW: WebContainers run project code in a different origin than
+// Branch HQ's own app -- a "third-party" context by Chromium's
+// definition. Since Chrome 115, third-party contexts have service
+// workers blocked by default unless third-party storage partitioning is
+// explicitly disabled, which is exactly what produced the "Enable
+// Storage Partitioning" screen. Left as a per-user browser setting,
+// whether a client hits this depends on their own Chromium version and
+// privacy settings -- unpredictable, and a bad thing to hit mid-demo.
+// Setting it here, before the app is ready, means it's baked into
+// Branch HQ itself -- no client ever needs to touch a flag manually.
+// Genuinely worth confirming this clears the screen when tested; this
+// is a strong, well-supported fix for the documented cause, not one
+// I've been able to run and watch resolve it myself.
+app.commandLine.appendSwitch('disable-features', 'ThirdPartyStoragePartitioning')
+
+// NEW: "InvalidStateError: Failed to register a ServiceWorker" is a
+// well-documented Electron pattern (VS Code's own webviews hit this
+// exact error regularly) with two common real causes: a stale, corrupted
+// service worker registration left over from an earlier run, or a race
+// registering too soon after a fresh launch. Since this app gets
+// restarted often during active development, with different CSP/session
+// configurations each time, stale leftover registrations are a real risk
+// worth proactively clearing rather than leaving for someone to
+// diagnose by hand in DevTools each time it happens.
+app.whenReady().then(async () => {
+  await session.defaultSession.clearStorageData({ storages: ['serviceworkers'] }).catch(() => {})
+  createWindow()
+})
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
