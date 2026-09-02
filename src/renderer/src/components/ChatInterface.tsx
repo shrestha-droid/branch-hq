@@ -16,10 +16,10 @@ const markdownComponents = {
   p: ({ node, ...props }: any) => <p className="mb-4 last:mb-0" {...props} />,
   code: ({ node, inline, ...props }: any) =>
     inline
-      ? <code className="bg-white/10 px-1.5 py-0.5 rounded text-[#d9847b] font-mono text-[13px]" {...props} />
+      ? <code className="bg-white/10 px-1.5 py-0.5 rounded text-[#5eb3ff] font-mono text-[13px]" {...props} />
       : <code {...props} />,
   pre: ({ node, ...props }: any) => (
-    <div className="my-4 rounded-xl overflow-hidden border border-white/[0.06] bg-[#0f0f0f]">
+    <div className="my-4 rounded-xl overflow-hidden border border-white/[0.08] bg-[#151517]">
       <pre className="p-4 overflow-x-auto text-[13px] font-mono" {...props} />
     </div>
   )
@@ -110,11 +110,29 @@ interface ChatInterfaceProps {
 // small set of values, so it's easy to find and change later without
 // hunting through every className.
 const ACCENT = {
-  text: 'text-[#c1554b]',
-  bg: 'bg-[#a8443c]',
-  bgHover: 'hover:bg-[#b84f45]',
-  bgSoft: 'bg-[#a8443c]/10',
-  border: 'border-[#a8443c]/30',
+  text: 'text-[#409cff]',
+  bg: 'bg-[#0a84ff]',
+  bgHover: 'hover:bg-[#3395ff]',
+  bgSoft: 'bg-[#0a84ff]/10',
+  border: 'border-[#0a84ff]/30',
+}
+
+// NEW: real macOS system-gray values (systemGray6/5 dark-mode
+// equivalents), not arbitrary dark grays -- the same layered surface
+// levels Apple's own apps use, so panels read as genuinely elevated
+// rather than just a different flat shade. -apple-system renders real
+// San Francisco on macOS directly from the OS's own installed font,
+// with no font files embedded here at all -- falls back cleanly
+// everywhere else.
+const SURFACE = {
+  base: '#1c1c1e',
+  sidebar: 'backdrop-blur-2xl bg-[#1c1c1e]/70',
+  elevated: 'bg-[#2c2c2e]',
+  elevatedHover: 'hover:bg-[#323234]',
+  hairline: 'border-white/[0.08]',
+  textPrimary: 'text-[#f5f5f7]',
+  textSecondary: 'text-[#98989d]',
+  fontStack: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif'
 }
 
 export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenSettings }: ChatInterfaceProps) {
@@ -394,16 +412,18 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
     : conversations
 
   return (
-    <div className="flex h-full relative bg-[#141414] text-neutral-100 overflow-hidden">
-      {/* Sidebar for Conversations -- calmer, no neon border glow */}
-      <div className={`${sidebarOpen ? 'w-64' : 'w-0'} transition-all duration-300 bg-[#191919] border-r border-white/[0.06] flex flex-col shrink-0 overflow-hidden z-20`}>
-        <div className="p-4 border-b border-white/[0.06] flex items-center justify-between">
-          <span className="text-sm text-neutral-400">Chats</span>
+    <div className="flex h-full relative bg-[#1c1c1e] text-[#f5f5f7] overflow-hidden" style={{ fontFamily: SURFACE.fontStack }}>
+      {/* Sidebar -- real vibrancy, translucent and blurred, the way
+          Finder or Messages actually render their sidebar, not a flat
+          panel with a different shade. */}
+      <div className={`${sidebarOpen ? 'w-64' : 'w-0'} transition-all duration-300 ${SURFACE.sidebar} border-r ${SURFACE.hairline} flex flex-col shrink-0 overflow-hidden z-20`}>
+        <div className={`p-4 border-b ${SURFACE.hairline} flex items-center justify-between`}>
+          <span className={`text-sm font-medium ${SURFACE.textSecondary}`}>Chats</span>
           <div className="flex items-center gap-1.5">
-            <button onClick={createNewConversation} className={`p-1.5 ${ACCENT.bgSoft} ${ACCENT.text} rounded-lg transition-colors hover:bg-[#a8443c]/20`} title="New chat">
+            <button onClick={createNewConversation} className={`p-1.5 ${ACCENT.bgSoft} ${ACCENT.text} rounded-lg transition-colors hover:bg-[#0a84ff]/20`} title="New chat">
               <MessageSquarePlus size={16} />
             </button>
-            <button onClick={() => onOpenSettings?.()} className="p-1.5 text-neutral-400 hover:text-neutral-200 hover:bg-white/[0.06] rounded-lg transition-colors" title="Settings">
+            <button onClick={() => onOpenSettings?.()} className={`p-1.5 ${SURFACE.textSecondary} hover:text-[#f5f5f7] hover:bg-white/[0.06] rounded-lg transition-colors`} title="Settings">
               <SettingsIcon size={16} />
             </button>
           </div>
@@ -433,7 +453,7 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
             <div
               key={convo.id}
               onClick={() => selectConversation(convo.id)}
-              className={`group flex items-center justify-between px-3 py-2.5 rounded-xl text-sm cursor-pointer transition-colors ${
+              className={`group flex items-center justify-between px-3 py-2 rounded-lg text-sm cursor-pointer transition-colors ${
                 activeConvoId === convo.id
                   ? `${ACCENT.bgSoft} ${ACCENT.text}`
                   : 'text-neutral-400 hover:bg-white/[0.04] hover:text-neutral-200'
@@ -452,24 +472,22 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
       </div>
 
       {/* Main Chat View */}
-      <div className="flex-1 flex flex-col h-full relative overflow-hidden">
-        {/* Top Header Toggle -- flat, no blur/glow */}
+      <div className="flex-1 flex flex-col h-full relative overflow-hidden bg-[#1c1c1e]">
+        {/* Top toggle -- small, precise, native-feeling control */}
         <div className="absolute top-4 left-4 z-30">
           <button
             onClick={() => setSidebarOpen(!sidebarOpen)}
-            className="p-2 bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] rounded-xl text-neutral-400 hover:text-neutral-200 transition-colors"
+            className="p-2 bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.08] rounded-lg text-[#98989d] hover:text-[#f5f5f7] transition-colors"
           >
-            {sidebarOpen ? <X size={16} /> : <Menu size={16} />}
+            {sidebarOpen ? <X size={15} /> : <Menu size={15} />}
           </button>
         </div>
-
-        {/* No background grid pattern -- plain flat background, calmer */}
 
         {/* NEW: the office scene -- persistent, not just shown at empty
             state, since the whole point is seeing real activity while
             it's actually happening. */}
         {messages.length > 0 && (
-          <div className="pt-14 pb-1 shrink-0 border-b border-white/[0.04] bg-black/10">
+          <div className="pt-14 pb-1 shrink-0 border-b border-white/[0.06] bg-black/20">
             <OfficeScene
               statuses={agentStatuses}
               activeDirectTarget={directTarget}
@@ -487,7 +505,7 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
                 onCharacterClick={handleCharacterClick}
                 scale={2}
               />
-              <p className="text-sm mt-6 text-neutral-500 max-w-sm text-center">
+              <p className={`text-sm mt-6 ${SURFACE.textSecondary} max-w-sm text-center`}>
                 Click a character to talk directly to them, or just type below and Michael will route it.
               </p>
             </div>
@@ -516,7 +534,7 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
                       <div className={`w-8 h-8 rounded-full ${ACCENT.bgSoft} flex items-center justify-center shrink-0 mt-1`}>
                         <Bot size={16} className={ACCENT.text} />
                       </div>
-                      <div className="bg-[#1c1c1c] border border-white/[0.06] p-5 rounded-2xl rounded-tl-md w-full overflow-x-auto text-sm text-neutral-300 leading-relaxed">
+                      <div className={`${SURFACE.elevated} border ${SURFACE.hairline} p-5 rounded-2xl rounded-tl-md w-full overflow-x-auto text-sm ${SURFACE.textPrimary} leading-relaxed`}>
                         <div className={`text-xs ${ACCENT.text} mb-2 font-medium capitalize`}>
                           {msg.role}
                         </div>
@@ -566,7 +584,7 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
             </div>
           )}
         </div>
-        <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-[#141414] via-[#141414]/95 to-transparent z-20">
+        <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-[#1c1c1e] via-[#1c1c1e]/95 to-transparent z-20">
           <div className="w-full max-w-3xl mx-auto">
             {directTarget && (
               <div className={`flex items-center gap-2 mb-2 px-3 py-2 ${ACCENT.bgSoft} border ${ACCENT.border} rounded-xl text-xs`}>
@@ -580,7 +598,7 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
               </div>
             )}
             {(attachedFile || isExtracting || attachError) && (
-              <div className="flex items-center gap-2 mb-2 px-3 py-2 bg-white/[0.04] border border-white/[0.06] rounded-xl text-xs">
+              <div className={`flex items-center gap-2 mb-2 px-3 py-2 ${SURFACE.elevated} border ${SURFACE.hairline} rounded-xl text-xs`}>
                 {isExtracting ? (
                   <>
                     <Loader2 size={13} className="animate-spin text-neutral-400" />
@@ -606,7 +624,7 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
                 ) : null}
               </div>
             )}
-            <div className={`flex items-center gap-3 bg-white/[0.04] focus-within:bg-white/[0.06] rounded-2xl p-2 border border-white/[0.06] focus-within:${ACCENT.border} transition-colors duration-200`}>
+            <div className={`flex items-center gap-3 ${SURFACE.elevated} focus-within:bg-[#323234] rounded-2xl p-2 border ${SURFACE.hairline} focus-within:${ACCENT.border} transition-colors duration-200`}>
               <input
                 ref={fileInputRef}
                 type="file"

@@ -46,7 +46,7 @@ const TIE = 0x2a2530
 // A single, uniform dark tie color for everyone -- simple and
 // consistently formal rather than another per-character variable.
 const CHARACTERS: CharacterDef[] = [
-  { id: 'michael', name: 'Michael', hair: 0x4a3323, shirt: 0xa8443c },
+  { id: 'michael', name: 'Michael', hair: 0x4a3323, shirt: 0x0a84ff },
   { id: 'jim', name: 'Jim', hair: 0x8a6a45, shirt: 0x4a7ba8 },
   { id: 'dwight', name: 'Dwight', hair: 0x2e2318, shirt: 0x3d7a52 },
   { id: 'pam', name: 'Pam', hair: 0x8a4a2e, shirt: 0xc99a3d },
@@ -201,7 +201,7 @@ export default function OfficeScene({ statuses, activeDirectTarget, onCharacterC
         // chat target -- a real selection indicator, not decoration.
         const selectRing = new PIXI.Graphics()
         selectRing.roundRect(-6, -6, spriteWidth + 12, spriteHeight + 12, 6)
-        selectRing.stroke({ width: 2, color: 0xa8443c })
+        selectRing.stroke({ width: 2, color: 0x0a84ff })
         selectRing.visible = false
         root.addChild(selectRing)
 

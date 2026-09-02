@@ -13,9 +13,9 @@ interface Settings {
 }
 
 const ACCENT = {
-  bg: 'bg-[#a8443c]',
-  bgHover: 'hover:bg-[#b84f45]',
-  border: 'border-[#a8443c]/30',
+  bg: 'bg-[#0a84ff]',
+  bgHover: 'hover:bg-[#3395ff]',
+  border: 'border-[#0a84ff]/30',
 }
 
 interface SettingsModalProps {
@@ -84,14 +84,14 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   if (!settings) {
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-        <div className="bg-[#191919] rounded-2xl p-6 text-neutral-400 text-sm">Loading settings...</div>
+        <div className="bg-[#2c2c2e] rounded-2xl p-6 text-[#98989d] text-sm backdrop-blur-2xl">Loading settings...</div>
       </div>
     )
   }
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-      <div className="bg-[#191919] border border-white/[0.08] rounded-2xl w-full max-w-lg max-h-[85vh] overflow-y-auto">
+      <div className="bg-[#2c2c2e] border border-white/[0.08] rounded-2xl w-full max-w-lg max-h-[85vh] overflow-y-auto backdrop-blur-2xl" style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif' }}>
         <div className="flex items-center justify-between px-5 py-4 border-b border-white/[0.06]">
           <h2 className="text-sm font-medium text-neutral-200">Settings</h2>
           <button onClick={onClose} className="text-neutral-500 hover:text-white">

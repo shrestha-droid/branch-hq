@@ -5,11 +5,11 @@ import SettingsModal from './components/SettingsModal'
 import { Code2, FileCode, X, CheckCircle2, Play, HardDriveDownload, Loader2, AlertTriangle, Activity, ShieldCheck, Maximize2, Minimize2, Download, GitBranch } from 'lucide-react'
 
 const ACCENT = {
-  text: 'text-[#c1554b]',
-  bg: 'bg-[#a8443c]',
-  bgHover: 'hover:bg-[#b84f45]',
-  bgSoft: 'bg-[#a8443c]/10',
-  border: 'border-[#a8443c]/30',
+  text: 'text-[#409cff]',
+  bg: 'bg-[#0a84ff]',
+  bgHover: 'hover:bg-[#3395ff]',
+  bgSoft: 'bg-[#0a84ff]/10',
+  border: 'border-[#0a84ff]/30',
 }
 
 export default function App() {
@@ -289,7 +289,7 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-screen w-screen bg-[#141414] text-neutral-200 overflow-hidden">
+    <div className="flex h-screen w-screen bg-[#1c1c1e] text-[#f5f5f7] overflow-hidden" style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif' }}>
 
       {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
 
@@ -306,7 +306,7 @@ export default function App() {
       {previewFiles && (
         <section className={`h-full flex flex-col bg-[#101010] transition-all duration-300 ${isPreviewMaximized ? 'w-full' : 'w-1/2'}`}>
 
-          <div className="flex items-center justify-between px-4 py-3 bg-[#191919] border-b border-white/[0.06] shrink-0">
+          <div className="flex items-center justify-between px-4 py-3 bg-[#1c1c1e]/80 backdrop-blur-xl border-b border-white/[0.08] shrink-0">
             <div className="flex items-center gap-2 text-sm text-neutral-300">
               <Code2 size={16} className={ACCENT.text} />
               <span>Staged (Gate 1 passed)</span>
@@ -345,7 +345,7 @@ export default function App() {
 
           {viewMode === 'code' ? (
             <div className="flex flex-col flex-1 overflow-hidden">
-              <div className="flex gap-1.5 px-3 py-2 bg-[#141414] border-b border-white/[0.05] overflow-x-auto shrink-0">
+              <div className="flex gap-1.5 px-3 py-2 bg-black/20 border-b border-white/[0.06] overflow-x-auto shrink-0">
                 {Object.keys(previewFiles).map((filename) => (
                   <button
                     key={filename} onClick={() => setSelectedFile(filename)}
@@ -392,7 +392,7 @@ export default function App() {
             </div>
           )}
 
-          <div className="p-4 bg-[#191919] border-t border-white/[0.06] flex flex-col gap-3 shrink-0">
+          <div className="p-4 bg-[#1c1c1e]/80 backdrop-blur-xl border-t border-white/[0.08] flex flex-col gap-3 shrink-0">
             <div className="flex items-center justify-between gap-4">
               <div className="flex-1 flex flex-col gap-1.5">
                 <label className="text-xs font-medium text-neutral-500">
@@ -410,7 +410,7 @@ export default function App() {
                 <button
                   onClick={handleIndexWorkspace}
                   disabled={isIndexing || !targetDir.trim()}
-                  className="flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-white/20 text-white text-xs font-medium rounded-md disabled:opacity-50 transition-colors"
+                  className="flex items-center gap-2 px-4 py-2 bg-white/[0.08] hover:bg-white/[0.14] text-[#f5f5f7] text-xs font-medium rounded-lg disabled:opacity-50 transition-colors"
                   title="Scan this folder into AI memory"
                 >
                   {isIndexing ? <Loader2 size={14} className="animate-spin" /> : <Code2 size={14} />}
@@ -419,7 +419,7 @@ export default function App() {
                 <button
                   onClick={handleExportAudit}
                   disabled={!healContext?.conversationId}
-                  className="flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-white/20 text-white text-xs font-medium rounded-md disabled:opacity-50 transition-colors"
+                  className="flex items-center gap-2 px-4 py-2 bg-white/[0.08] hover:bg-white/[0.14] text-[#f5f5f7] text-xs font-medium rounded-lg disabled:opacity-50 transition-colors"
                   title="Export the Gate 1 / Pam compliance record for this conversation"
                 >
                   <ShieldCheck size={14} />
@@ -428,7 +428,7 @@ export default function App() {
                 <button
                   onClick={handleDownloadZip}
                   disabled={!previewFiles}
-                  className="flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-white/20 text-white text-xs font-medium rounded-md disabled:opacity-50 transition-colors"
+                  className="flex items-center gap-2 px-4 py-2 bg-white/[0.08] hover:bg-white/[0.14] text-[#f5f5f7] text-xs font-medium rounded-lg disabled:opacity-50 transition-colors"
                   title="Download everything as a single .zip -- for taking the code elsewhere and deploying it yourself"
                 >
                   <Download size={14} />
@@ -437,7 +437,7 @@ export default function App() {
                 <button
                   onClick={handleOpenGithubModal}
                   disabled={!previewFiles}
-                  className="flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-white/20 text-white text-xs font-medium rounded-md disabled:opacity-50 transition-colors"
+                  className="flex items-center gap-2 px-4 py-2 bg-white/[0.08] hover:bg-white/[0.14] text-[#f5f5f7] text-xs font-medium rounded-lg disabled:opacity-50 transition-colors"
                   title="Push to a new GitHub repo"
                 >
                   <GitBranch size={14} />
@@ -516,7 +516,7 @@ export default function App() {
 
       {githubModalOpen && (
         <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center">
-          <div className="bg-[#191919] border border-white/10 rounded-xl w-full max-w-md p-5">
+          <div className="bg-[#2c2c2e] border border-white/[0.08] rounded-2xl w-full max-w-md p-5 backdrop-blur-2xl">
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center gap-2">
                 <GitBranch size={16} className="text-white" />

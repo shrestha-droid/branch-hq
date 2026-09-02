@@ -417,6 +417,35 @@ function injectFrontendBoilerplate(extractedFiles: Record<string, string>): Reco
     'vite.config.ts': `import { defineConfig } from 'vite'\nimport react from '@vitejs/plugin-react'\n\nexport default defineConfig({\n  plugins: [react()],\n  server: { port: 3000, strictPort: false }\n})`,
     'tailwind.config.js': `/** @type {import('tailwindcss').Config} */\nexport default {\n  content: [\n    "./index.html",\n    "./src/**/*.{js,ts,jsx,tsx}",\n  ],\n  theme: {\n    extend: {},\n  },\n  plugins: [],\n}`,
     'postcss.config.js': `export default {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n}`,
+    // NEW: confirmed real, long-standing bug -- the build script below
+    // runs `tsc`, but no tsconfig.json was ever generated for it to
+    // use. With no config and nothing explicit to compile, tsc's real,
+    // documented fallback is to print its own help/usage text and exit
+    // with an error -- exactly what a real Vercel deploy surfaced,
+    // since this is the first time the build script (as opposed to
+    // `npm run dev`, which never touches tsc at all) had ever actually
+    // been exercised. Standard Vite+React+TS config, matching what
+    // `npm create vite` itself generates. noEmit is correct here --
+    // Vite's own build step does the actual bundling; tsc's only job
+    // in "tsc && vite build" is type-checking.
+    'tsconfig.json': JSON.stringify({
+      compilerOptions: {
+        target: "ES2020",
+        useDefineForClassFields: true,
+        lib: ["ES2020", "DOM", "DOM.Iterable"],
+        module: "ESNext",
+        skipLibCheck: true,
+        moduleResolution: "bundler",
+        allowImportingTsExtensions: true,
+        resolveJsonModule: true,
+        isolatedModules: true,
+        noEmit: true,
+        jsx: "react-jsx",
+        strict: true,
+        esModuleInterop: true
+      },
+      include: ["src"]
+    }, null, 2),
     'index.html': `<!DOCTYPE html>\n<html lang="en">\n  <head>\n    <meta charset="UTF-8" />\n    <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n    <title>Sandbox Preview</title>\n  </head>\n  <body>\n    <div id="root"></div>\n    <script type="module" src="/src/main.tsx"></script>\n  </body>\n</html>`,
     'src/main.tsx': hasAppComponent
       ? `import React from 'react'\nimport ReactDOM from 'react-dom/client'\n${appImportLine}\nimport './assets/main.css'\n\nReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(\n  <React.StrictMode>\n    <App />\n  </React.StrictMode>\n)`
@@ -567,6 +596,8 @@ WHEN MOTION GENUINELY SERVES THE DESIGN, you now have framer-motion available --
 - Aurora/mesh gradient background: pure CSS, no dependency needed -- several large, soft, slowly-drifting blurred gradient shapes behind content, distinct from the "one glowing blue accent" AI tell above by using the build's own actual palette and genuine slow motion, not a static glow
 
 CRITICAL: only build a login/signup/authentication screen when the request genuinely implies user accounts are needed (explicit mentions of accounts, multiple users, "sign up," "login," roles, or personal/private data that must belong to someone specific). Do not add an auth screen by default just because the app has a backend -- most requests (a task tracker, a dashboard, an internal tool) don't need one, and adding it unasked is real, unrequested complexity that becomes a new thing that can break, not a nice-to-have.
+
+CRITICAL, confirmed real failure: when you build a frontend that depends on a backend, your initial connectivity check must retry automatically, not just once. The backend is a separate process that can genuinely still be starting (installing its own dependencies) when your frontend's first render happens -- a single failed fetch followed by a static "backend offline" message, with no automatic re-check, means the user has to manually reload or click retry themselves even after the backend comes up on its own, which reads as broken when it's actually just a timing gap. On the first failed connection attempt specifically, poll again automatically every 2 seconds for up to 20 seconds before giving up and showing a real offline state -- this is separate from, and in addition to, any manual "Retry" button you already show.
 
 THE BAR: build like a senior product designer at a top tech company, not like someone assembling a template. This is what actually separates that level of work from generic AI output -- reach for these specifically:
 - Real spacing discipline: pick a base unit (4px or 8px) and keep every gap, padding, and margin a multiple of it throughout the whole build. Inconsistent, eyeballed spacing is one of the fastest tells of unpolished work, even when every individual value looks fine in isolation.

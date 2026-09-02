@@ -24,9 +24,9 @@ interface SandboxPreviewProps {
 }
 
 const ACCENT = {
-  text: 'text-[#c1554b]',
-  bg: 'bg-[#a8443c]',
-  bgHover: 'hover:bg-[#b84f45]',
+  text: 'text-[#409cff]',
+  bg: 'bg-[#0a84ff]',
+  bgHover: 'hover:bg-[#3395ff]',
 }
 
 interface DocumentResult {
@@ -108,7 +108,16 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
   // single biggest cost in how long a run takes to start.
   const lastInstalledPackageJsonRef = useRef<string | null>(null)
 
-  const isDocumentOutput = files['package.json']?.includes('"branch-hq-preview-docs"') ?? false
+  // FIXED: confirmed real misrouting -- relying only on parsing
+  // package.json's content meant a Riley generation could, for reasons
+  // not fully pinned down, fail this check and get dispatched through
+  // bootNative() instead of runDocumentScript() -- trying to npm
+  // install document-generation dependencies (pdfkit, docx) as if they
+  // were a Vite frontend, which is exactly what a real failure showed.
+  // agentKey is a second, independent signal already available as a
+  // prop -- checking both means this can't misfire on package.json
+  // parsing alone.
+  const isDocumentOutput = (files['package.json']?.includes('"branch-hq-preview-docs"') ?? false) || agentKey === 'riley'
   const canSelfHeal = Boolean(conversationId && agentKey && instructions)
 
   const addLog = (msg: string) => setLogs(prev => [...prev.slice(-99), msg])
