@@ -20,7 +20,6 @@ interface SandboxPreviewProps {
   // real (post-self-heal) failure; the parent decides what's worth
   // surfacing visibly based on whether strict mode is on.
   auditId?: string | null
-  strictVerification?: boolean
   onVerificationOutcome?: (success: boolean, message?: string) => void
 }
 
@@ -51,7 +50,7 @@ const FATAL_ERROR_PATTERNS = [
   /Internal server error/i,
 ]
 
-export default function SandboxPreview({ files, conversationId, agentKey, instructions, onFilesHealed, auditId, strictVerification, onVerificationOutcome }: SandboxPreviewProps) {
+export default function SandboxPreview({ files, conversationId, agentKey, instructions, onFilesHealed, auditId, onVerificationOutcome }: SandboxPreviewProps) {
   const [status, setStatus] = useState<'booting' | 'installing' | 'starting' | 'ready' | 'error' | 'healing'>('booting')
   // NEW: the log panel used to permanently occupy a large, fixed chunk
   // of vertical space, squeezing the actual preview into a small strip
@@ -86,6 +85,16 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
   // never a hidden implementation detail. Distinct from nativeAvailable:
   // that's the capability, this is what actually happened this run.
   const [activeMode, setActiveMode] = useState<'webcontainer' | 'native' | null>(null)
+  // NEW: confirmed real pattern -- the frontend can report ready
+  // (Vite boots in well under a second) while the backend is still
+  // running its own separate npm install, which real logs tonight have
+  // shown taking several real seconds. Without tracking this
+  // separately, "ready" looked identical whether the backend was
+  // actually up or not -- someone trying to log in the instant the app
+  // appeared would hit a real, confusing "backend not detected" even
+  // though it was only ever a matter of a few more seconds.
+  const [backendExpected, setBackendExpected] = useState(false)
+  const [backendReady, setBackendReady] = useState(false)
 
   useEffect(() => {
     // @ts-ignore
@@ -176,9 +185,19 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
   // the same specialist that wrote this code, through the main process,
   // and -- on success -- hands the corrected files up to App.tsx, which
   // flows back down as a new `files` prop and re-triggers a normal run.
+  // NEW: tracks every error self-healing has seen this run, so the final
+  // exhausted-attempts message can show real, complete diagnostic
+  // history -- confirmed real gap: previously the actual error text was
+  // silently discarded the moment healing gave up, leaving only "we
+  // stopped trying" with no way to know what was actually wrong.
+  const errorHistoryRef = useRef<string[]>([])
+
   const attemptSelfHeal = async (errorContext: string) => {
+    errorHistoryRef.current.push(errorContext)
+
     if (!canSelfHeal) {
       addLog('System: Cannot self-heal -- missing conversation/agent context for this result.')
+      addLog(`System: The actual error was:\n${errorContext}`)
       setStatus('error')
       reportExecutionFailure('This result could not be verified as running -- no healing context was available to attempt a fix.')
       return
@@ -186,8 +205,16 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
     if (healingRef.current || hasTriggeredHealForThisRunRef.current) return
     if (healAttempt >= MAX_SELF_HEAL_ROUNDS) {
       addLog(`System: Already used ${MAX_SELF_HEAL_ROUNDS} self-heal attempts -- stopping rather than guessing again.`)
+      // NEW: actually show what happened at each attempt, not just that
+      // attempts were used up. If the same error repeats verbatim across
+      // attempts, that's real, useful information too (the fix genuinely
+      // isn't landing) -- shown explicitly rather than left to guess at.
+      const history = errorHistoryRef.current
+      const allSame = history.length > 1 && history.every(e => e === history[0])
+      addLog(`System: ${allSame ? 'The SAME error persisted across every attempt:' : 'Error history across all attempts:'}`)
+      history.forEach((err, i) => addLog(`--- Attempt ${i + 1} ---\n${err}`))
       setStatus('error')
-      reportExecutionFailure(`This build could not be verified as actually running, even after ${MAX_SELF_HEAL_ROUNDS} automatic repair attempts. It passed review but never ran successfully.`)
+      reportExecutionFailure(`This build could not be verified as actually running, even after ${MAX_SELF_HEAL_ROUNDS} automatic repair attempts. It passed review but never ran successfully. Final error: ${history[history.length - 1]?.slice(0, 500)}`)
       return
     }
 
@@ -236,6 +263,7 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
       setHealAttempt(0)
     }
     hasTriggeredHealForThisRunRef.current = false
+    errorHistoryRef.current = []
 
     async function bootWebApp() {
       try {
@@ -414,7 +442,7 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
         }
 
         addLog('System: Script finished. Looking for the output file...')
-        const candidateNames = ['output.pdf', 'output.pptx']
+        const candidateNames = ['output.pdf', 'output.pptx', 'output.docx', 'output.xlsx', 'output.csv', 'output.md']
         let found: DocumentResult | null = null
 
         for (const name of candidateNames) {
@@ -466,6 +494,12 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
         const runId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
         nativeRunIdRef.current = runId
         let frontendReadyReceived = false
+        // A backend is expected whenever the merged files include a
+        // server/ subfolder -- same check the main process itself uses
+        // to decide whether to spawn one at all.
+        const hasBackendThisRun = Object.keys(files).some(f => f.startsWith('server/'))
+        setBackendExpected(hasBackendThisRun)
+        setBackendReady(!hasBackendThisRun)
 
         // @ts-ignore
         const unsubLog = window.api.onSandboxLog((data: any) => {
@@ -484,6 +518,7 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
         const unsubBackendReady = window.api.onSandboxBackendReady((data: any) => {
           if (data.runId !== runId || !mounted) return
           addLog(`System: Backend confirmed running at ${data.url}`)
+          setBackendReady(true)
         })
         // @ts-ignore
         const unsubError = window.api.onSandboxError((data: any) => {
@@ -542,9 +577,20 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
 
   const handleDownload = () => {
     if (!documentResult) return
-    const mimeType = documentResult.name.endsWith('.pdf')
-      ? 'application/pdf'
-      : 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+    // FIXED: was a binary PDF-or-PPTX check that labeled everything else
+    // (docx, xlsx, csv, md) with the PowerPoint MIME type -- harmless for
+    // the file's actual content, but wrong for how some browsers/OS
+    // combinations decide how to handle or preview the download.
+    const mimeTypes: Record<string, string> = {
+      '.pdf': 'application/pdf',
+      '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      '.csv': 'text/csv',
+      '.md': 'text/markdown'
+    }
+    const ext = '.' + documentResult.name.split('.').pop()
+    const mimeType = mimeTypes[ext] || 'application/octet-stream'
     const buffer = new ArrayBuffer(documentResult.data.byteLength)
     new Uint8Array(buffer).set(documentResult.data)
     const blob = new Blob([buffer], { type: mimeType })
@@ -576,6 +622,12 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
           {activeMode && (
             <span className={`text-[10px] px-1.5 py-0.5 rounded uppercase tracking-wide ${activeMode === 'native' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-white/10 text-neutral-400'}`}>
               {activeMode === 'native' ? 'Native' : 'WebContainer'}
+            </span>
+          )}
+          {status === 'ready' && backendExpected && !backendReady && (
+            <span className="flex items-center gap-1.5 text-[11px] text-amber-400" title="The frontend is up, but the backend is still finishing its own install -- give it a few more seconds before trying to log in or submit anything">
+              <Loader2 size={11} className="animate-spin" />
+              Backend still starting...
             </span>
           )}
         </div>

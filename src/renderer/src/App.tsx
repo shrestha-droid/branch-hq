@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import ChatInterface from './components/ChatInterface'
 import SandboxPreview from './components/SandboxPreview'
 import SettingsModal from './components/SettingsModal'
-import { Code2, FileCode, X, CheckCircle2, Play, HardDriveDownload, Loader2, AlertTriangle, Activity, ShieldCheck, Maximize2, Minimize2, Download } from 'lucide-react'
+import { Code2, FileCode, X, CheckCircle2, Play, HardDriveDownload, Loader2, AlertTriangle, Activity, ShieldCheck, Maximize2, Minimize2, Download, GitBranch } from 'lucide-react'
 
 const ACCENT = {
   text: 'text-[#c1554b]',
@@ -46,8 +46,21 @@ export default function App() {
   // it buried in the sandbox's own log panel.
   const [verificationFailedNotice, setVerificationFailedNotice] = useState<string | null>(null)
 
-  const [targetDir, setTargetDir] = useState('/Users/ShresthaPandey/branch-hq-output')
+  // FIXED: was a hardcoded absolute path containing one specific
+  // user's home directory -- meaning Push to Local, Scan Workspace, and
+  // the existing-project check all silently pointed at a folder that
+  // does not exist on any other machine. Starts empty now and is filled
+  // from settings, which resolves a real per-user path on startup.
+  const [targetDir, setTargetDir] = useState('')
   const [isPushing, setIsPushing] = useState(false)
+  // NEW: GitHub push modal state -- kept separate from the plain
+  // Push to Local state since this is a real external action with its
+  // own confirmation step (repo name, public/private), not a one-click.
+  const [githubModalOpen, setGithubModalOpen] = useState(false)
+  const [githubRepoName, setGithubRepoName] = useState('')
+  const [githubIsPrivate, setGithubIsPrivate] = useState(true)
+  const [isPushingGithub, setIsPushingGithub] = useState(false)
+  const [githubPushStatus, setGithubPushStatus] = useState<string | null>(null)
   const [pushStatus, setPushStatus] = useState<string | null>(null)
   const [isIndexing, setIsIndexing] = useState(false)
   // NEW: files that already exist at the target path -- shown as a
@@ -61,7 +74,7 @@ export default function App() {
   // NEW: the configured BASE folder, kept separate from targetDir (which
   // the user can freely edit per push) -- each new project's suggested
   // folder is computed as a subfolder of this base.
-  const [baseTargetDir, setBaseTargetDir] = useState('/Users/ShresthaPandey/branch-hq-output')
+  const [baseTargetDir, setBaseTargetDir] = useState('')
   // NEW: which conversation we last auto-suggested a folder for -- only
   // suggest once per conversation becoming newly active, so a second
   // generation in the same chat doesn't stomp on a manual edit.
@@ -248,6 +261,33 @@ export default function App() {
     }
   }
 
+  const handleOpenGithubModal = () => {
+    if (!previewFiles) return
+    const suggested = targetDir.split('/').filter(Boolean).pop() || 'branch-hq-project'
+    setGithubRepoName(suggested)
+    setGithubPushStatus(null)
+    setGithubModalOpen(true)
+  }
+
+  const handleGithubPush = async () => {
+    if (!previewFiles || !githubRepoName.trim()) return
+    setIsPushingGithub(true)
+    setGithubPushStatus(null)
+    try {
+      // @ts-ignore
+      const res = await window.api.pushToGithub(previewFiles, githubRepoName.trim(), githubIsPrivate)
+      if (res.success) {
+        setGithubPushStatus(`Pushed successfully: ${res.repoUrl}`)
+      } else {
+        setGithubPushStatus(res.error || 'Push failed.')
+      }
+    } catch (err: any) {
+      setGithubPushStatus(err.message)
+    } finally {
+      setIsPushingGithub(false)
+    }
+  }
+
   return (
     <div className="flex h-screen w-screen bg-[#141414] text-neutral-200 overflow-hidden">
 
@@ -339,7 +379,6 @@ export default function App() {
                   agentKey={healContext?.agentKey}
                   instructions={healContext?.instructions}
                   auditId={healContext?.auditId}
-                  strictVerification={strictVerification}
                   onFilesHealed={handleFilesHealed}
                   onVerificationOutcome={(success, message) => {
                     if (success) {
@@ -394,6 +433,15 @@ export default function App() {
                 >
                   <Download size={14} />
                   Download ZIP
+                </button>
+                <button
+                  onClick={handleOpenGithubModal}
+                  disabled={!previewFiles}
+                  className="flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-white/20 text-white text-xs font-medium rounded-md disabled:opacity-50 transition-colors"
+                  title="Push to a new GitHub repo"
+                >
+                  <GitBranch size={14} />
+                  Push to GitHub
                 </button>
                 <button
                   onClick={handlePushToLocal}
@@ -464,6 +512,55 @@ export default function App() {
           </div>
 
         </section>
+      )}
+
+      {githubModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center">
+          <div className="bg-[#191919] border border-white/10 rounded-xl w-full max-w-md p-5">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2">
+                <GitBranch size={16} className="text-white" />
+                <h3 className="text-sm font-medium text-white">Push to GitHub</h3>
+              </div>
+              <button onClick={() => setGithubModalOpen(false)} className="text-neutral-500 hover:text-white">
+                <X size={16} />
+              </button>
+            </div>
+
+            <label className="text-xs font-medium text-neutral-400 block mb-1.5">Repository name</label>
+            <input
+              type="text"
+              value={githubRepoName}
+              onChange={(e) => setGithubRepoName(e.target.value)}
+              className="w-full bg-black/30 border border-white/[0.06] rounded-lg px-3 py-2 text-sm text-white mb-3 focus:outline-none focus:border-white/20"
+            />
+
+            <div className="flex items-center justify-between mb-4">
+              <span className="text-xs text-neutral-400">Private repository</span>
+              <button
+                onClick={() => setGithubIsPrivate(!githubIsPrivate)}
+                className={`relative w-10 h-6 rounded-full transition-colors ${githubIsPrivate ? ACCENT.bg : 'bg-white/10'}`}
+              >
+                <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform ${githubIsPrivate ? 'translate-x-4' : 'translate-x-0'}`} />
+              </button>
+            </div>
+
+            {githubPushStatus && (
+              <p className={`text-xs mb-3 ${githubPushStatus.startsWith('Pushed') ? 'text-emerald-400' : 'text-red-400'}`}>
+                {githubPushStatus}
+              </p>
+            )}
+
+            <button
+              onClick={handleGithubPush}
+              disabled={isPushingGithub || !githubRepoName.trim()}
+              className={`w-full flex items-center justify-center gap-2 py-2.5 ${ACCENT.bg} ${ACCENT.bgHover} text-white text-xs font-medium rounded-lg disabled:opacity-50 transition-colors`}
+            >
+              {isPushingGithub ? <Loader2 size={14} className="animate-spin" /> : <GitBranch size={14} />}
+              {isPushingGithub ? 'Pushing...' : 'Create Repo & Push'}
+            </button>
+          </div>
+        </div>
       )}
     </div>
   )

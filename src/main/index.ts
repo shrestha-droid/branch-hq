@@ -9,6 +9,16 @@ import * as fs from 'fs/promises'
 // the dependency lists Jim/Dwight/Riley's generated code is allowed to
 // use -- run `npm install jszip` in the project root once for this.
 import JSZip from 'jszip'
+// NEW: for real file upload/attachment support -- extracting actual
+// text from an uploaded PDF so it can be used as real context, not just
+// a filename. Pure JS, no native compilation. Run `npm install
+// pdf-parse` in the project root once for this.
+// FIXED: confirmed real, well-documented issue -- pdf-parse's own
+// TypeScript typings don't reliably expose a default export across
+// configurations (TS1192), regardless of esModuleInterop. A plain
+// require() sidesteps the whole ES-module interop question entirely,
+// since this file compiles to CommonJS anyway.
+const pdfParse = require('pdf-parse')
 import * as dotenv from 'dotenv'
 import {
   createConversation,
@@ -23,6 +33,8 @@ import { searchRelevantCode } from './vectorStore'
 import { generateEmbedding, indexWorkspace } from './indexer'
 import { getSettings, updateSettings } from './settingsStore'
 import { recordAudit, generateAuditReport, markExecutionVerified } from './auditStore'
+import { recordLesson, getLearnedGuidance } from './lessonsStore'
+import { setGithubToken, hasGithubToken, clearGithubToken, getGithubTokenForInternalUse } from './credentialsStore'
 import { runMechanicalAudit, AuditResult } from './gate1'
 import { looksTransient } from './resilience'
 
@@ -471,11 +483,13 @@ function injectDocumentBoilerplate(extractedFiles: Record<string, string>): Reco
           ? 'tsx src/generate.ts'
           : 'echo "No src/generate.ts found -- Riley must name the script exactly that" && exit 1'
       },
-      // Both libraries are pure JS/TS, no native compilation -- same
+      // All four are pure JS/TS, no native compilation -- same
       // WebContainer-safety reasoning as bcryptjs over bcrypt for Dwight.
       dependencies: {
         "pdfkit": "^0.15.0",
-        "pptxgenjs": "^3.12.0"
+        "pptxgenjs": "^3.12.0",
+        "docx": "^9.0.2",
+        "exceljs": "^4.4.0"
       },
       devDependencies: {
         "typescript": "^5.4.5",
@@ -552,6 +566,8 @@ WHEN MOTION GENUINELY SERVES THE DESIGN, you now have framer-motion available --
 - Animated number counter: a stat counts up from 0 to its real value once, when it first enters view -- not on every render
 - Aurora/mesh gradient background: pure CSS, no dependency needed -- several large, soft, slowly-drifting blurred gradient shapes behind content, distinct from the "one glowing blue accent" AI tell above by using the build's own actual palette and genuine slow motion, not a static glow
 
+CRITICAL: only build a login/signup/authentication screen when the request genuinely implies user accounts are needed (explicit mentions of accounts, multiple users, "sign up," "login," roles, or personal/private data that must belong to someone specific). Do not add an auth screen by default just because the app has a backend -- most requests (a task tracker, a dashboard, an internal tool) don't need one, and adding it unasked is real, unrequested complexity that becomes a new thing that can break, not a nice-to-have.
+
 THE BAR: build like a senior product designer at a top tech company, not like someone assembling a template. This is what actually separates that level of work from generic AI output -- reach for these specifically:
 - Real spacing discipline: pick a base unit (4px or 8px) and keep every gap, padding, and margin a multiple of it throughout the whole build. Inconsistent, eyeballed spacing is one of the fastest tells of unpolished work, even when every individual value looks fine in isolation.
 - A genuine type scale, not ad hoc sizes: 3-5 font sizes total, each with a deliberate weight and line-height pairing, reused consistently. Don't introduce a new one-off size because a single heading "needs to be a bit bigger."
@@ -563,7 +579,9 @@ THE BAR: build like a senior product designer at a top tech company, not like so
 
 A financial dashboard, a kids' game, and a developer tool should never end up looking like the same template in different colors. Match the whole visual style to what's actually being built.
 
-CRITICAL, confirmed real failure: lucide-react icon names are easy to hallucinate, especially compound names that sound plausible but don't exist -- confirmed real example: "LayoutKanban" was imported and does not exist as an export, despite sounding exactly like a real icon name (lucide-react does have LayoutGrid, LayoutDashboard, LayoutList, AND separately Kanban, SquareKanban, FolderKanban -- but never combines "Layout" with "Kanban"). When you want an icon for a board/kanban/grid-style UI concept and are not fully certain the exact name exists, prefer a simple, extremely well-established icon (LayoutGrid, List, Columns, Grid3x3) over guessing at a more specific compound name -- a plain, safe icon that definitely exists beats a precisely-named one that might not.`,
+CRITICAL, confirmed real failure: lucide-react icon names are easy to hallucinate, especially compound names that sound plausible but don't exist -- confirmed real example: "LayoutKanban" was imported and does not exist as an export, despite sounding exactly like a real icon name (lucide-react does have LayoutGrid, LayoutDashboard, LayoutList, AND separately Kanban, SquareKanban, FolderKanban -- but never combines "Layout" with "Kanban"). When you want an icon for a board/kanban/grid-style UI concept and are not fully certain the exact name exists, prefer a simple, extremely well-established icon (LayoutGrid, List, Columns, Grid3x3) over guessing at a more specific compound name -- a plain, safe icon that definitely exists beats a precisely-named one that might not.
+
+CRITICAL, confirmed real failure: NEVER build a login, sign-up, or authentication gate in front of the app unless the request explicitly asks for user accounts, login, authentication, or multi-user access. Confirmed real pattern: "professional-looking dashboard" in training data is frequently associated with a login screen, even when nothing about the actual request called for one -- the result is a real, working feature sitting behind a login form that has no real account system to actually authenticate against, completely blocking anyone from ever seeing what they actually asked for. Default to showing the requested functionality directly, immediately, with no gate in front of it. Only build login/auth UI when it is the explicit subject of the request.`,
   DWIGHT_BACKEND: `You are Dwight, Backend Specialist. Write complete, functional Node.js/TypeScript code using Express.
 ALWAYS wrap your code in standard Markdown code blocks (e.g., \`\`\`ts ).
 ALWAYS declare file paths at the very start of the code blocks (e.g., // File: src/server.ts).
@@ -598,17 +616,28 @@ or
 PAM_VERDICT: CHANGES_REQUESTED`,
   // NEW: Riley, the third specialist -- produces PDF/PPT files via a
   // script instead of app code.
-  RILEY_DOCS: `You are Riley, the Research & Documents Specialist. You produce PDF and PowerPoint files by writing a single Node.js/TypeScript script.
+  RILEY_DOCS: `You are Riley, the Research & Documents Specialist. You produce PDF, PowerPoint, Word, and Excel files, plus plain CSV and Markdown, by writing a single Node.js/TypeScript script.
 ALWAYS wrap your code in a standard Markdown code block.
 ALWAYS declare the file path at the very start of the code block (e.g., // File: src/generate.ts).
 ALWAYS name your script exactly src/generate.ts -- this is the only file the system will run.
-CRITICAL: You are ONLY allowed to use 'pdfkit' (for PDF files) and 'pptxgenjs' (for PowerPoint files) as external dependencies. Do not import anything else.
-CRITICAL: Your script must write its output to exactly output.pdf or output.pptx in the project root when run -- that is the file that gets saved for the user.
+CRITICAL: You are ONLY allowed to use 'pdfkit' (PDF), 'pptxgenjs' (PowerPoint), 'docx' (Word), and 'exceljs' (Excel) as external dependencies -- CSV and Markdown need no library at all, just write the file directly with Node's built-in fs. Do not import anything else.
+CRITICAL: Your script must write its output to exactly one of output.pdf, output.pptx, output.docx, output.xlsx, output.csv, or output.md in the project root, matching whichever format the request actually calls for -- that is the file that gets saved for the user. Pick the format the request genuinely needs: a written report or proposal is normally Word or PDF, a presentation is PowerPoint, tabular/numeric data is Excel or CSV, notes or documentation are Markdown.
 CRITICAL: NEVER include your own name or role ("Riley", "Research & Documents Specialist", "Published by...", etc.) anywhere in the actual document content. The document is for the user to give to their own audience -- it must never describe itself as AI-generated or reference who/what produced it.
+
 CRITICAL for page numbers in PDFs: if you add page numbers, add each one incrementally as its page is created (e.g. using pdfkit's 'pageAdded' event, tracking a running count), never in a separate loop after all pages already exist -- that requires switchToPage() and is a common source of every page number landing in the same spot instead of on its own page. A simple running "Page N" without a "of TOTAL" is safer and preferred, since knowing the total in advance requires that same error-prone two-pass approach.
 CRITICAL for shapes in PPTX files: every addShape() call's first argument must be a real shape type from pptxgen.ShapeType (e.g. pptxgen.ShapeType.rect, pptxgen.ShapeType.roundRect, pptxgen.ShapeType.line) -- never leave it missing or guess at a name. A confirmed real failure: calling addShape() with a missing or invalid shape type crashes the whole script. If you use the same shape type more than once, use the exact same correct constant every time -- do not vary it.
 CRITICAL for PPTX slide width: 'LAYOUT_16X9' is only 10" x 5.625" -- NOT the ~13.3" wide canvas its name suggests. A confirmed real failure: writing multi-column layouts (3-4 cards, wide titles) with x-coordinates going up to 11-12" while using LAYOUT_16X9 silently cuts off everything past x=10" -- titles, whole columns, right-edge cards. pptxgenjs writes coordinates past the slide edge without any warning; they are simply gone from the rendered file. ALWAYS set pres.layout = 'LAYOUT_WIDE' (13.3" x 7.5") for any slide with 3+ columns or a title near full-width, and keep every x + w within that actual boundary.
 CRITICAL, separate rule, do not skip this: NEVER add a decorative color bar or accent stripe anywhere in a deck. This is a confirmed, repeated real failure across multiple generations -- it keeps appearing in different forms even after being told to stop once, so read this as covering ALL of the following, not just one of them: a vertical stripe down the left edge of a slide, a horizontal bar across the top of a slide, and a thin colored stripe down the left edge of an individual card or content box (a common habit: giving every card a colored left border to "make it pop"). All three are the same mistake. If a card needs to stand out, use a subtle background color difference or a soft shadow -- never a stripe or bar of any kind, on a slide or on a card.
+
+For Word documents (docx): build the structure declaratively with real Paragraph, TextRun, and Table objects -- headings via HeadingLevel, not just bold text pretending to be a heading. Generate the final buffer with await Packer.toBuffer(doc) and write that exact buffer to output.docx with fs.writeFileSync -- do not skip the await, since it returns a Promise.
+For Excel files (xlsx): build with a real Workbook -> Worksheet -> rows/cells structure. Always set explicit column widths (worksheet.columns = [...]) -- default widths make real content look cramped and cut off. Write actual numbers as JavaScript numbers, not strings, so Excel treats them as real numbers for formatting and formulas, not text. Save with await workbook.xlsx.writeFile('output.xlsx') -- this is async, do not skip the await.
+For CSV: proper escaping matters -- any field containing a comma, quote, or newline must be wrapped in double quotes with internal quotes doubled. Do not hand-roll this casually; a naive join(',') breaks on real-world data.
+For Markdown: use real heading levels (#, ##) to reflect actual structure, not just bold text -- and remember this is being read as a document a person will open, not chat formatting.
+
+Research methodology -- read this carefully, since it shapes whether the document is actually trustworthy: you do not have live internet access. Write from your own knowledge -- never claim to have searched the web, never cite a specific source you were not actually given, and never invent a precise-sounding statistic, date, or figure you are not genuinely confident is correct. A vague-but-honest statement ("adoption has grown significantly in recent years") is better than a fabricated-but-specific one ("adoption grew 47% in 2024") -- a specific wrong number is a worse failure than an honest general statement, because it looks more credible while being less true. When a request would genuinely benefit from current, live, or sourced information you don't have, say so plainly in the document or your response rather than filling the gap with invented facts. Structure research-style content with real, clear sections and headers reflecting its actual logical organization, not a wall of undifferentiated paragraphs.
+
+If the instructions include an attached file's real extracted content (marked as such in what you're given), use it with genuine specificity -- real names, numbers, and facts drawn directly from it, not a generic gloss that could apply to any similar document. The entire point of an attached file is for the output to actually reflect what's really in it.
+
 IMPORTANT: You do not have live internet access. Write from your own knowledge -- never claim to have searched the web or cite sources you were not actually given. If the user needs current or live information, say so plainly rather than inventing facts.`,
   // NEW: the plain chatbot -- not part of the pipeline, no code, no Gate 1,
   // just a normal back-and-forth conversation.
@@ -860,11 +889,56 @@ typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName,
       return { success: true, messages: newMessages }
     }
 
-    // Direct chat with Jim/Dwight/Pam (skipping Michael's routing) is the
-    // original, still-unbuilt feature this channel was designed for.
-    // Failing clearly here beats guessing at behavior for something that
-    // was never actually implemented.
-    const errMsg = await addMessage(conversationId, 'error', `Direct chat with ${agentName} isn't implemented yet -- only general chat mode is currently wired up.`)
+    // NEW: direct chat with Jim or Dwight -- the actual feature this
+    // channel was originally built for, finally implemented. What's
+    // genuinely being skipped here is Michael's routing decision and
+    // Pam's review -- the whole point of clicking a specific character
+    // is a faster, more direct conversation with them. Gate 1 is never
+    // skipped for anyone, under any path -- that's a security check, not
+    // routing ceremony, and stays non-negotiable regardless of how a
+    // generation was reached.
+    if (agentName === 'jim' || agentName === 'dwight') {
+      const targetPrompt = agentName === 'dwight' ? PROMPTS.DWIGHT_BACKEND : PROMPTS.JIM_FRONTEND
+      const learnedGuidance = await getLearnedGuidance(agentName)
+      const specialistOutput = await fetchFrontierAI(targetPrompt, prompt + learnedGuidance)
+      const { staticAudit, stageableFiles } = auditAndStage(specialistOutput, agentName)
+
+      if (!staticAudit.passed) {
+        await recordAudit({
+          conversationId, agentKey: agentName, attempt: 1,
+          gate1Passed: false, perFile: staticAudit.perFile, pamVerdict: 'UNKNOWN'
+        })
+        const errMsg = await addMessage(conversationId, 'error', `Gate 1 Hard Blockers Enforced:\n- ${staticAudit.blockers.join('\n- ')}`)
+        return { success: false, messages: [...newMessages, errMsg] }
+      }
+
+      const agentMsg = await addMessage(conversationId, agentName, specialistOutput, stageableFiles)
+      newMessages.push(agentMsg)
+
+      // Recorded honestly: Gate 1 genuinely ran and passed, Pam's
+      // verdict is UNKNOWN because she was genuinely never asked, not
+      // silently defaulted to an approval she never gave.
+      const auditRecord = await recordAudit({
+        conversationId, agentKey: agentName, attempt: 1,
+        gate1Passed: true, perFile: staticAudit.perFile, pamVerdict: 'UNKNOWN'
+      })
+
+      return { success: true, messages: newMessages, files: stageableFiles, agentKey: agentName, instructions: prompt, auditId: auditRecord.id }
+    }
+
+    // NEW: direct chat with Pam -- a genuinely different use case from
+    // the other two. Not staged code from the pipeline; a real review
+    // of whatever the user hands her directly (a pasted snippet, code
+    // written by hand, anything), on demand, outside the normal
+    // generate-then-review flow.
+    if (agentName === 'pam') {
+      const pamReview = await fetchFrontierAI(PROMPTS.PAM_AUDITOR_LOGIC, prompt)
+      const pamMsg = await addMessage(conversationId, 'pam', pamReview)
+      newMessages.push(pamMsg)
+      return { success: true, messages: newMessages }
+    }
+
+    const errMsg = await addMessage(conversationId, 'error', `Unrecognized direct chat target: ${agentName}`)
     return { success: false, messages: [...newMessages, errMsg] }
   } catch (error: any) {
     const errMsg = await addMessage(conversationId, 'error', error.message || 'Chat error.')
@@ -892,7 +966,10 @@ async function runSpecialistPipeline(params: {
     agentKey === 'riley' ? PROMPTS.RILEY_DOCS :
     PROMPTS.JIM_FRONTEND
 
-  let currentInstructions = baseInstructions + projectContext + existingProjectSnapshot
+  // NEW: self-healing memory. Real, confirmed mistakes this agent has
+  // made and already had fixed before -- local to this machine only.
+  const learnedGuidance = await getLearnedGuidance(agentKey)
+  let currentInstructions = baseInstructions + projectContext + existingProjectSnapshot + learnedGuidance
   let specialistOutput = ''
   let staticAudit: AuditResult
   let stageableFiles: Record<string, string> | undefined
@@ -1290,6 +1367,12 @@ typedIpc.handle('heal:invoke', async (_event: any, {
       pamVerdict: verdictMatch ? (verdictMatch[1].toUpperCase() as 'APPROVED' | 'CHANGES_REQUESTED') : 'UNKNOWN'
     })
 
+    // NEW: self-healing memory. Recorded at the same Gate1+Pam bar the
+    // rest of the system already treats as real success, not a stricter
+    // one invented just for this -- the fix genuinely cleared the same
+    // checks any other generation has to. Local-only, see lessonsStore.ts.
+    await recordLesson(agentKey, errorLog)
+
     return { success: true, messages: newMessages, files: stageableFiles, agentKey, instructions: previousInstructions, auditId: auditRecord.id }
   } catch (error: any) {
     const errMsg = await addMessage(conversationId, 'error', error.message || 'Self-healing failed.')
@@ -1658,6 +1741,141 @@ typedIpc.handle('fs:downloadZip', async (_event: any, { files, suggestedName }: 
     return { success: true, savedTo: filePath }
   } catch (err: any) {
     return { success: false, error: err.message }
+  }
+})
+
+// ============================================================================
+// GITHUB INTEGRATION (foundation) -- real, but scoped honestly. Personal
+// Access Token auth, not full OAuth (which needs Branch HQ registered as
+// a real GitHub developer app -- a separate step, not something doable
+// from this codebase alone). Creates a new PRIVATE repo by default and
+// pushes to it using real git commands, the same scratch-directory and
+// process-spawning pattern already proven by the native execution
+// engine. Vercel deployment deliberately isn't built yet -- connecting
+// the resulting GitHub repo to Vercel through Vercel's own UI gets most
+// of the way there for free, without needing a second integration.
+// ============================================================================
+
+typedIpc.handle('credentials:setGithubToken', async (_event: any, token: string) => {
+  return await setGithubToken(token)
+})
+
+typedIpc.handle('credentials:hasGithubToken', async () => {
+  return { hasToken: await hasGithubToken() }
+})
+
+typedIpc.handle('credentials:clearGithubToken', async () => {
+  await clearGithubToken()
+  return { success: true }
+})
+
+function detectGit(): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile('git', ['--version'], (err: Error | null) => resolve(!err))
+  })
+}
+
+typedIpc.handle('git:pushToGithub', async (_event: any, { files, repoName, isPrivate }: { files: Record<string, string>; repoName: string; isPrivate: boolean }) => {
+  try {
+    const token = await getGithubTokenForInternalUse()
+    if (!token) {
+      return { success: false, error: 'No GitHub token is set up yet -- add one in Settings first.' }
+    }
+
+    const gitAvailable = await detectGit()
+    if (!gitAvailable) {
+      return { success: false, error: 'git does not appear to be installed on this machine. Install it, then try again.' }
+    }
+
+    // Real repo creation via GitHub's REST API. Private by default --
+    // this is very likely to contain real, possibly proprietary code,
+    // and a private default is the safer choice than a public one.
+    const createRes = await fetch('https://api.github.com/user/repos', {
+      method: 'POST',
+      headers: {
+        'Authorization': `token ${token}`,
+        'Accept': 'application/vnd.github+json',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ name: repoName, private: isPrivate })
+    })
+
+    if (!createRes.ok) {
+      const errBody = await createRes.json().catch(() => ({}))
+      const message = errBody?.errors?.[0]?.message || errBody?.message || `GitHub returned status ${createRes.status}`
+      return { success: false, error: `Could not create the repo: ${message}` }
+    }
+
+    const repoData = await createRes.json()
+    const owner = repoData.owner?.login
+    const htmlUrl = repoData.html_url
+    // The token is embedded directly in the HTTPS remote URL -- a
+    // standard, well-established way to authenticate a git push with a
+    // PAT, without needing to configure SSH keys.
+    const authedRemote = `https://${token}@github.com/${owner}/${repoName}.git`
+
+    const scratchDir = path.join(os.tmpdir(), 'branch-hq-github-push', `${Date.now()}`)
+    await fs.mkdir(scratchDir, { recursive: true })
+    await writeFilesToScratch(scratchDir, files)
+
+    const runGit = (args: string[]): Promise<void> => new Promise((resolve, reject) => {
+      const proc = spawn('git', args, { cwd: scratchDir, shell: true, env: cleanInstallEnv() })
+      let stderr = ''
+      proc.stderr.on('data', (d: Buffer) => { stderr += d.toString() })
+      proc.on('exit', (code: number | null) => code === 0 ? resolve() : reject(new Error(stderr || `git ${args[0]} exited with code ${code}`)))
+    })
+
+    await runGit(['init'])
+    await runGit(['add', '-A'])
+    await runGit(['-c', 'user.email=branch-hq@local', '-c', 'user.name=Branch HQ', 'commit', '-m', 'Initial commit from Branch HQ'])
+    await runGit(['branch', '-M', 'main'])
+    await runGit(['remote', 'add', 'origin', authedRemote])
+    await runGit(['push', '-u', 'origin', 'main'])
+
+    await fs.rm(scratchDir, { recursive: true, force: true }).catch(() => {})
+
+    return { success: true, repoUrl: htmlUrl }
+  } catch (err: any) {
+    return { success: false, error: err.message }
+  }
+})
+
+// NEW: real file upload/attachment. Scoped deliberately to genuinely
+// text-extractable documents (PDF, plain text/markdown) -- a well-
+// reasoned first version, not a full multimodal rearchitecture. Image
+// upload would need actual vision-model support (base64 image content
+// in the API call shape), which is a separate, larger piece of work,
+// not folded in here silently.
+const MAX_UPLOADED_TEXT_CHARS = 12000
+
+typedIpc.handle('file:extractText', async (_event: any, { fileName, fileBytes }: { fileName: string; fileBytes: ArrayBuffer }) => {
+  try {
+    const buffer = Buffer.from(fileBytes)
+    const lowerName = fileName.toLowerCase()
+    let text: string
+
+    if (lowerName.endsWith('.pdf')) {
+      const parsed = await pdfParse(buffer)
+      text = parsed.text
+    } else if (lowerName.endsWith('.txt') || lowerName.endsWith('.md') || lowerName.endsWith('.csv') || lowerName.endsWith('.json')) {
+      text = buffer.toString('utf-8')
+    } else {
+      return {
+        success: false,
+        error: `"${fileName}" isn't a supported file type yet -- PDF, .txt, .md, .csv, and .json are supported. Images and other formats aren't extractable as text yet.`
+      }
+    }
+
+    const truncated = text.length > MAX_UPLOADED_TEXT_CHARS
+    const finalText = truncated ? text.slice(0, MAX_UPLOADED_TEXT_CHARS) + '\n... (truncated)' : text
+
+    if (finalText.trim().length === 0) {
+      return { success: false, error: `"${fileName}" was read, but no extractable text was found in it (it may be a scanned/image-only PDF, which isn't supported yet).` }
+    }
+
+    return { success: true, text: finalText, truncated }
+  } catch (err: any) {
+    return { success: false, error: `Could not read "${fileName}": ${err.message}` }
   }
 })
 

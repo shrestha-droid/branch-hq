@@ -26,11 +26,45 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   const [settings, setSettings] = useState<Settings | null>(null)
   const [isSaving, setIsSaving] = useState(false)
   const [saveStatus, setSaveStatus] = useState<string | null>(null)
+  // NEW: kept deliberately separate from the regular settings object --
+  // this goes through the secure credentials store, not the plain
+  // settings JSON. hasGithubToken never returns the actual token, only
+  // whether one is set.
+  const [hasGithubToken, setHasGithubToken] = useState(false)
+  const [githubTokenInput, setGithubTokenInput] = useState('')
+  const [githubStatus, setGithubStatus] = useState<string | null>(null)
 
   useEffect(() => {
     // @ts-ignore
     window.api.getSettings().then(setSettings).catch(() => {})
+    // @ts-ignore
+    window.api.hasGithubToken().then((r: any) => setHasGithubToken(r.hasToken)).catch(() => {})
   }, [])
+
+  const handleConnectGithub = async () => {
+    if (!githubTokenInput.trim()) return
+    setGithubStatus(null)
+    try {
+      // @ts-ignore
+      const res = await window.api.setGithubToken(githubTokenInput.trim())
+      if (res.success) {
+        setHasGithubToken(true)
+        setGithubTokenInput('')
+        setGithubStatus('Connected.')
+      } else {
+        setGithubStatus(res.error || 'Could not save the token.')
+      }
+    } catch (err: any) {
+      setGithubStatus(err.message)
+    }
+  }
+
+  const handleDisconnectGithub = async () => {
+    // @ts-ignore
+    await window.api.clearGithubToken()
+    setHasGithubToken(false)
+    setGithubStatus('Disconnected.')
+  }
 
   const handleSave = async () => {
     if (!settings) return
@@ -181,6 +215,42 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                 />
               </button>
             </div>
+          </div>
+
+          <div className="pt-4 border-t border-white/[0.06]">
+            <label className="text-xs font-medium text-neutral-300 block mb-1.5">GitHub</label>
+            <p className="text-[11px] text-neutral-500 mb-2.5 leading-relaxed">
+              Stored securely through your OS's own keychain, not in a plain settings file -- and never sent back to this app once saved, only whether one is set. Generate a token at github.com &rarr; Settings &rarr; Developer settings &rarr; Personal access tokens (the "repo" scope is enough).
+            </p>
+            {hasGithubToken ? (
+              <div className="flex items-center justify-between bg-black/30 rounded-lg px-3 py-2.5 border border-white/[0.06]">
+                <span className="text-xs text-emerald-400 flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                  Connected
+                </span>
+                <button onClick={handleDisconnectGithub} className="text-xs text-neutral-400 hover:text-white">
+                  Disconnect
+                </button>
+              </div>
+            ) : (
+              <div className="flex gap-2">
+                <input
+                  type="password"
+                  value={githubTokenInput}
+                  onChange={(e) => setGithubTokenInput(e.target.value)}
+                  placeholder="ghp_..."
+                  className="flex-1 bg-black/30 border border-white/[0.06] rounded-lg px-3 py-2 text-xs text-white placeholder:text-neutral-600 focus:outline-none focus:border-white/20"
+                />
+                <button
+                  onClick={handleConnectGithub}
+                  disabled={!githubTokenInput.trim()}
+                  className={`px-4 py-2 ${ACCENT.bg} ${ACCENT.bgHover} text-white text-xs font-medium rounded-lg disabled:opacity-40 transition-colors`}
+                >
+                  Connect
+                </button>
+              </div>
+            )}
+            {githubStatus && <p className="text-[11px] text-neutral-400 mt-1.5">{githubStatus}</p>}
           </div>
         </div>
 

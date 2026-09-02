@@ -60,6 +60,19 @@ contextBridge.exposeInMainWorld('api', {
   // code to take elsewhere and deploy it themselves.
   downloadZip: (files: Record<string, string>, suggestedName?: string) =>
     ipcRenderer.invoke('fs:downloadZip', { files, suggestedName }),
+  // NEW: real file upload -- extracts actual text from an uploaded PDF
+  // or plain-text document so it can be used as real context, not just
+  // a filename mentioned in passing.
+  extractFileText: (fileName: string, fileBytes: ArrayBuffer) =>
+    ipcRenderer.invoke('file:extractText', { fileName, fileBytes }),
+  // NEW: GitHub integration -- credential management (the token itself
+  // never comes back through this bridge, only a boolean) and the real
+  // push-to-a-new-repo action.
+  setGithubToken: (token: string) => ipcRenderer.invoke('credentials:setGithubToken', token),
+  hasGithubToken: () => ipcRenderer.invoke('credentials:hasGithubToken'),
+  clearGithubToken: () => ipcRenderer.invoke('credentials:clearGithubToken'),
+  pushToGithub: (files: Record<string, string>, repoName: string, isPrivate: boolean) =>
+    ipcRenderer.invoke('git:pushToGithub', { files, repoName, isPrivate }),
   // NEW: model-call usage stats for the current session/conversation.
   getUsage: (conversationId?: string) => ipcRenderer.invoke('usage:get', conversationId),
   // NEW: live settings -- provider, model, default folder. Changing
@@ -105,6 +118,11 @@ declare global {
       writeFiles: (targetDirectory: string, files: Record<string, string>, overwriteConfirmed?: boolean) => Promise<{ success: boolean; writtenFiles?: string[]; skippedFiles?: string[]; error?: string }>;
       checkFileConflicts: (targetDirectory: string, files: Record<string, string>) => Promise<{ success: boolean; conflicts?: string[]; error?: string }>;
       downloadZip: (files: Record<string, string>, suggestedName?: string) => Promise<{ success: boolean; savedTo?: string; canceled?: boolean; error?: string }>;
+      extractFileText: (fileName: string, fileBytes: ArrayBuffer) => Promise<{ success: boolean; text?: string; truncated?: boolean; error?: string }>;
+      setGithubToken: (token: string) => Promise<{ success: boolean; error?: string }>;
+      hasGithubToken: () => Promise<{ hasToken: boolean }>;
+      clearGithubToken: () => Promise<{ success: boolean }>;
+      pushToGithub: (files: Record<string, string>, repoName: string, isPrivate: boolean) => Promise<{ success: boolean; repoUrl?: string; error?: string }>;
       getUsage: (conversationId?: string) => Promise<{ success: boolean; session: { callCount: number; charsIn: number; charsOut: number }; conversation: { callCount: number; charsIn: number; charsOut: number } | null }>;
       getSettings: () => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; fallbackGeminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string; strictVerification: boolean }>;
       updateSettings: (partial: Record<string, any>) => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; fallbackGeminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string; strictVerification: boolean }>;

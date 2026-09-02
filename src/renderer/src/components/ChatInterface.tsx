@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { Send, Bot, AlertCircle, MessageSquarePlus, Trash2, Menu, X, FileCode, Search, Settings as SettingsIcon } from 'lucide-react'
+import { Send, Bot, AlertCircle, MessageSquarePlus, Trash2, Menu, X, FileCode, Search, Settings as SettingsIcon, Paperclip, Loader2 } from 'lucide-react'
+import OfficeScene from './OfficeScene'
 
 interface Message {
   id?: string
@@ -72,6 +73,11 @@ interface GeneratedResult {
   // own folder automatically instead of everything colliding into the
   // same static target folder every time.
   suggestedFolderName?: string
+  // NEW: the audit record's real id for this generation, so the
+  // sandbox can report back "this actually ran successfully" once it
+  // genuinely happens, upgrading the record from Pam's opinion to
+  // confirmed execution.
+  auditId?: string | null
 }
 
 function slugifyForFolder(title: string, conversationId: string): string {
@@ -116,7 +122,28 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
   const [activeConvoId, setActiveConvoId] = useState<string | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
+  // NEW: real file upload -- scoped to genuinely text-extractable
+  // documents (PDF, plain text/markdown/csv/json). Image upload would
+  // need real vision-model support, a separate, larger piece of work.
+  const [attachedFile, setAttachedFile] = useState<{ name: string; text: string; truncated: boolean } | null>(null)
+  const [isExtracting, setIsExtracting] = useState(false)
+  const [attachError, setAttachError] = useState<string | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const [isTyping, setIsTyping] = useState(false)
+  // NEW: real status per agent, driven by actual pipeline activity --
+  // not randomized or purely decorative. Honest about its own
+  // resolution: Michael is marked working the moment a message is sent
+  // (he genuinely always processes first), and whichever specialists
+  // actually appear in the response are marked working, then briefly
+  // done, once it arrives. This is real participation data, not a
+  // granular live step-by-step feed of every internal pipeline stage --
+  // that would need the backend to stream progress events, a separate,
+  // bigger piece not built here.
+  const [agentStatuses, setAgentStatuses] = useState<Record<string, 'idle' | 'working' | 'done'>>({})
+  // NEW: which agent (if any) is the current direct-chat target,
+  // selected by clicking their character. null means normal mode --
+  // Michael routes as he always has.
+  const [directTarget, setDirectTarget] = useState<'jim' | 'dwight' | 'pam' | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   // NEW: the conversation list is already long enough from testing alone
   // that scanning it by eye is a real annoyance -- this filters by title.
@@ -234,18 +261,56 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
     }
   }, [messages, isTyping])
 
+  // NEW: reads the picked file's real bytes in the renderer (a plain
+  // browser API, no Node needed for this part) and sends them to the
+  // main process for actual text extraction.
+  const handleFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setAttachError(null)
+    setIsExtracting(true)
+    try {
+      const bytes = await file.arrayBuffer()
+      // @ts-ignore
+      const result = await window.api.extractFileText(file.name, bytes)
+      if (result.success && result.text) {
+        setAttachedFile({ name: file.name, text: result.text, truncated: !!result.truncated })
+      } else {
+        setAttachError(result.error || 'Could not read that file.')
+      }
+    } catch (err: any) {
+      setAttachError(err.message || 'Could not read that file.')
+    } finally {
+      setIsExtracting(false)
+      if (fileInputRef.current) fileInputRef.current.value = ''
+    }
+  }
+
   const handleSend = async () => {
     if (!input.trim() || isTyping || !activeConvoId) return
     const promptText = input.trim()
+    // NEW: the displayed chat bubble stays clean (just what the user
+    // typed, plus a small visible marker) -- the FULL extracted document
+    // text goes into a separate string used only for the actual API
+    // call, so a long PDF's contents never clutter the visible
+    // transcript the way the raw prompt would.
+    const attachmentForApi = attachedFile
+      ? `[Attached file: ${attachedFile.name}${attachedFile.truncated ? ' -- truncated' : ''}]\n${attachedFile.text}\n\n`
+      : ''
+    const displayText = attachedFile ? `📎 ${attachedFile.name}\n${promptText}` : promptText
+    const apiPromptText = attachmentForApi + promptText
     setInput('')
+    setAttachedFile(null)
+    setAttachError(null)
     setIsTyping(true)
+    setAgentStatuses({ [directTarget || 'michael']: 'working' })
 
     // NEW: captured before the optimistic append below, so this marks
     // exactly where the newly-arriving messages will start once the
     // response replaces the array -- the boundary the typewriter effect
     // uses to know what's new vs. old history.
     const startLen = messages.length
-    setMessages(prev => [...prev, { role: 'user', content: promptText }])
+    setMessages(prev => [...prev, { role: 'user', content: displayText }])
 
     // Kept only so any conversation created before this change (back when
     // "Chat" was picked as a separate mode) still works correctly. Every
@@ -255,15 +320,34 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
     const isChatMode = activeConversation?.mode === 'chat'
 
     try {
-      const response = isChatMode
+      // NEW: a selected character takes priority over normal routing --
+      // this is the actual point of clicking one.
+      const response = directTarget
         // @ts-ignore
-        ? await window.api.invokeAgent(activeConvoId, 'chat', promptText)
+        ? await window.api.invokeAgent(activeConvoId, directTarget, apiPromptText)
+        : isChatMode
         // @ts-ignore
-        : await window.api.invokeAI(activeConvoId, promptText)
+        ? await window.api.invokeAgent(activeConvoId, 'chat', apiPromptText)
+        // @ts-ignore
+        : await window.api.invokeAI(activeConvoId, apiPromptText)
 
       if (response.success && response.messages) {
         setMessages(response.messages)
         setAnimateFromIndex(startLen + 1)
+
+        // NEW: real participation, not decoration -- whichever agents
+        // actually posted a message in this response are the ones shown
+        // as having worked. A brief "done" pulse, then back to idle.
+        const involvedAgents = new Set(
+          response.messages.slice(startLen)
+            .map((m: any) => m.role)
+            .filter((role: string) => ['michael', 'jim', 'dwight', 'pam', 'riley'].includes(role))
+        )
+        setAgentStatuses(Object.fromEntries([...involvedAgents].map(id => [id, 'working'])))
+        setTimeout(() => {
+          setAgentStatuses(Object.fromEntries([...involvedAgents].map(id => [id, 'done'])))
+        }, 1200)
+        setTimeout(() => setAgentStatuses({}), 3200)
 
         // CRITICAL: Pass generated files up to App.tsx to trigger the sandbox split-pane
         if (response.files && Object.keys(response.files).length > 0 && onCodeGenerated) {
@@ -273,7 +357,8 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
             conversationId: activeConvoId,
             agentKey: response.agentKey,
             instructions: response.instructions,
-            suggestedFolderName: slugifyForFolder(activeTitle, activeConvoId)
+            suggestedFolderName: slugifyForFolder(activeTitle, activeConvoId),
+            auditId: response.auditId
           })
         }
       } else if (response.messages) {
@@ -283,6 +368,7 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
       loadConversations()
     } catch (err: any) {
       setMessages(prev => [...prev, { role: 'error', content: `IPC Bridge Error: ${err.message}` }])
+      setAgentStatuses({})
     } finally {
       setIsTyping(false)
     }
@@ -364,7 +450,22 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
 
         {/* No background grid pattern -- plain flat background, calmer */}
 
-        <div ref={messagesContainerRef} className="flex-1 overflow-y-auto pb-40 pt-16 px-6 z-10 scrollbar-thin scrollbar-thumb-neutral-800 scrollbar-track-transparent">
+        {/* NEW: the office scene -- persistent, not just shown at empty
+            state, since the whole point is seeing real activity while
+            it's actually happening. */}
+        <div className="pt-14 pb-1 shrink-0 border-b border-white/[0.04] bg-black/10">
+          <OfficeScene
+            statuses={agentStatuses}
+            activeDirectTarget={directTarget}
+            onCharacterClick={(agentId) => {
+              // Clicking the already-selected character deselects it --
+              // returns to Michael's normal routing.
+              setDirectTarget(prev => (prev === agentId ? null : agentId as 'jim' | 'dwight' | 'pam'))
+            }}
+          />
+        </div>
+
+        <div ref={messagesContainerRef} className="flex-1 overflow-y-auto pb-40 pt-4 px-6 z-10 scrollbar-thin scrollbar-thumb-neutral-800 scrollbar-track-transparent">
           {messages.length === 0 ? (
             <div className="h-full flex flex-col items-center justify-center text-neutral-500">
               <style>{`
@@ -470,23 +571,78 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
           )}
         </div>
         <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-[#141414] via-[#141414]/95 to-transparent z-20">
-          <div className={`w-full max-w-3xl mx-auto flex items-center gap-3 bg-white/[0.04] focus-within:bg-white/[0.06] rounded-2xl p-2 border border-white/[0.06] focus-within:${ACCENT.border} transition-colors duration-200`}>
-            <input
-              type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') handleSend() }}
-              placeholder="Message Branch HQ..."
-              disabled={isTyping}
-              className="flex-1 bg-transparent border-none outline-none px-4 py-2 text-sm text-neutral-100 placeholder:text-neutral-500"
-            />
-            <button
-              onClick={handleSend}
-              disabled={!input.trim() || isTyping}
-              className={`p-3 ${ACCENT.bg} ${ACCENT.bgHover} text-white rounded-xl disabled:opacity-30 transition-colors`}
-            >
-              <Send size={16} className={isTyping ? "opacity-50" : "ml-0.5"} />
-            </button>
+          <div className="w-full max-w-3xl mx-auto">
+            {directTarget && (
+              <div className={`flex items-center gap-2 mb-2 px-3 py-2 ${ACCENT.bgSoft} border ${ACCENT.border} rounded-xl text-xs`}>
+                <span className={`w-1.5 h-1.5 rounded-full ${ACCENT.bg}`} />
+                <span className="text-neutral-200 flex-1">
+                  Talking directly to <span className="font-medium capitalize">{directTarget}</span> -- Michael's routing is bypassed for this message.
+                </span>
+                <button onClick={() => setDirectTarget(null)} className="text-neutral-400 hover:text-white shrink-0">
+                  <X size={13} />
+                </button>
+              </div>
+            )}
+            {(attachedFile || isExtracting || attachError) && (
+              <div className="flex items-center gap-2 mb-2 px-3 py-2 bg-white/[0.04] border border-white/[0.06] rounded-xl text-xs">
+                {isExtracting ? (
+                  <>
+                    <Loader2 size={13} className="animate-spin text-neutral-400" />
+                    <span className="text-neutral-400">Reading file...</span>
+                  </>
+                ) : attachError ? (
+                  <>
+                    <AlertCircle size={13} className="text-red-400 shrink-0" />
+                    <span className="text-red-400 flex-1">{attachError}</span>
+                    <button onClick={() => setAttachError(null)} className="text-neutral-500 hover:text-white shrink-0">
+                      <X size={13} />
+                    </button>
+                  </>
+                ) : attachedFile ? (
+                  <>
+                    <Paperclip size={13} className={`${ACCENT.text} shrink-0`} />
+                    <span className="text-neutral-300 flex-1 truncate">{attachedFile.name}</span>
+                    {attachedFile.truncated && <span className="text-neutral-500 shrink-0">(truncated)</span>}
+                    <button onClick={() => setAttachedFile(null)} className="text-neutral-500 hover:text-white shrink-0" title="Remove attachment">
+                      <X size={13} />
+                    </button>
+                  </>
+                ) : null}
+              </div>
+            )}
+            <div className={`flex items-center gap-3 bg-white/[0.04] focus-within:bg-white/[0.06] rounded-2xl p-2 border border-white/[0.06] focus-within:${ACCENT.border} transition-colors duration-200`}>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".pdf,.txt,.md,.csv,.json"
+                onChange={handleFileSelected}
+                className="hidden"
+              />
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isTyping || isExtracting}
+                title="Attach a PDF or text document"
+                className="p-2.5 text-neutral-400 hover:text-white hover:bg-white/[0.06] rounded-xl disabled:opacity-30 transition-colors shrink-0"
+              >
+                <Paperclip size={16} />
+              </button>
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleSend() }}
+                placeholder="Message Branch HQ..."
+                disabled={isTyping}
+                className="flex-1 bg-transparent border-none outline-none px-2 py-2 text-sm text-neutral-100 placeholder:text-neutral-500"
+              />
+              <button
+                onClick={handleSend}
+                disabled={!input.trim() || isTyping}
+                className={`p-3 ${ACCENT.bg} ${ACCENT.bgHover} text-white rounded-xl disabled:opacity-30 transition-colors`}
+              >
+                <Send size={16} className={isTyping ? "opacity-50" : "ml-0.5"} />
+              </button>
+            </div>
           </div>
         </div>
       </div>
