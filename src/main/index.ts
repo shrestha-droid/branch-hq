@@ -408,6 +408,8 @@ function injectFrontendBoilerplate(extractedFiles: Record<string, string>): Reco
         "@vitejs/plugin-react": "^4.2.1",
         "vite": "^5.1.0",
         "typescript": "^5.2.2",
+        "@types/react": "^18.2.66",
+        "@types/react-dom": "^18.2.22",
         "@types/canvas-confetti": "^1.6.4",
         "tailwindcss": "^3.4.1",
         "postcss": "^8.4.35",
@@ -446,7 +448,7 @@ function injectFrontendBoilerplate(extractedFiles: Record<string, string>): Reco
       },
       include: ["src"]
     }, null, 2),
-    'index.html': `<!DOCTYPE html>\n<html lang="en">\n  <head>\n    <meta charset="UTF-8" />\n    <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n    <title>Sandbox Preview</title>\n  </head>\n  <body>\n    <div id="root"></div>\n    <script type="module" src="/src/main.tsx"></script>\n  </body>\n</html>`,
+    'index.html': `<!DOCTYPE html>\n<html lang="en">\n  <head>\n    <meta charset="UTF-8" />\n    <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n    <title>Sandbox Preview</title>\n  </head>\n  <body>\n    <div id="root"></div>\n    <script>\n      // NEW: confirmed real gap -- errors happening inside this page\n      // after it loads (a bad import, a runtime exception) were never\n      // detected at all, meaning self-healing had zero chance to ever\n      // see or fix them. Registered before the app's own module below,\n      // so it catches even module-load-time errors, not just ones\n      // after React mounts.\n      window.addEventListener('error', function(e) {\n        try {\n          window.parent.postMessage({ type: 'branch-hq-runtime-error', message: (e.error && e.error.stack) || e.message || String(e) }, '*')\n        } catch (err) {}\n      })\n      window.addEventListener('unhandledrejection', function(e) {\n        try {\n          window.parent.postMessage({ type: 'branch-hq-runtime-error', message: 'Unhandled promise rejection: ' + ((e.reason && e.reason.stack) || e.reason || String(e)) }, '*')\n        } catch (err) {}\n      })\n    </script>\n    <script type="module" src="/src/main.tsx"></script>\n  </body>\n</html>`,
     'src/main.tsx': hasAppComponent
       ? `import React from 'react'\nimport ReactDOM from 'react-dom/client'\n${appImportLine}\nimport './assets/main.css'\n\nReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(\n  <React.StrictMode>\n    <App />\n  </React.StrictMode>\n)`
       : `import './assets/main.css'\n\n// No src/App.tsx in this response -- likely a utility/non-visual file\n// (constants, types, helpers), not a renderable component. Nothing to\n// mount here; see the Code tab for what was actually generated.\nconst root = document.getElementById('root')\nif (root) {\n  root.innerHTML = '<div style="font-family: monospace; padding: 2rem; color: #888;">No root App component in this response. Check the Code tab.</div>'\n}`,
@@ -596,6 +598,8 @@ WHEN MOTION GENUINELY SERVES THE DESIGN, you now have framer-motion available --
 - Aurora/mesh gradient background: pure CSS, no dependency needed -- several large, soft, slowly-drifting blurred gradient shapes behind content, distinct from the "one glowing blue accent" AI tell above by using the build's own actual palette and genuine slow motion, not a static glow
 
 CRITICAL: only build a login/signup/authentication screen when the request genuinely implies user accounts are needed (explicit mentions of accounts, multiple users, "sign up," "login," roles, or personal/private data that must belong to someone specific). Do not add an auth screen by default just because the app has a backend -- most requests (a task tracker, a dashboard, an internal tool) don't need one, and adding it unasked is real, unrequested complexity that becomes a new thing that can break, not a nice-to-have.
+
+CRITICAL, confirmed real failure, distinct from icon-name hallucination: never import a React hook (useState, useEffect, useRef, useMemo, useCallback, etc.) from any package other than 'react' itself. A confirmed real failure: useEffect imported from 'lucide-react' -- a syntactically valid import statement that only fails at runtime, when the browser tries to resolve an export that package never actually had. Double-check that every hook's import line specifically says 'react', not whatever icon or utility package happens to be imported nearby in the same file.
 
 CRITICAL, confirmed real failure: when you build a frontend that depends on a backend, your initial connectivity check must retry automatically, not just once. The backend is a separate process that can genuinely still be starting (installing its own dependencies) when your frontend's first render happens -- a single failed fetch followed by a static "backend offline" message, with no automatic re-check, means the user has to manually reload or click retry themselves even after the backend comes up on its own, which reads as broken when it's actually just a timing gap. On the first failed connection attempt specifically, poll again automatically every 2 seconds for up to 20 seconds before giving up and showing a real offline state -- this is separate from, and in addition to, any manual "Retry" button you already show.
 

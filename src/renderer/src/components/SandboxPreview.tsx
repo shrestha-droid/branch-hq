@@ -274,6 +274,22 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
     hasTriggeredHealForThisRunRef.current = false
     errorHistoryRef.current = []
 
+    // NEW: confirmed real gap -- catches errors reported by the
+    // injected script in the scaffolded index.html (see
+    // injectFrontendBoilerplate), the only way to know about a runtime
+    // error happening inside the iframe after the page loads. Covers
+    // both native and WebContainer modes, since both load an iframe
+    // pointing at real content. A fresh closure over attemptSelfHeal
+    // each time this effect runs (a new generation) avoids a stale
+    // reference to state that changes between runs, like healAttempt.
+    const handleRuntimeErrorMessage = (event: MessageEvent) => {
+      if (event.data?.type !== 'branch-hq-runtime-error') return
+      if (!mounted || currentRunId !== runIdRef.current) return
+      addLog(`Error [frontend runtime]: ${event.data.message}`)
+      attemptSelfHeal(`A runtime error occurred in the browser after the page loaded:\n${event.data.message}`)
+    }
+    window.addEventListener('message', handleRuntimeErrorMessage)
+
     async function bootWebApp() {
       try {
         await teardownPrevious()
@@ -579,6 +595,7 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
 
     return () => {
       mounted = false
+      window.removeEventListener('message', handleRuntimeErrorMessage)
       teardownPrevious()
       teardownNative()
     }
