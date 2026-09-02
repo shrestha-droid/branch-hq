@@ -870,7 +870,7 @@ typedIpc.handle('workspace:index', async (_event: any, targetPath?: string) => {
 // (conversationId, prompt), which would have silently misread whatever
 // the renderer sent as agentName as if it were the prompt. Now it reads
 // agentName correctly and branches on it.
-typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName, prompt }: { conversationId: string; agentName: 'jim' | 'dwight' | 'pam' | 'chat'; prompt: string }) => {
+typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName, prompt }: { conversationId: string; agentName: 'jim' | 'dwight' | 'pam' | 'riley' | 'chat'; prompt: string }) => {
   const newMessages: any[] = []
   try {
     const userMsg = await addMessage(conversationId, 'user', prompt)
@@ -897,8 +897,11 @@ typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName,
     // skipped for anyone, under any path -- that's a security check, not
     // routing ceremony, and stays non-negotiable regardless of how a
     // generation was reached.
-    if (agentName === 'jim' || agentName === 'dwight') {
-      const targetPrompt = agentName === 'dwight' ? PROMPTS.DWIGHT_BACKEND : PROMPTS.JIM_FRONTEND
+    if (agentName === 'jim' || agentName === 'dwight' || agentName === 'riley') {
+      const targetPrompt =
+        agentName === 'dwight' ? PROMPTS.DWIGHT_BACKEND :
+        agentName === 'riley' ? PROMPTS.RILEY_DOCS :
+        PROMPTS.JIM_FRONTEND
       const learnedGuidance = await getLearnedGuidance(agentName)
       const specialistOutput = await fetchFrontierAI(targetPrompt, prompt + learnedGuidance)
       const { staticAudit, stageableFiles } = auditAndStage(specialistOutput, agentName)
@@ -1819,7 +1822,16 @@ typedIpc.handle('git:pushToGithub', async (_event: any, { files, repoName, isPri
     await writeFilesToScratch(scratchDir, files)
 
     const runGit = (args: string[]): Promise<void> => new Promise((resolve, reject) => {
-      const proc = spawn('git', args, { cwd: scratchDir, shell: true, env: cleanInstallEnv() })
+      // FIXED: confirmed real bug -- shell:true concatenates args into
+      // one unquoted command string, so any argument containing a space
+      // (like "Branch HQ" in the commit author name and message) gets
+      // split into separate words by the shell, and the stray "HQ"
+      // token gets interpreted as a git subcommand ("git: 'HQ' is not
+      // a git command"). git is a real native binary on every platform,
+      // unlike npm which sometimes needs shell resolution on Windows --
+      // removing shell:true here lets spawn() pass each argument
+      // correctly and directly, spaces included, with no shell parsing.
+      const proc = spawn('git', args, { cwd: scratchDir, env: cleanInstallEnv() })
       let stderr = ''
       proc.stderr.on('data', (d: Buffer) => { stderr += d.toString() })
       proc.on('exit', (code: number | null) => code === 0 ? resolve() : reject(new Error(stderr || `git ${args[0]} exited with code ${code}`)))

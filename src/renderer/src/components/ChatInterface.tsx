@@ -143,7 +143,7 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
   // NEW: which agent (if any) is the current direct-chat target,
   // selected by clicking their character. null means normal mode --
   // Michael routes as he always has.
-  const [directTarget, setDirectTarget] = useState<'jim' | 'dwight' | 'pam' | null>(null)
+  const [directTarget, setDirectTarget] = useState<'jim' | 'dwight' | 'pam' | 'riley' | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   // NEW: the conversation list is already long enough from testing alone
   // that scanning it by eye is a real annoyance -- this filters by title.
@@ -264,6 +264,21 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
   // NEW: reads the picked file's real bytes in the renderer (a plain
   // browser API, no Node needed for this part) and sends them to the
   // main process for actual text extraction.
+  // NEW: shared between the large empty-state office and the compact
+  // strip shown once a conversation is active, so both behave
+  // identically. Michael isn't a direct-chat target himself -- there's
+  // no real "bypass Michael's routing to talk to Michael" concept,
+  // since he IS the router. Clicking him is how you explicitly return
+  // to normal mode. Every other character toggles the same way as
+  // before: click again to deselect.
+  const handleCharacterClick = (agentId: string) => {
+    if (agentId === 'michael') {
+      setDirectTarget(null)
+      return
+    }
+    setDirectTarget(prev => (prev === agentId ? null : agentId as 'jim' | 'dwight' | 'pam' | 'riley'))
+  }
+
   const handleFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
@@ -453,46 +468,27 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
         {/* NEW: the office scene -- persistent, not just shown at empty
             state, since the whole point is seeing real activity while
             it's actually happening. */}
-        <div className="pt-14 pb-1 shrink-0 border-b border-white/[0.04] bg-black/10">
-          <OfficeScene
-            statuses={agentStatuses}
-            activeDirectTarget={directTarget}
-            onCharacterClick={(agentId) => {
-              // Clicking the already-selected character deselects it --
-              // returns to Michael's normal routing.
-              setDirectTarget(prev => (prev === agentId ? null : agentId as 'jim' | 'dwight' | 'pam'))
-            }}
-          />
-        </div>
+        {messages.length > 0 && (
+          <div className="pt-14 pb-1 shrink-0 border-b border-white/[0.04] bg-black/10">
+            <OfficeScene
+              statuses={agentStatuses}
+              activeDirectTarget={directTarget}
+              onCharacterClick={handleCharacterClick}
+            />
+          </div>
+        )}
 
         <div ref={messagesContainerRef} className="flex-1 overflow-y-auto pb-40 pt-4 px-6 z-10 scrollbar-thin scrollbar-thumb-neutral-800 scrollbar-track-transparent">
           {messages.length === 0 ? (
             <div className="h-full flex flex-col items-center justify-center text-neutral-500">
-              <style>{`
-                @keyframes branchBreathe {
-                  0%, 100% { transform: scale(1); }
-                  50% { transform: scale(1.08); }
-                }
-                @keyframes branchGlowPulse {
-                  0%, 100% { opacity: 0.35; }
-                  50% { opacity: 0.6; }
-                }
-              `}</style>
-              <div className="relative w-24 h-24 mb-4 flex items-center justify-center">
-                <div
-                  className={`absolute inset-0 ${ACCENT.bg} rounded-full blur-xl`}
-                  style={{ animation: 'branchGlowPulse 4s ease-in-out infinite' }}
-                />
-                <div
-                  className="relative"
-                  style={{ animation: 'branchBreathe 3s ease-in-out infinite' }}
-                >
-                  <Bot size={32} className={ACCENT.text} />
-                </div>
-              </div>
-              <p className="text-lg font-medium text-neutral-200">Branch HQ</p>
-              <p className="text-sm mt-2 text-neutral-500 max-w-sm text-center">
-                Ask anything -- chat, code, research, or a document. Just start typing.
+              <OfficeScene
+                statuses={agentStatuses}
+                activeDirectTarget={directTarget}
+                onCharacterClick={handleCharacterClick}
+                scale={2}
+              />
+              <p className="text-sm mt-6 text-neutral-500 max-w-sm text-center">
+                Click a character to talk directly to them, or just type below and Michael will route it.
               </p>
             </div>
           ) : (

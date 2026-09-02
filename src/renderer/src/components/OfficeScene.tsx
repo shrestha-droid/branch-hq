@@ -12,6 +12,7 @@ import * as PIXI from 'pixi.js'
 // 12 columns x 16 rows. One character per pixel:
 // . = transparent   H = hair   F = face/skin   E = eye
 // S = shirt         A = arm (bare skin)         P = pants   B = shoes
+// T = necktie -- formal attire, running from collar down the chest
 const SPRITE_TEMPLATE = [
   '..HHHHHHHH..',
   '.HHHHHHHHHH.',
@@ -21,9 +22,9 @@ const SPRITE_TEMPLATE = [
   'HFFFFFFFFFFH',
   '.FFFFFFFFFF.',
   '..FFFFFFFF..',
-  '.ASSSSSSSSA.',
-  'AASSSSSSSSAA',
-  'AASSSSSSSSAA',
+  '.ASSSTTSSSA.',
+  'AASSSTTSSSAA',
+  'AASSSTTSSSAA',
   '.ASSSSSSSSA.',
   '..SS....SS..',
   '..PP....PP..',
@@ -38,8 +39,12 @@ interface CharacterDef {
   shirt: number
 }
 
+const TIE = 0x2a2530
+
 // Same base shape, five different color recipes -- the actual point of
 // this technique, not a shortcut around drawing five real characters.
+// A single, uniform dark tie color for everyone -- simple and
+// consistently formal rather than another per-character variable.
 const CHARACTERS: CharacterDef[] = [
   { id: 'michael', name: 'Michael', hair: 0x4a3323, shirt: 0xa8443c },
   { id: 'jim', name: 'Jim', hair: 0x8a6a45, shirt: 0x4a7ba8 },
@@ -63,6 +68,10 @@ interface OfficeSceneProps {
   // used to visually highlight the selected character.
   activeDirectTarget?: string | null
   onCharacterClick?: (agentId: string) => void
+  // NEW: lets the same component render as either the large primary
+  // empty-state view or the compact strip shown once a conversation is
+  // active, without duplicating the sprite-drawing logic.
+  scale?: number
 }
 
 function drawCharacter(g: PIXI.Graphics, def: CharacterDef, pixelSize: number) {
@@ -78,6 +87,7 @@ function drawCharacter(g: PIXI.Graphics, def: CharacterDef, pixelSize: number) {
         token === 'E' ? EYE :
         token === 'S' ? def.shirt :
         token === 'A' ? SKIN :
+        token === 'T' ? TIE :
         token === 'P' ? PANTS :
         SHOE
       g.rect(col * pixelSize, row * pixelSize, pixelSize, pixelSize)
@@ -86,10 +96,10 @@ function drawCharacter(g: PIXI.Graphics, def: CharacterDef, pixelSize: number) {
   }
 }
 
-export default function OfficeScene({ statuses, activeDirectTarget, onCharacterClick }: OfficeSceneProps) {
+export default function OfficeScene({ statuses, activeDirectTarget, onCharacterClick, scale = 1 }: OfficeSceneProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const appRef = useRef<PIXI.Application | null>(null)
-  const spritesRef = useRef<Record<string, { root: PIXI.Container; body: PIXI.Graphics; badge: PIXI.Graphics; selectRing: PIXI.Graphics; baseY: number }>>({})
+  const spritesRef = useRef<Record<string, { root: PIXI.Container; body: PIXI.Graphics; badge: PIXI.Graphics; selectRing: PIXI.Graphics; monitor: PIXI.Graphics; monitorX: number; monitorY: number; monitorWidth: number; baseY: number }>>({})
   const statusesRef = useRef(statuses)
   statusesRef.current = statuses
   const activeDirectTargetRef = useRef(activeDirectTarget)
@@ -100,14 +110,14 @@ export default function OfficeScene({ statuses, activeDirectTarget, onCharacterC
   useEffect(() => {
     let destroyed = false
     const app = new PIXI.Application()
-    const pixelSize = 3
+    const pixelSize = 3 * scale
     const spriteWidth = 12 * pixelSize
     const spriteHeight = 16 * pixelSize
-    const deskGap = 84
+    const deskGap = 84 * scale
 
     const initPromise = app.init({
-      width: deskGap * CHARACTERS.length + 40,
-      height: 130,
+      width: deskGap * CHARACTERS.length + 40 * scale,
+      height: 130 * scale,
       backgroundAlpha: 0,
       antialias: false,
     })
@@ -117,10 +127,56 @@ export default function OfficeScene({ statuses, activeDirectTarget, onCharacterC
       containerRef.current.appendChild(app.canvas)
       appRef.current = app
 
+      const canvasWidth = deskGap * CHARACTERS.length + 40 * scale
+      const canvasHeight = 130 * scale
+      const floorTop = canvasHeight * 0.55
+
+      // NEW: a real, static office environment -- explicitly not a
+      // walkable floor plan (no movement or pathfinding), just an
+      // actual backdrop instead of characters floating on nothing.
+      // Drawn first so it sits behind everything else.
+      const backdrop = new PIXI.Graphics()
+      backdrop.rect(0, 0, canvasWidth, floorTop)
+      backdrop.fill(0x2e2a26)
+      backdrop.rect(0, floorTop, canvasWidth, canvasHeight - floorTop)
+      backdrop.fill(0x25221f)
+      backdrop.rect(0, floorTop - 2 * scale, canvasWidth, 2 * scale)
+      backdrop.fill(0x1a1714)
+      app.stage.addChild(backdrop)
+
+      // A window -- a simple lit rectangle with a plain cross frame.
+      const windowW = 26 * scale
+      const windowH = 18 * scale
+      const windowX = canvasWidth - windowW - 16 * scale
+      const windowY = 8 * scale
+      const window_ = new PIXI.Graphics()
+      window_.rect(windowX, windowY, windowW, windowH)
+      window_.fill(0x4a5568)
+      window_.rect(windowX + windowW / 2 - 1, windowY, 2, windowH)
+      window_.fill(0x1a1714)
+      window_.rect(windowX, windowY + windowH / 2 - 1, windowW, 2)
+      window_.fill(0x1a1714)
+      app.stage.addChild(window_)
+
+      // A potted plant on the opposite side, for a little life without
+      // needing any actual simulation.
+      const plantX = 14 * scale
+      const plantY = floorTop - 2 * scale
+      const plant = new PIXI.Graphics()
+      plant.rect(plantX - 5 * scale, plantY - 5 * scale, 10 * scale, 5 * scale)
+      plant.fill(0x5a4632)
+      plant.circle(plantX, plantY - 10 * scale, 6 * scale)
+      plant.fill(0x3d6b45)
+      plant.circle(plantX - 4 * scale, plantY - 7 * scale, 4 * scale)
+      plant.fill(0x3d6b45)
+      plant.circle(plantX + 4 * scale, plantY - 7 * scale, 4 * scale)
+      plant.fill(0x3d6b45)
+      app.stage.addChild(plant)
+
       CHARACTERS.forEach((def, i) => {
         const root = new PIXI.Container()
-        const x = 20 + i * deskGap
-        const baseY = 60
+        const x = 20 * scale + i * deskGap
+        const baseY = 60 * scale
         root.x = x
         root.y = baseY
 
@@ -130,6 +186,16 @@ export default function OfficeScene({ statuses, activeDirectTarget, onCharacterC
         desk.rect(-4, spriteHeight - 4, spriteWidth + 8, 8)
         desk.fill(0x2a2622)
         root.addChild(desk)
+
+        // NEW: the actual mechanism behind "desktops light up when
+        // working" -- a real monitor on the desk, dark when idle, lit
+        // when genuinely working. Redrawn each tick alongside the
+        // status badge, driven by the same real status data.
+        const monitor = new PIXI.Graphics()
+        const monitorWidth = 10 * scale
+        const monitorX = spriteWidth / 2 - monitorWidth / 2
+        const monitorY = spriteHeight - 3
+        root.addChild(monitor)
 
         // NEW: shown only while this character is the active direct-
         // chat target -- a real selection indicator, not decoration.
@@ -145,7 +211,7 @@ export default function OfficeScene({ statuses, activeDirectTarget, onCharacterC
 
         const label = new PIXI.Text({
           text: def.name,
-          style: { fontSize: 10, fill: 0x999999, fontFamily: 'monospace' }
+          style: { fontSize: 10 * scale, fill: 0x999999, fontFamily: 'monospace' }
         })
         label.x = spriteWidth / 2 - label.width / 2
         label.y = spriteHeight + 8
@@ -159,24 +225,19 @@ export default function OfficeScene({ statuses, activeDirectTarget, onCharacterC
         badge.x = spriteWidth / 2
         root.addChild(badge)
 
-        // NEW: real click interactivity -- this is the actual point of
-        // the whole scene existing, not just a visual. Only Jim, Dwight,
-        // and Pam support direct chat (matching what the backend
-        // actually implements); Michael and Riley are shown but not
-        // clickable -- Michael because he's already the default routed
-        // target, Riley because document generation doesn't fit the
-        // same "quick direct conversation" shape the other two do.
-        const clickable = ['jim', 'dwight', 'pam'].includes(def.id)
-        if (clickable) {
-          root.eventMode = 'static'
-          root.cursor = 'pointer'
-          root.on('pointerdown', () => onCharacterClickRef.current?.(def.id))
-          root.on('pointerover', () => { body.alpha = 0.8 })
-          root.on('pointerout', () => { body.alpha = 1 })
-        }
+        // Every character is clickable now -- Michael included, since
+        // clicking him is how you explicitly return to normal routed
+        // mode, and Riley now has real direct-chat backend support too
+        // (see agent:invoke). The parent decides what each specific
+        // click actually means; this component just reports it.
+        root.eventMode = 'static'
+        root.cursor = 'pointer'
+        root.on('pointerdown', () => onCharacterClickRef.current?.(def.id))
+        root.on('pointerover', () => { body.alpha = 0.8 })
+        root.on('pointerout', () => { body.alpha = 1 })
 
         app.stage.addChild(root)
-        spritesRef.current[def.id] = { root, body, badge, selectRing, baseY }
+        spritesRef.current[def.id] = { root, body, badge, selectRing, monitor, monitorX, monitorY, monitorWidth, baseY }
       })
 
       let elapsed = 0
@@ -203,6 +264,21 @@ export default function OfficeScene({ statuses, activeDirectTarget, onCharacterC
             s.badge.fill(0x10b981)
           }
 
+          // NEW: the actual "desktops light up when working" mechanism.
+          // Dark bezel always visible; the screen itself is dark when
+          // idle and a real, gently pulsing warm glow while genuinely
+          // working -- the pulse (not just a flat color swap) is what
+          // reads as "actively doing something" rather than a static
+          // indicator light.
+          s.monitor.clear()
+          s.monitor.rect(s.monitorX - 1, s.monitorY - 1, s.monitorWidth + 2, 6 * scale + 2)
+          s.monitor.fill(0x1a1814)
+          const screenColor = status === 'working'
+            ? (Math.sin(elapsed * 8) > 0 ? 0xffd27a : 0xd97706)
+            : 0x111111
+          s.monitor.rect(s.monitorX, s.monitorY, s.monitorWidth, 6 * scale)
+          s.monitor.fill(screenColor)
+
           s.selectRing.visible = activeDirectTargetRef.current === def.id
         }
       })
@@ -226,7 +302,7 @@ export default function OfficeScene({ statuses, activeDirectTarget, onCharacterC
         // init itself failed -- nothing valid to destroy either way.
       })
     }
-  }, [])
+  }, [scale])
 
   return <div ref={containerRef} className="flex justify-center" />
 }
