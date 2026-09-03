@@ -3,7 +3,7 @@ import { contextBridge, ipcRenderer } from 'electron'
 contextBridge.exposeInMainWorld('api', {
   // AI Pipeline & Agent Calls
   invokeAI: (conversationId: string, prompt: string) => ipcRenderer.invoke('ai:invoke', { conversationId, prompt }),
-  invokeAgent: (conversationId: string, agentName: 'jim' | 'dwight' | 'pam' | 'chat', prompt: string) =>
+  invokeAgent: (conversationId: string, agentName: 'jim' | 'dwight' | 'pam' | 'chat' | 'riley', prompt: string) =>
     ipcRenderer.invoke('agent:invoke', { conversationId, agentName, prompt }),
   // NEW: self-healing. Called after code has already passed review but
   // then actually failed when run -- feeds the real error back and asks
@@ -26,6 +26,44 @@ contextBridge.exposeInMainWorld('api', {
   // reliably; duplicating that dev/prod branching in the renderer would
   // be one more place for the two to drift out of sync.
   getSandboxWebviewConfig: () => ipcRenderer.invoke('sandbox-webview:get-config'),
+
+  // NEW: multi-device pairing (Phase 1 -- discovery + secure pairing
+  // only, no task handoff yet). See deviceIdentity.ts/devicePairing.ts
+  // in the main process for the full protocol.
+  getDeviceIdentity: () => ipcRenderer.invoke('devices:getIdentity'),
+  setDeviceName: (name: string) => ipcRenderer.invoke('devices:setName', name),
+  listDiscoveredDevices: () => ipcRenderer.invoke('devices:listDiscovered'),
+  listTrustedDevices: () => ipcRenderer.invoke('devices:listTrusted'),
+  removeTrustedDevice: (deviceId: string) => ipcRenderer.invoke('devices:removeTrusted', deviceId),
+  listPendingIncomingPairingRequests: () => ipcRenderer.invoke('devices:listPendingIncoming'),
+  initiatePairing: (targetDeviceId: string) => ipcRenderer.invoke('devices:initiatePairing', targetDeviceId),
+  respondToIncomingPairingRequest: (requestId: string, accept: boolean) =>
+    ipcRenderer.invoke('devices:respondToIncomingRequest', { requestId, accept }),
+  finalizeOutgoingPairing: (targetDeviceId: string, peerRequestId: string, confirmed: boolean) =>
+    ipcRenderer.invoke('devices:finalizeOutgoingPairing', { targetDeviceId, peerRequestId, confirmed }),
+  // Push events -- an incoming request, or a peer's response to a
+  // request THIS device sent, can arrive at any time, not just while
+  // the renderer is actively waiting on a specific IPC call.
+  onIncomingPairingRequest: (callback: (data: any) => void) => {
+    const listener = (_event: any, data: any) => callback(data)
+    ipcRenderer.on('pairing:incoming-request', listener)
+    return () => ipcRenderer.removeListener('pairing:incoming-request', listener)
+  },
+  onPeerConfirmedPairing: (callback: (data: any) => void) => {
+    const listener = (_event: any, data: any) => callback(data)
+    ipcRenderer.on('pairing:peer-confirmed', listener)
+    return () => ipcRenderer.removeListener('pairing:peer-confirmed', listener)
+  },
+  onPairingCompleted: (callback: (data: any) => void) => {
+    const listener = (_event: any, data: any) => callback(data)
+    ipcRenderer.on('pairing:completed', listener)
+    return () => ipcRenderer.removeListener('pairing:completed', listener)
+  },
+  onPairingCancelledByPeer: (callback: (data: any) => void) => {
+    const listener = (_event: any, data: any) => callback(data)
+    ipcRenderer.on('pairing:cancelled-by-peer', listener)
+    return () => ipcRenderer.removeListener('pairing:cancelled-by-peer', listener)
+  },
   startNativeSandbox: (runId: string, files: Record<string, string>) =>
     ipcRenderer.invoke('sandbox:startNative', { runId, files }),
   stopNativeSandbox: (runId: string) => ipcRenderer.invoke('sandbox:stopNative', { runId }),
@@ -109,7 +147,7 @@ declare global {
   interface Window {
     api: {
       invokeAI: (conversationId: string, prompt: string) => Promise<{ success: boolean; messages?: any[]; files?: Record<string, string>; agentKey?: 'jim' | 'dwight' | 'riley'; instructions?: string; auditId?: string | null; error?: string }>;
-      invokeAgent: (conversationId: string, agentName: 'jim' | 'dwight' | 'pam' | 'chat', prompt: string) => Promise<{ success: boolean; messages?: any[]; error?: string }>;
+      invokeAgent: (conversationId: string, agentName: 'jim' | 'dwight' | 'pam' | 'chat' | 'riley', prompt: string) => Promise<{ success: boolean; messages?: any[]; files?: Record<string, string>; agentKey?: 'jim' | 'dwight' | 'riley'; instructions?: string; auditId?: string | null; error?: string }>;
       healPipeline: (params: {
         conversationId: string
         agentKey: 'jim' | 'dwight' | 'riley'
@@ -119,6 +157,19 @@ declare global {
       }) => Promise<{ success: boolean; messages?: any[]; files?: Record<string, string>; agentKey?: 'jim' | 'dwight' | 'riley'; instructions?: string; auditId?: string; error?: string }>;
       detectRuntime: () => Promise<{ available: boolean; nodeVersion?: string; npmVersion?: string }>;
       getSandboxWebviewConfig: () => Promise<{ preloadPath: string; src: string; partition: string }>;
+      getDeviceIdentity: () => Promise<{ deviceId: string; deviceName: string; publicKeyPem: string }>;
+      setDeviceName: (name: string) => Promise<{ success: boolean; deviceName?: string; error?: string }>;
+      listDiscoveredDevices: () => Promise<Array<{ deviceId: string; deviceName: string; publicKeyPem: string; host: string; port: number; lastSeen: number; isTrusted: boolean }>>;
+      listTrustedDevices: () => Promise<Array<{ deviceId: string; deviceName: string; publicKeyPem: string; pairedAt: number }>>;
+      removeTrustedDevice: (deviceId: string) => Promise<{ success: boolean }>;
+      listPendingIncomingPairingRequests: () => Promise<Array<{ requestId: string; fromDeviceId: string; fromDeviceName: string; verificationCode: string; receivedAt: number }>>;
+      initiatePairing: (targetDeviceId: string) => Promise<{ success: boolean; verificationCode?: string; targetDeviceName?: string; error?: string }>;
+      respondToIncomingPairingRequest: (requestId: string, accept: boolean) => Promise<{ success: boolean; accepted?: boolean; verificationCode?: string; error?: string }>;
+      finalizeOutgoingPairing: (targetDeviceId: string, peerRequestId: string, confirmed: boolean) => Promise<{ success: boolean; error?: string }>;
+      onIncomingPairingRequest: (callback: (data: { requestId: string; fromDeviceId: string; fromDeviceName: string; verificationCode: string; receivedAt: number }) => void) => () => void;
+      onPeerConfirmedPairing: (callback: (data: { targetDeviceId: string; targetDeviceName: string; targetPublicKeyPem: string; verificationCode: string; peerRequestId: string }) => void) => () => void;
+      onPairingCompleted: (callback: (data: { deviceId: string; deviceName: string }) => void) => () => void;
+      onPairingCancelledByPeer: (callback: (data: { deviceId: string; deviceName: string }) => void) => () => void;
       startNativeSandbox: (runId: string, files: Record<string, string>) => Promise<{ success: boolean; error?: string }>;
       stopNativeSandbox: (runId: string) => Promise<{ success: boolean }>;
       onSandboxLog: (callback: (data: { runId: string; source: string; line: string }) => void) => () => void;

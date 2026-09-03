@@ -27,6 +27,7 @@
     "@supabase/supabase-js": "^2.112.4",
     "@webcontainer/api": "^1.6.4",
     "better-sqlite3": "^13.0.3",
+    "bonjour-service": "^1.4.4",
     "dotenv": "^17.4.2",
     "jszip": "^3.10.1",
     "jzip": "^1.0.0",

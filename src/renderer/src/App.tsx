@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import ChatInterface from './components/ChatInterface'
 import SandboxPreview from './components/SandboxPreview'
 import SettingsModal from './components/SettingsModal'
-import { Code2, FileCode, X, CheckCircle2, Play, HardDriveDownload, Loader2, AlertTriangle, Activity, ShieldCheck, Maximize2, Minimize2, Download, GitBranch, BookOpen } from 'lucide-react'
+import { Code2, FileCode, X, CheckCircle2, Play, HardDriveDownload, Loader2, AlertTriangle, Activity, ShieldCheck, Maximize2, Minimize2, Download, GitBranch, BookOpen, Laptop, Wifi, Check, Trash2 } from 'lucide-react'
 
 const ACCENT = {
   text: 'text-[#409cff]',
@@ -36,6 +36,16 @@ export default function App() {
     instructions?: string
     auditId?: string | null
   } | null>(null)
+  // NEW: which conversation is currently open in ChatInterface's own
+  // sidebar -- known from the moment a conversation is created or
+  // selected, well before any build happens. Distinct from
+  // healContext.conversationId, which only ever gets set AFTER a
+  // successful generation -- this is what lets Project Knowledge (and
+  // anything else that should be usable "up front," the way Claude
+  // Projects' own project knowledge works) actually be usable before
+  // the first message, not gated behind a build having already
+  // happened.
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null)
   // NEW: whether "nothing counts as done until the sandbox actually
   // confirms it runs" is on. Off by default -- see settingsStore.ts for
   // the real tradeoff this makes.
@@ -71,6 +81,29 @@ export default function App() {
   const [isLoadingClientFacts, setIsLoadingClientFacts] = useState(false)
   const [isSavingClientFacts, setIsSavingClientFacts] = useState(false)
   const [clientFactsSaveStatus, setClientFactsSaveStatus] = useState<string | null>(null)
+
+  // NEW: multi-device pairing (Phase 1 -- discovery + secure pairing
+  // only, no task handoff yet). See the main-process deviceIdentity.ts/
+  // devicePairing.ts for the actual protocol and its security reasoning.
+  const [devicesModalOpen, setDevicesModalOpen] = useState(false)
+  const [myDeviceIdentity, setMyDeviceIdentity] = useState<{ deviceId: string; deviceName: string } | null>(null)
+  const [deviceNameDraft, setDeviceNameDraft] = useState('')
+  const [discoveredDevices, setDiscoveredDevices] = useState<Array<{ deviceId: string; deviceName: string; host: string; port: number; isTrusted: boolean }>>([])
+  const [trustedDevices, setTrustedDevices] = useState<Array<{ deviceId: string; deviceName: string; pairedAt: number }>>([])
+  // Incoming requests are tracked at the top level (not just while the
+  // modal is open) -- a request can arrive at any time, and the human
+  // on the OTHER end is actively waiting on a response, so it shouldn't
+  // silently go unnoticed just because the Devices panel isn't open.
+  const [incomingPairingRequests, setIncomingPairingRequests] = useState<Array<{ requestId: string; fromDeviceId: string; fromDeviceName: string; verificationCode: string }>>([])
+  const [outgoingPairing, setOutgoingPairing] = useState<{
+    targetDeviceId: string
+    targetDeviceName: string
+    verificationCode: string
+    status: 'awaiting_peer' | 'awaiting_local_confirmation'
+    peerRequestId?: string
+  } | null>(null)
+  const [devicesStatusMessage, setDevicesStatusMessage] = useState<string | null>(null)
+  const [isPairingInFlight, setIsPairingInFlight] = useState(false)
   const [pushStatus, setPushStatus] = useState<string | null>(null)
   const [isIndexing, setIsIndexing] = useState(false)
   // NEW: files that already exist at the target path -- shown as a
@@ -99,6 +132,54 @@ export default function App() {
       }
       setStrictVerification(!!s.strictVerification)
     }).catch(() => {})
+  }, [])
+
+  // NEW: this device's own identity, fetched once -- shown in the
+  // Devices panel so the person pairing on the OTHER device can confirm
+  // they're looking at the right one.
+  useEffect(() => {
+    // @ts-ignore
+    window.api.getDeviceIdentity().then((identity: any) => {
+      setMyDeviceIdentity({ deviceId: identity.deviceId, deviceName: identity.deviceName })
+      setDeviceNameDraft(identity.deviceName)
+    }).catch(() => {})
+  }, [])
+
+  // NEW: pairing push-events, registered once at mount -- these can
+  // arrive at any time (a colleague's device sending a pairing request
+  // doesn't wait for this panel to be open), not just while
+  // devicesModalOpen is true.
+  useEffect(() => {
+    // @ts-ignore
+    const unsubIncoming = window.api.onIncomingPairingRequest((data: any) => {
+      setIncomingPairingRequests(prev => [...prev.filter(r => r.requestId !== data.requestId), data])
+    })
+    // @ts-ignore
+    const unsubPeerConfirmed = window.api.onPeerConfirmedPairing((data: any) => {
+      setOutgoingPairing({
+        targetDeviceId: data.targetDeviceId,
+        targetDeviceName: data.targetDeviceName,
+        verificationCode: data.verificationCode,
+        status: 'awaiting_local_confirmation',
+        peerRequestId: data.peerRequestId
+      })
+    })
+    // @ts-ignore
+    const unsubCompleted = window.api.onPairingCompleted((data: any) => {
+      setTrustedDevices(prev => [...prev.filter(p => p.deviceId !== data.deviceId), { deviceId: data.deviceId, deviceName: data.deviceName, pairedAt: Date.now() }])
+      setDevicesStatusMessage(`Paired with ${data.deviceName}.`)
+    })
+    // @ts-ignore
+    const unsubCancelled = window.api.onPairingCancelledByPeer((data: any) => {
+      setOutgoingPairing(null)
+      setDevicesStatusMessage(`${data.deviceName} cancelled the pairing.`)
+    })
+    return () => {
+      unsubIncoming?.()
+      unsubPeerConfirmed?.()
+      unsubCompleted?.()
+      unsubCancelled?.()
+    }
   }, [])
 
   const handleCodeGenerated = (result: { files: Record<string, string>; conversationId: string; agentKey?: 'jim' | 'dwight' | 'riley'; instructions?: string; suggestedFolderName?: string; auditId?: string | null }) => {
@@ -302,20 +383,18 @@ export default function App() {
   }
 
   const handleOpenClientFactsModal = async () => {
-    // NEW: previously returned silently with no conversation active --
-    // harmless when this button only existed post-build (a conversation
-    // necessarily existed by then), but this button is now always
-    // visible, so silently doing nothing on click would be a real UX
-    // dead end. Opens the modal regardless; the modal itself shows an
-    // honest "start a conversation first" message when there's nothing
-    // to attach facts to yet, rather than pretending to work.
+    // NEW: now genuinely almost always populated -- activeConversationId
+    // is set the instant ChatInterface has created or selected a
+    // conversation, which happens automatically on mount. The empty
+    // state below is still worth keeping for the brief real window
+    // before that initial load resolves, not just for show.
     setClientFactsModalOpen(true)
     setClientFactsSaveStatus(null)
-    if (!healContext?.conversationId) return
+    if (!activeConversationId) return
     setIsLoadingClientFacts(true)
     try {
       // @ts-ignore
-      const res = await window.api.getClientFacts(healContext.conversationId)
+      const res = await window.api.getClientFacts(activeConversationId)
       if (res.success) setClientFactsText(res.facts || '')
     } catch {
       // Best-effort load -- an empty textarea just means starting fresh.
@@ -325,12 +404,12 @@ export default function App() {
   }
 
   const handleSaveClientFacts = async () => {
-    if (!healContext?.conversationId) return
+    if (!activeConversationId) return
     setIsSavingClientFacts(true)
     setClientFactsSaveStatus(null)
     try {
       // @ts-ignore
-      const res = await window.api.setClientFacts(healContext.conversationId, clientFactsText)
+      const res = await window.api.setClientFacts(activeConversationId, clientFactsText)
       if (res.success) {
         setClientFactsSaveStatus('Saved -- future generations for this project will use these facts.')
       } else {
@@ -340,6 +419,121 @@ export default function App() {
       setClientFactsSaveStatus(`Error: ${err.message}`)
     } finally {
       setIsSavingClientFacts(false)
+    }
+  }
+
+  const refreshDiscoveredDevices = async () => {
+    try {
+      // @ts-ignore
+      const list = await window.api.listDiscoveredDevices()
+      setDiscoveredDevices(list)
+    } catch {
+      // Best-effort -- the list just doesn't update this tick.
+    }
+  }
+
+  const handleOpenDevicesModal = async () => {
+    setDevicesModalOpen(true)
+    setDevicesStatusMessage(null)
+    try {
+      // @ts-ignore
+      const trusted = await window.api.listTrustedDevices()
+      setTrustedDevices(trusted)
+    } catch {
+      // Best-effort.
+    }
+    await refreshDiscoveredDevices()
+  }
+
+  // NEW: polls the discovered-devices list while the panel is open --
+  // mDNS discovery is inherently a live, changing picture (a device can
+  // appear or disappear at any moment), and a static one-time fetch
+  // would show a stale snapshot the whole time the panel stays open.
+  useEffect(() => {
+    if (!devicesModalOpen) return
+    const interval = setInterval(refreshDiscoveredDevices, 4000)
+    return () => clearInterval(interval)
+  }, [devicesModalOpen])
+
+  const handleSaveDeviceName = async () => {
+    if (!deviceNameDraft.trim()) return
+    try {
+      // @ts-ignore
+      const res = await window.api.setDeviceName(deviceNameDraft.trim())
+      if (res.success) {
+        setMyDeviceIdentity(prev => prev ? { ...prev, deviceName: res.deviceName } : prev)
+        setDevicesStatusMessage('Device name updated.')
+      }
+    } catch (err: any) {
+      setDevicesStatusMessage(`Error: ${err.message}`)
+    }
+  }
+
+  const handlePairWithDevice = async (deviceId: string) => {
+    setIsPairingInFlight(true)
+    setDevicesStatusMessage(null)
+    try {
+      // @ts-ignore
+      const res = await window.api.initiatePairing(deviceId)
+      if (res.success) {
+        setOutgoingPairing({
+          targetDeviceId: deviceId,
+          targetDeviceName: res.targetDeviceName,
+          verificationCode: res.verificationCode,
+          status: 'awaiting_peer'
+        })
+      } else {
+        setDevicesStatusMessage(res.error || 'Could not start pairing.')
+      }
+    } catch (err: any) {
+      setDevicesStatusMessage(`Error: ${err.message}`)
+    } finally {
+      setIsPairingInFlight(false)
+    }
+  }
+
+  const handleRespondToIncoming = async (requestId: string, accept: boolean) => {
+    setIncomingPairingRequests(prev => prev.filter(r => r.requestId !== requestId))
+    try {
+      // @ts-ignore
+      const res = await window.api.respondToIncomingPairingRequest(requestId, accept)
+      if (!res.success) {
+        setDevicesStatusMessage(res.error || 'Could not respond to that pairing request.')
+      } else if (accept) {
+        setDevicesStatusMessage('Confirmation sent -- waiting for the other device to finish pairing.')
+      }
+    } catch (err: any) {
+      setDevicesStatusMessage(`Error: ${err.message}`)
+    }
+  }
+
+  const handleFinalizeOutgoing = async (confirmed: boolean) => {
+    if (!outgoingPairing) return
+    const { targetDeviceId, peerRequestId, targetDeviceName } = outgoingPairing
+    setOutgoingPairing(null)
+    try {
+      // @ts-ignore
+      const res = await window.api.finalizeOutgoingPairing(targetDeviceId, peerRequestId || '', confirmed)
+      if (res.success && confirmed) {
+        setTrustedDevices(prev => [...prev.filter(p => p.deviceId !== targetDeviceId), { deviceId: targetDeviceId, deviceName: targetDeviceName, pairedAt: Date.now() }])
+        setDevicesStatusMessage(`Paired with ${targetDeviceName}.`)
+      } else if (!confirmed) {
+        setDevicesStatusMessage('Pairing cancelled.')
+      } else if (res.error) {
+        setDevicesStatusMessage(res.error)
+      }
+    } catch (err: any) {
+      setDevicesStatusMessage(`Error: ${err.message}`)
+    }
+  }
+
+  const handleRemoveTrustedDevice = async (deviceId: string) => {
+    try {
+      // @ts-ignore
+      await window.api.removeTrustedDevice(deviceId)
+      setTrustedDevices(prev => prev.filter(p => p.deviceId !== deviceId))
+    } catch (err: any) {
+      setDevicesStatusMessage(`Error: ${err.message}`)
     }
   }
 
@@ -381,27 +575,26 @@ export default function App() {
           conventional spot, matching how Claude/ChatGPT/Slack place it,
           instead of floating alone in the corner of the whole window. */}
       <main className={`flex flex-col h-full transition-all duration-300 ${previewFiles ? (isPreviewMaximized ? 'w-0 overflow-hidden' : 'w-1/2 border-r border-white/[0.06]') : 'flex-1'}`}>
-        {/* NEW: "Project Knowledge" -- always visible, independent of
-            whether a build has happened yet. Previously this lived as a
-            button inside the preview panel, which doesn't exist until
-            AFTER a generation -- backwards for something meant to be set
-            BEFORE building, the same way Claude Projects' "Project
-            knowledge" or Gemini's custom instructions work. Sits as its
-            own thin bar above the whole ChatInterface (sidebar + chat
-            column both) rather than inside it, so it's reachable
-            immediately without needing to modify ChatInterface.tsx's own
-            internal layout. Renamed from "Client Facts" -- the person
-            reading this button might BE the client in some contexts, so
-            a name that only makes sense from the agency's own point of
-            view was worth avoiding.
-            STILL A REAL LIMITATION, not fully solved: this modal is
-            still keyed to healContext.conversationId, which App.tsx only
-            learns AFTER a build -- true "usable before your first
-            message" parity needs ChatInterface.tsx to surface which
-            conversation is currently active, not yet wired. See the
-            modal's own empty-state message below for how this is
-            handled honestly in the meantime. */}
-        <div className="flex items-center justify-end px-3 py-2 border-b border-white/[0.04] shrink-0">
+        {/* NEW: "Project Knowledge" -- always visible and genuinely
+            usable from the moment a conversation exists, independent of
+            whether a build has happened yet -- matching how Claude
+            Projects' own "Project knowledge" or Gemini's custom
+            instructions work. Sits as its own thin bar above the whole
+            ChatInterface (sidebar + chat column both) rather than
+            inside it, so it's reachable immediately without needing to
+            modify ChatInterface.tsx's own internal layout. Renamed from
+            "Client Facts" -- the person reading this button might BE
+            the client in some contexts, so a name that only makes
+            sense from the agency's own point of view was worth
+            avoiding.
+            Keyed to activeConversationId (from ChatInterface's new
+            onActiveConversationChange callback), NOT healContext --
+            activeConversationId is known the instant a conversation is
+            created or selected, well before any build; healContext only
+            updates after a successful generation. That's what actually
+            makes this usable before your first message, not just
+            visible before it. */}
+        <div className="flex items-center justify-end gap-1 px-3 py-2 border-b border-white/[0.04] shrink-0">
           <button
             onClick={handleOpenClientFactsModal}
             className="flex items-center gap-1.5 px-2.5 py-1.5 text-neutral-500 hover:text-white hover:bg-white/[0.06] text-xs font-medium rounded-md transition-colors"
@@ -410,8 +603,19 @@ export default function App() {
             <BookOpen size={13} />
             Project Knowledge
           </button>
+          <button
+            onClick={handleOpenDevicesModal}
+            className="relative flex items-center gap-1.5 px-2.5 py-1.5 text-neutral-500 hover:text-white hover:bg-white/[0.06] text-xs font-medium rounded-md transition-colors"
+            title="Pair with other Branch HQ devices on this network"
+          >
+            <Laptop size={13} />
+            Devices
+            {incomingPairingRequests.length > 0 && (
+              <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-[#0a84ff] animate-pulse" />
+            )}
+          </button>
         </div>
-        <ChatInterface onCodeGenerated={handleCodeGenerated} onClearPreview={handleClearPreview} onOpenSettings={() => setShowSettings(true)} />
+        <ChatInterface onCodeGenerated={handleCodeGenerated} onClearPreview={handleClearPreview} onOpenSettings={() => setShowSettings(true)} onActiveConversationChange={setActiveConversationId} />
       </main>
 
       {/* Right Split-Pane */}
@@ -648,15 +852,14 @@ export default function App() {
               </button>
             </div>
 
-            {!healContext?.conversationId ? (
-              // NEW: honest empty state -- this modal is still keyed to
-              // a conversation App.tsx doesn't know about until after a
-              // build (see this file's own note on that real, not-yet-
-              // solved limitation). Says so plainly instead of showing a
-              // textarea that would have nowhere real to save to.
+            {!activeConversationId ? (
+              // NEW: now a real, brief loading state -- not a permanent
+              // limitation. ChatInterface creates or selects a
+              // conversation automatically on mount, so this only shows
+              // in the short window before that initial load resolves.
               <div className="py-6 text-center">
-                <p className="text-sm text-neutral-300">Start a conversation first.</p>
-                <p className="text-xs text-neutral-500 mt-1.5 leading-relaxed">Once you've sent a message in a chat, come back here to add real facts about that project's business -- prices, hours, policies -- so builds use them instead of guessing.</p>
+                <p className="text-sm text-neutral-300">Loading your conversation...</p>
+                <p className="text-xs text-neutral-500 mt-1.5 leading-relaxed">Add real facts about this project's business -- prices, hours, policies -- so builds use them instead of guessing.</p>
               </div>
             ) : (
               <>
@@ -688,7 +891,7 @@ export default function App() {
               >
                 Close
               </button>
-              {healContext?.conversationId && (
+              {activeConversationId && (
                 <button
                   onClick={handleSaveClientFacts}
                   disabled={isSavingClientFacts || isLoadingClientFacts}
@@ -697,6 +900,169 @@ export default function App() {
                   {isSavingClientFacts ? <Loader2 size={14} className="animate-spin" /> : null}
                   {isSavingClientFacts ? 'Saving...' : 'Save'}
                 </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {devicesModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4">
+          <div className="bg-[#2c2c2e] border border-white/[0.08] rounded-2xl w-full max-w-lg p-5 backdrop-blur-2xl max-h-[85vh] overflow-y-auto">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <Laptop size={16} className="text-white" />
+                <h3 className="text-sm font-medium text-white">Devices</h3>
+              </div>
+              <button onClick={() => setDevicesModalOpen(false)} className="text-neutral-500 hover:text-white">
+                <X size={16} />
+              </button>
+            </div>
+
+            <p className="text-xs text-neutral-400 mb-4 leading-relaxed">
+              Pair with other Branch HQ installations on this network. Nothing is shared until both devices confirm a matching code -- see this device's own identity below, shown so whoever's pairing with you can verify it's really you.
+            </p>
+
+            {/* This device's own identity */}
+            <div className="bg-black/20 border border-white/[0.06] rounded-lg p-3 mb-4">
+              <label className="text-[11px] font-medium text-neutral-500 uppercase tracking-wide block mb-1.5">This Device</label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={deviceNameDraft}
+                  onChange={(e) => setDeviceNameDraft(e.target.value)}
+                  className="flex-1 bg-black/30 border border-white/[0.06] rounded-md px-2.5 py-1.5 text-xs text-neutral-200 focus:outline-none focus:border-white/20"
+                />
+                <button
+                  onClick={handleSaveDeviceName}
+                  disabled={!deviceNameDraft.trim() || deviceNameDraft === myDeviceIdentity?.deviceName}
+                  className="px-2.5 py-1.5 text-xs bg-white/10 hover:bg-white/20 disabled:opacity-30 text-neutral-200 rounded-md transition-colors"
+                >
+                  Save
+                </button>
+              </div>
+              {myDeviceIdentity && (
+                <p className="text-[10px] text-neutral-600 font-mono mt-1.5">ID: {myDeviceIdentity.deviceId}</p>
+              )}
+            </div>
+
+            {/* Incoming pairing requests -- someone else wants to pair with THIS device */}
+            {incomingPairingRequests.map(req => (
+              <div key={req.requestId} className="bg-[#0a84ff]/10 border border-[#0a84ff]/30 rounded-lg p-3 mb-3">
+                <p className="text-xs text-neutral-200 mb-1">
+                  <span className="font-medium">{req.fromDeviceName}</span> wants to pair with this device.
+                </p>
+                <p className="text-xs text-neutral-400 mb-2">
+                  Confirm this code matches what's shown on their screen:
+                </p>
+                <p className="text-lg font-mono font-bold text-white tracking-widest mb-3 text-center">{req.verificationCode}</p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => handleRespondToIncoming(req.requestId, false)}
+                    className="flex-1 px-3 py-1.5 text-xs bg-white/10 hover:bg-white/20 text-neutral-200 rounded-md transition-colors"
+                  >
+                    Decline
+                  </button>
+                  <button
+                    onClick={() => handleRespondToIncoming(req.requestId, true)}
+                    className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs ${ACCENT.bg} ${ACCENT.bgHover} text-white rounded-md transition-colors`}
+                  >
+                    <Check size={13} />
+                    Codes Match -- Accept
+                  </button>
+                </div>
+              </div>
+            ))}
+
+            {/* Outgoing pairing awaiting THIS device's final confirmation */}
+            {outgoingPairing && (
+              <div className="bg-[#0a84ff]/10 border border-[#0a84ff]/30 rounded-lg p-3 mb-3">
+                {outgoingPairing.status === 'awaiting_peer' ? (
+                  <>
+                    <p className="text-xs text-neutral-200 mb-1">
+                      Waiting for <span className="font-medium">{outgoingPairing.targetDeviceName}</span> to confirm...
+                    </p>
+                    <p className="text-xs text-neutral-400 mb-2">Your code (should match their screen):</p>
+                    <p className="text-lg font-mono font-bold text-white tracking-widest text-center flex items-center justify-center gap-2">
+                      <Loader2 size={16} className="animate-spin" />
+                      {outgoingPairing.verificationCode}
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p className="text-xs text-neutral-200 mb-1">
+                      <span className="font-medium">{outgoingPairing.targetDeviceName}</span> confirmed. Does this code match their screen?
+                    </p>
+                    <p className="text-lg font-mono font-bold text-white tracking-widest mb-3 text-center">{outgoingPairing.verificationCode}</p>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => handleFinalizeOutgoing(false)}
+                        className="flex-1 px-3 py-1.5 text-xs bg-white/10 hover:bg-white/20 text-neutral-200 rounded-md transition-colors"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={() => handleFinalizeOutgoing(true)}
+                        className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs ${ACCENT.bg} ${ACCENT.bgHover} text-white rounded-md transition-colors`}
+                      >
+                        <Check size={13} />
+                        Codes Match -- Confirm Pairing
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
+            {devicesStatusMessage && (
+              <p className="text-xs text-neutral-400 mb-3">{devicesStatusMessage}</p>
+            )}
+
+            {/* Discovered, unpaired devices on the network */}
+            <label className="text-[11px] font-medium text-neutral-500 uppercase tracking-wide flex items-center gap-1.5 mb-1.5">
+              <Wifi size={11} />
+              Nearby Devices
+            </label>
+            <div className="space-y-1.5 mb-4">
+              {discoveredDevices.filter(d => !d.isTrusted).length === 0 ? (
+                <p className="text-xs text-neutral-600 py-2">No unpaired Branch HQ devices found on this network yet.</p>
+              ) : (
+                discoveredDevices.filter(d => !d.isTrusted).map(device => (
+                  <div key={device.deviceId} className="flex items-center justify-between bg-black/20 border border-white/[0.06] rounded-lg px-3 py-2">
+                    <span className="text-xs text-neutral-300">{device.deviceName}</span>
+                    <button
+                      onClick={() => handlePairWithDevice(device.deviceId)}
+                      disabled={isPairingInFlight || !!outgoingPairing}
+                      className="px-2.5 py-1 text-[11px] bg-white/10 hover:bg-white/20 disabled:opacity-30 text-neutral-200 rounded-md transition-colors"
+                    >
+                      Pair
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* Trusted, already-paired devices */}
+            <label className="text-[11px] font-medium text-neutral-500 uppercase tracking-wide flex items-center gap-1.5 mb-1.5">
+              <Check size={11} />
+              Paired Devices
+            </label>
+            <div className="space-y-1.5">
+              {trustedDevices.length === 0 ? (
+                <p className="text-xs text-neutral-600 py-2">No paired devices yet.</p>
+              ) : (
+                trustedDevices.map(peer => (
+                  <div key={peer.deviceId} className="flex items-center justify-between bg-black/20 border border-white/[0.06] rounded-lg px-3 py-2">
+                    <span className="text-xs text-neutral-300">{peer.deviceName}</span>
+                    <button
+                      onClick={() => handleRemoveTrustedDevice(peer.deviceId)}
+                      className="p-1 text-neutral-500 hover:text-red-400 transition-colors"
+                      title="Remove pairing"
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  </div>
+                ))
               )}
             </div>
           </div>

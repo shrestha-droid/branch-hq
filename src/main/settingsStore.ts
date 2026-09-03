@@ -36,6 +36,14 @@ export interface AppSettings {
   // a boolean toggle, so it's not tied to any one specific stronger
   // model existing at any given time.
   dwightModel: string
+  // NEW: enables real, live Google Search grounding for Riley's
+  // research/document generation. Off by default and deliberately
+  // opt-in -- unlike everything else in this file, this has a real,
+  // per-search cost billed by Google (confirmed via their own current
+  // docs: billed per search query the model decides to execute, not
+  // per prompt), so it shouldn't turn on silently just because a
+  // feature exists.
+  enableWebSearch: boolean
   // NEW: off by default on purpose. When on, nothing is treated as
   // finished until the sandbox has actually run it successfully -- the
   // preview auto-boots the moment code is staged instead of waiting for
@@ -75,6 +83,7 @@ function defaults(): AppSettings {
     // app.getPath('home') resolves correctly per user on every machine.
     defaultTargetDir: process.env.DEFAULT_TARGET_DIR || path.join(app.getPath('home'), 'branch-hq-output'),
     dwightModel: process.env.DWIGHT_MODEL || '',
+    enableWebSearch: false,
     strictVerification: false
   }
 }

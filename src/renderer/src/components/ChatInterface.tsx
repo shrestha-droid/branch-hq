@@ -104,6 +104,16 @@ interface ChatInterfaceProps {
   // NEW: Settings now lives here, in the sidebar's own header, instead
   // of floating alone in the corner of the whole window.
   onOpenSettings?: () => void
+  // NEW: surfaces which conversation is currently open the moment it
+  // changes -- created, selected, or deleted-and-fallen-back-to. This is
+  // genuinely known here well before any message is ever sent (the
+  // instant a conversation exists in the sidebar), unlike App.tsx's own
+  // healContext, which previously only ever learned a conversation id
+  // AFTER a successful generation. Lets a parent feature (like Project
+  // Knowledge) be usable from the moment a conversation is open, the
+  // same way Claude Projects' own project-level context works, instead
+  // of being gated behind a build having already happened.
+  onActiveConversationChange?: (conversationId: string | null) => void
 }
 
 // Plain-word note: this is the only place the "brand red" lives, as one
@@ -135,7 +145,7 @@ const SURFACE = {
   fontStack: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif'
 }
 
-export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenSettings }: ChatInterfaceProps) {
+export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenSettings, onActiveConversationChange }: ChatInterfaceProps) {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeConvoId, setActiveConvoId] = useState<string | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
@@ -180,6 +190,16 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
   useEffect(() => {
     loadConversations()
   }, [])
+
+  // NEW: fires whenever activeConvoId actually changes, regardless of
+  // which code path changed it (initial load, manual selection, a new
+  // conversation being created, or falling back after a delete) -- a
+  // single effect here is more robust than calling the callback
+  // manually at each of those separate call sites, since it can't drift
+  // out of sync if another one is added later.
+  useEffect(() => {
+    onActiveConversationChange?.(activeConvoId)
+  }, [activeConvoId])
 
   const loadConversations = async () => {
     try {

@@ -1,6 +1,14 @@
 import { app, BrowserWindow, ipcMain, session, shell, dialog } from 'electron'
 import * as path from 'path'
 import { pathToFileURL } from 'url'
+import * as http from 'http'
+import { getDeviceIdentity, setDeviceName, signPayload, verifySignature } from './deviceIdentity'
+import {
+  getTrustedPeers, isPeerTrusted, addTrustedPeer, removeTrustedPeer,
+  createPendingIncomingRequest, getPendingIncomingRequest, consumePendingIncomingRequest, listPendingIncomingRequests,
+  createPendingOutgoingRequest, getPendingOutgoingRequest, markOutgoingAwaitingLocalConfirmation, consumePendingOutgoingRequest
+} from './devicePairing'
+import { startDiscovery, stopDiscovery, listDiscoveredDevices } from './deviceDiscovery'
 import { spawn, execFile, ChildProcess } from 'child_process'
 import * as net from 'net'
 import * as os from 'os'
@@ -69,14 +77,20 @@ dotenv.config()
 type ChatTurn = { role: 'user' | 'assistant'; content: string }
 
 interface ModelProvider {
-  generate(systemPrompt: string, history: ChatTurn[], modelOverride?: string): Promise<string>
+  // NEW: useSearchGrounding enables real, live Google Search grounding
+  // on this call (Gemini's own google_search tool -- confirmed against
+  // Google's real, current API docs, not guessed). Optional and
+  // Gemini-specific: OpenAICompatibleProvider (local models) has no
+  // equivalent and simply ignores it, per Google's own docs confirming
+  // this feature doesn't exist in OpenAI-compatible mode either way.
+  generate(systemPrompt: string, history: ChatTurn[], modelOverride?: string, useSearchGrounding?: boolean): Promise<string>
 }
 
 class GeminiProvider implements ModelProvider {
   // NEW: optional modelOverride lets a caller (the fallback logic below)
   // use a different model than whatever Settings has as primary, without
   // needing a second provider instance or touching Settings itself.
-  async generate(systemPrompt: string, history: ChatTurn[], modelOverride?: string): Promise<string> {
+  async generate(systemPrompt: string, history: ChatTurn[], modelOverride?: string, useSearchGrounding?: boolean): Promise<string> {
     // Model NAME is live-configurable via Settings; the API KEY stays in
     // .env only -- a secret has no business sitting in a plain JSON
     // settings file the same way a model name does.
@@ -95,14 +109,26 @@ class GeminiProvider implements ModelProvider {
         parts: [{ text: m.content }]
       }))
 
+      // NEW: real Google Search grounding -- the model decides for
+      // itself, per request, whether a search would actually improve
+      // the answer (per Google's docs: it analyzes the prompt and only
+      // searches when it judges that useful, not on every single call
+      // this flag is set for). Confirmed real, current request shape:
+      // tools: [{ google_search: {} }] on the same /v1beta generateContent
+      // endpoint already in use here -- no new endpoint, no new SDK.
+      const requestBody: any = {
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents,
+        generationConfig: { temperature: 0.5 }
+      }
+      if (useSearchGrounding) {
+        requestBody.tools = [{ google_search: {} }]
+      }
+
       const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: systemPrompt }] },
-          contents,
-          generationConfig: { temperature: 0.5 }
-        }),
+        body: JSON.stringify(requestBody),
         signal: controller.signal
       })
 
@@ -111,7 +137,32 @@ class GeminiProvider implements ModelProvider {
         throw new Error(`Gemini API Error (${response.status}): ${await response.text()}`)
       }
       const data = await response.json()
-      return data.candidates?.[0]?.content?.parts?.[0]?.text || ''
+      let text = data.candidates?.[0]?.content?.parts?.[0]?.text || ''
+
+      // NEW: real source citations, extracted from groundingMetadata --
+      // confirmed real field names (groundingChunks[].web.{uri,title})
+      // against Google's own current docs. Deliberately best-effort,
+      // not assumed present: a live-reported Gemini instability (April
+      // 2026) shows groundingChunks can be entirely absent from a
+      // response even when a search genuinely ran and the model's
+      // answer was genuinely grounded by it -- so a missing chunk list
+      // here means "citations weren't returned this time," not "no
+      // search happened" or "something is broken."
+      if (useSearchGrounding) {
+        const chunks = data.candidates?.[0]?.groundingMetadata?.groundingChunks || []
+        const sources: string[] = []
+        for (const chunk of chunks) {
+          const uri = chunk?.web?.uri
+          const title = chunk?.web?.title
+          if (uri) sources.push(title ? `${title} -- ${uri}` : uri)
+        }
+        if (sources.length > 0) {
+          const uniqueSources = [...new Set(sources)]
+          text += `\n\n[Sources found via live web search:]\n${uniqueSources.map(s => `- ${s}`).join('\n')}`
+        }
+      }
+
+      return text
     } catch (err: any) {
       clearTimeout(timeoutId)
       if (err.name === 'AbortError') throw new Error('API Request timed out after 40 seconds.')
@@ -257,7 +308,7 @@ async function withTransientRetry(fn: () => Promise<string>): Promise<string> {
 }
 
 const countingProvider: ModelProvider = {
-  async generate(systemPrompt: string, history: ChatTurn[], modelOverride?: string): Promise<string> {
+  async generate(systemPrompt: string, history: ChatTurn[], modelOverride?: string, useSearchGrounding?: boolean): Promise<string> {
     const charsIn = systemPrompt.length + history.reduce((sum, m) => sum + m.content.length, 0)
     const settings = await getSettings()
     const provider = await selectModelProvider()
@@ -269,7 +320,8 @@ const countingProvider: ModelProvider = {
       // transient-outage fallback below, but countingProvider.generate
       // itself never accepted or forwarded one, so nothing outside this
       // file could ever request a specific model for a specific call.
-      const result = await withTransientRetry(() => provider.generate(systemPrompt, history, modelOverride))
+      // useSearchGrounding threaded through the same way.
+      const result = await withTransientRetry(() => provider.generate(systemPrompt, history, modelOverride, useSearchGrounding))
       recordUsage(charsIn, result.length)
       return result
     } catch (err: any) {
@@ -284,10 +336,13 @@ const countingProvider: ModelProvider = {
       // here -- an outage fallback is about provider reliability, a
       // separate concern from per-agent quality routing; falling back
       // to the same configured emergency model regardless of which
-      // agent asked keeps that distinction clean.
+      // agent asked keeps that distinction clean. useSearchGrounding IS
+      // still forwarded to the fallback attempt though -- that's about
+      // what the CALLER needs from the answer, not about which model
+      // serves it, so it should survive a same-provider model swap.
       if (settings.modelProvider === 'gemini' && settings.fallbackGeminiModel && looksTransient(err)) {
         try {
-          const result = await withTransientRetry(() => provider.generate(systemPrompt, history, settings.fallbackGeminiModel))
+          const result = await withTransientRetry(() => provider.generate(systemPrompt, history, settings.fallbackGeminiModel, useSearchGrounding))
           recordUsage(charsIn, result.length)
           return result
         } catch (fallbackErr: any) {
@@ -306,10 +361,10 @@ const countingProvider: ModelProvider = {
 // Kept as the same function names/signatures every existing call site
 // already uses -- Michael, Jim, Dwight, Riley, Pam, chat, and
 // self-healing all call these exactly as before. Only the inside changed.
-// NEW: optional modelOverride, forwarded straight through -- callers
-// that don't pass one behave exactly as before (settings.geminiModel).
-async function fetchFrontierAI(systemPrompt: string, userPrompt: string, modelOverride?: string): Promise<string> {
-  return countingProvider.generate(systemPrompt, [{ role: 'user', content: userPrompt }], modelOverride)
+// NEW: optional modelOverride and useSearchGrounding, forwarded straight
+// through -- callers that don't pass them behave exactly as before.
+async function fetchFrontierAI(systemPrompt: string, userPrompt: string, modelOverride?: string, useSearchGrounding?: boolean): Promise<string> {
+  return countingProvider.generate(systemPrompt, [{ role: 'user', content: userPrompt }], modelOverride, useSearchGrounding)
 }
 
 // NEW: currently only Dwight has a configurable override (settings.dwightModel)
@@ -323,6 +378,17 @@ async function fetchFrontierAI(systemPrompt: string, userPrompt: string, modelOv
 function resolveModelOverride(agentKey: 'jim' | 'dwight' | 'riley', settings: Awaited<ReturnType<typeof getSettings>>): string | undefined {
   if (agentKey === 'dwight' && settings.dwightModel) return settings.dwightModel
   return undefined
+}
+
+// NEW: currently only Riley gets real search grounding -- see
+// settingsStore.ts's own note on enableWebSearch for why this is
+// opt-in (real per-search billing) and Riley-scoped (Jim/Dwight's code
+// generation isn't what this feature is for; Michael's own routing call
+// deliberately stays out of scope too -- see the note where this is
+// actually wired in for why mixing grounding into a JSON-parsed
+// response is too risky for a load-bearing call).
+function shouldUseSearchGrounding(agentKey: 'jim' | 'dwight' | 'riley', settings: Awaited<ReturnType<typeof getSettings>>): boolean {
+  return agentKey === 'riley' && settings.enableWebSearch
 }
 
 async function fetchChatCompletion(systemPrompt: string, history: ChatTurn[]): Promise<string> {
@@ -787,11 +853,11 @@ For Excel files (xlsx): build with a real Workbook -> Worksheet -> rows/cells st
 For CSV: proper escaping matters -- any field containing a comma, quote, or newline must be wrapped in double quotes with internal quotes doubled. Do not hand-roll this casually; a naive join(',') breaks on real-world data.
 For Markdown: use real heading levels (#, ##) to reflect actual structure, not just bold text -- and remember this is being read as a document a person will open, not chat formatting.
 
-Research methodology -- read this carefully, since it shapes whether the document is actually trustworthy: you do not have live internet access. Write from your own knowledge -- never claim to have searched the web, never cite a specific source you were not actually given, and never invent a precise-sounding statistic, date, or figure you are not genuinely confident is correct. A vague-but-honest statement ("adoption has grown significantly in recent years") is better than a fabricated-but-specific one ("adoption grew 47% in 2024") -- a specific wrong number is a worse failure than an honest general statement, because it looks more credible while being less true. When a request would genuinely benefit from current, live, or sourced information you don't have, say so plainly in the document or your response rather than filling the gap with invented facts. Structure research-style content with real, clear sections and headers reflecting its actual logical organization, not a wall of undifferentiated paragraphs.
+Research methodology -- read this carefully, since it shapes whether the document is actually trustworthy: real, live web search (Google Search grounding) may be available for this specific request -- when it is, the system genuinely searches the web on your behalf, and any real sources found are appended automatically after your response as their own [Sources found via live web search:] section. You are not told in advance whether it fired for a given call, so the same rule covers both cases: never invent a precise-sounding statistic, date, or figure you are not genuinely confident is correct or that a real search didn't actually surface, and NEVER write your own "Sources:" section yourself -- if real ones were found, they are appended for you automatically; writing your own would risk fabricating citations that look real but aren't. A vague-but-honest statement ("adoption has grown significantly in recent years") is better than a fabricated-but-specific one ("adoption grew 47% in 2024") -- a specific wrong number is a worse failure than an honest general statement, because it looks more credible while being less true. When a request would genuinely benefit from current information and no real search results end up available, say so plainly in the document or your response rather than filling the gap with invented facts. Structure research-style content with real, clear sections and headers reflecting its actual logical organization, not a wall of undifferentiated paragraphs.
 
 If the instructions include an attached file's real extracted content (marked as such in what you're given), use it with genuine specificity -- real names, numbers, and facts drawn directly from it, not a generic gloss that could apply to any similar document. The entire point of an attached file is for the output to actually reflect what's really in it.
 
-IMPORTANT: You do not have live internet access. Write from your own knowledge -- never claim to have searched the web or cite sources you were not actually given. If the user needs current or live information, say so plainly rather than inventing facts.`,
+IMPORTANT: Live web search may or may not be available for any given request -- see the research methodology rule above. Never claim with certainty that you searched the web, and never write your own "Sources:" section -- real ones, when found, are appended automatically. If the user needs current or live information and none was found, say so plainly rather than inventing facts.`,
   // NEW: the plain chatbot -- not part of the pipeline, no code, no Gate 1,
   // just a normal back-and-forth conversation.
   GENERAL_CHAT: `You are a helpful, general-purpose assistant inside Branch HQ. Unlike Michael, Jim, Dwight, Pam, and Riley, you are not part of the coding/document pipeline -- you have a normal, free-ranging conversation with the user about anything they want: questions, advice, writing help, brainstorming, or just talking. You do not generate stageable files, and nothing you write goes through Gate 1 or gets pushed to the sandbox. Be direct, clear, and genuinely helpful.`
@@ -1125,8 +1191,9 @@ typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName,
         agentName === 'riley' ? PROMPTS.RILEY_DOCS :
         PROMPTS.JIM_FRONTEND
       const learnedGuidance = await getLearnedGuidance(agentName)
-      const modelOverride = resolveModelOverride(agentName, await getSettings())
-      const specialistOutput = await fetchFrontierAI(targetPrompt, prompt + learnedGuidance, modelOverride)
+      const settingsForCall = await getSettings()
+      const modelOverride = resolveModelOverride(agentName, settingsForCall)
+      const specialistOutput = await fetchFrontierAI(targetPrompt, prompt + learnedGuidance, modelOverride, shouldUseSearchGrounding(agentName, settingsForCall))
       const { staticAudit, stageableFiles } = auditAndStage(specialistOutput, agentName)
 
       if (!staticAudit.passed) {
@@ -1206,7 +1273,7 @@ async function runSpecialistPipeline(params: {
   for (let round = 1; round <= MAX_AUTO_FIX_ROUNDS; round++) {
     const roundTag = MAX_AUTO_FIX_ROUNDS > 1 ? ` (attempt ${round} of ${MAX_AUTO_FIX_ROUNDS})` : ''
 
-    specialistOutput = await fetchFrontierAI(targetPrompt, currentInstructions, modelOverride)
+    specialistOutput = await fetchFrontierAI(targetPrompt, currentInstructions, modelOverride, shouldUseSearchGrounding(agentKey, settingsForModel))
     const auditResult = auditAndStage(specialistOutput, agentKey)
     staticAudit = auditResult.staticAudit
     stageableFiles = auditResult.stageableFiles
@@ -1631,7 +1698,8 @@ typedIpc.handle('heal:invoke', async (_event: any, {
     // fixed each time.
     const healingInstructions = `${previousInstructions}\n\nYour previous code passed review, but FAILED WHEN ACTUALLY RUN. Here is the real error:\n\n${errorLog}\n\nFix the specific problem causing this error. If this exact kind of mistake appears more than once in your code, fix EVERY occurrence, not just the one the error happened to stop at -- the error only shows where execution failed first, which may not be the only instance. If the error says a named export doesn't exist in a library (e.g. an icon name from lucide-react that isn't real), don't guess at another specific, similarly-plausible name -- replace it with a simple, extremely well-established name from that same library that you are highly confident actually exists, since a specific-sounding guess is exactly how this kind of error happens in the first place. Do not change anything else.`
 
-    const specialistOutput = await fetchFrontierAI(targetPrompt, healingInstructions, resolveModelOverride(agentKey, await getSettings()))
+    const settingsForHeal = await getSettings()
+    const specialistOutput = await fetchFrontierAI(targetPrompt, healingInstructions, resolveModelOverride(agentKey, settingsForHeal), shouldUseSearchGrounding(agentKey, settingsForHeal))
     const { staticAudit, stageableFiles } = auditAndStage(specialistOutput, agentKey)
 
     // A self-heal fix still has to clear Gate 1 like anything else -- a
@@ -1841,6 +1909,24 @@ interface NativeRun {
 }
 const activeNativeRuns = new Map<string, NativeRun>()
 
+// FIXED: confirmed real, currently-occurring crash -- EADDRINUSE on
+// NATIVE_BACKEND_PORT when a new generation's backend tries to start
+// while a PREVIOUS generation's backend is still alive and bound to
+// that same fixed port. activeNativeRuns tracks processes keyed by a
+// randomized runId that's different on every single boot, so
+// stopNativeRun(newRunId) at the start of a new run can never actually
+// find and kill a previous run's backend -- it's tracked under a
+// different key entirely. Relying on React effect cleanup timing on
+// the renderer side to always sequence teardown-before-boot perfectly
+// is fragile (any race leaves an orphaned process holding the port).
+// Since NATIVE_BACKEND_PORT is a single fixed port shared by every run
+// (the frontend's generated code always calls it directly), there can
+// only ever be ONE legitimate backend process bound to it at a time,
+// system-wide -- tracked here separately, keyed to the port itself
+// rather than any one run's id, and always killed first before a new
+// backend spawns, regardless of which run it originally belonged to.
+let currentBackendProcess: ChildProcess | null = null
+
 async function writeFilesToScratch(scratchDir: string, files: Record<string, string>): Promise<void> {
   for (const [relativePath, content] of Object.entries(files)) {
     const absolutePath = path.join(scratchDir, relativePath)
@@ -1903,6 +1989,10 @@ async function stopNativeRun(runId: string): Promise<void> {
   if (!run) return
   try { run.frontend?.kill() } catch { /* already gone */ }
   try { run.backend?.kill() } catch { /* already gone */ }
+  // Reference-checked -- only clear the shared tracker if it's genuinely
+  // THIS run's backend, so stopping an old, already-superseded run can't
+  // accidentally clear a newer run's currently-active process.
+  if (currentBackendProcess === run.backend) currentBackendProcess = null
   await fs.rm(run.scratchDir, { recursive: true, force: true }).catch(() => {})
   activeNativeRuns.delete(runId)
 }
@@ -1996,16 +2086,60 @@ typedIpc.handle('sandbox:startNative', async (event: any, { runId, files }: { ru
         install.on('exit', (code: number | null) => code === 0 ? resolve() : reject(new Error(`Backend npm install exited with code ${code}`)))
       })
 
+      // FIXED: see currentBackendProcess's own note above -- always kill
+      // whatever's currently holding the fixed backend port before
+      // spawning a new one, regardless of which run it belonged to.
+      // This is the deterministic fix for the confirmed real
+      // EADDRINUSE crash; it doesn't depend on the renderer's effect
+      // cleanup timing being perfect.
+      if (currentBackendProcess) {
+        try { currentBackendProcess.kill() } catch { /* already gone */ }
+        currentBackendProcess = null
+        // Killing a process doesn't guarantee the OS has released the
+        // port the instant kill() returns -- a brief wait here is
+        // cheap insurance against the exact same EADDRINUSE race,
+        // just one step later (the old process's socket lingering in
+        // TIME_WAIT/closing state for a moment after the process itself
+        // is gone).
+        await new Promise(resolve => setTimeout(resolve, 300))
+      }
+
       const backendDev = spawn('npm', ['run', 'dev'], {
         cwd: serverDir,
         shell: true,
         env: { ...process.env, PORT: String(NATIVE_BACKEND_PORT) }
       })
       run.backend = backendDev
+      currentBackendProcess = backendDev
       backendDev.stdout.on('data', (d: Buffer) => send('sandbox:log', { source: 'backend', line: d.toString() }))
-      backendDev.stderr.on('data', (d: Buffer) => send('sandbox:log', { source: 'backend', line: d.toString() }))
+      // NEW: previously only stdout was scanned; EADDRINUSE and most
+      // other Node crash dumps go to STDERR, not stdout -- meaning this
+      // specific, confirmed real failure was never actually detected as
+      // an error by this check before, even though the raw text was
+      // visible in the container output log.
+      let backendStderrTail = ''
+      backendDev.stderr.on('data', (d: Buffer) => {
+        const line = d.toString()
+        send('sandbox:log', { source: 'backend', line })
+        backendStderrTail = (backendStderrTail + line).slice(-4000)
+      })
       backendDev.on('exit', (code: number | null) => {
-        if (code !== null && code !== 0) send('sandbox:error', { source: 'backend', message: `Backend server exited with code ${code}` })
+        // Reference-checked, not unconditional -- a NEWER backend
+        // process's own currentBackendProcess assignment must not get
+        // silently cleared by an OLDER process's exit handler firing
+        // late (e.g. from the kill() above resolving asynchronously).
+        if (currentBackendProcess === backendDev) currentBackendProcess = null
+        if (code !== null && code !== 0) {
+          // FIXED: previously just "exited with code N" -- gave no hint
+          // this was EADDRINUSE (or anything else) without digging
+          // through the raw log separately. Surfaces the real crash
+          // reason directly in the error self-healing and the UI both
+          // see.
+          const reason = /EADDRINUSE/.test(backendStderrTail)
+            ? `port ${NATIVE_BACKEND_PORT} was already in use by another process`
+            : `exited with code ${code}`
+          send('sandbox:error', { source: 'backend', message: `Backend server ${reason}` })
+        }
       })
 
       // Genuine port probe, not a log-line guess -- see waitForPort's own
@@ -2253,6 +2387,382 @@ typedIpc.handle('file:extractText', async (_event: any, { fileName, fileBytes }:
   }
 })
 
+// ============================================================================
+// MULTI-DEVICE PAIRING (Phase 1: discovery + secure pairing only -- no
+// task handoff yet, deliberately staged separately). See
+// deviceIdentity.ts for the cryptographic foundation (Ed25519 identity,
+// signing, the human-verification code) and devicePairing.ts for the
+// full protocol writeup and trusted-peer storage. This section is the
+// actual network transport: a small local HTTP server other Branch HQ
+// instances on the LAN can reach to request pairing, the signed
+// outbound calls this instance makes to THEM, and the IPC surface this
+// app's own renderer uses to drive the whole flow.
+//
+// HONESTY NOTE, the same kind this file already carries for the native
+// execution engine: the cryptography itself (signing, verification, the
+// verification-code derivation) was tested standalone with a real
+// sign/verify/tamper round-trip before being wired in here, and that
+// confidence is real. The actual multi-device network exchange --
+// two real Electron processes on two real machines completing this
+// full handshake -- has not been. Treat this as a carefully-reasoned
+// first version, not something to trust untested.
+// ============================================================================
+
+const PREFERRED_PAIRING_PORT = 47821
+let pairingHttpServer: http.Server | null = null
+let pairingServerActualPort: number | null = null
+let mainWindowRef: BrowserWindow | null = null
+
+function sendToRenderer(channel: string, payload: any) {
+  if (mainWindowRef && !mainWindowRef.isDestroyed()) {
+    mainWindowRef.webContents.send(channel, payload)
+  }
+}
+
+function readJsonBody(req: http.IncomingMessage): Promise<any> {
+  return new Promise((resolve, reject) => {
+    let body = ''
+    req.on('data', (chunk) => {
+      body += chunk
+      // A crude but real cap -- nothing in this handshake should ever
+      // legitimately need more than a few KB; refusing to buffer past
+      // 1MB is cheap protection against a malformed or hostile sender
+      // trying to exhaust memory with an oversized body.
+      if (body.length > 1_000_000) req.destroy()
+    })
+    req.on('end', () => {
+      try { resolve(body ? JSON.parse(body) : {}) } catch (err) { reject(err) }
+    })
+    req.on('error', reject)
+  })
+}
+
+function sendJson(res: http.ServerResponse, status: number, data: any) {
+  res.writeHead(status, { 'Content-Type': 'application/json' })
+  res.end(JSON.stringify(data))
+}
+
+async function startPairingServer(): Promise<void> {
+  const identity = await getDeviceIdentity()
+
+  pairingHttpServer = http.createServer(async (req, res) => {
+    try {
+      if (req.method !== 'POST' || !req.url) {
+        return sendJson(res, 404, { error: 'Not found' })
+      }
+
+      // -------- Incoming pairing request (this device is the responder) --------
+      if (req.url === '/pairing/request') {
+        const body = await readJsonBody(req)
+        const { fromDeviceId, fromDeviceName, fromPublicKeyPem, nonce, signature } = body
+        if (!fromDeviceId || !fromPublicKeyPem || !signature) {
+          return sendJson(res, 400, { error: 'Malformed pairing request' })
+        }
+        // Proves the sender genuinely holds the private key for the
+        // public key it's claiming -- not yet proof of WHICH real
+        // device that is; the human verification code is what actually
+        // establishes that.
+        const payload = JSON.stringify({ fromDeviceId, fromPublicKeyPem, nonce })
+        if (!verifySignature(fromPublicKeyPem, payload, signature)) {
+          return sendJson(res, 401, { error: 'Invalid signature' })
+        }
+        // NEW: an already-trusted device re-sending a pairing request
+        // (e.g. its user double-clicked "Pair," or it retried after a
+        // dropped connection) shouldn't trigger a fresh human
+        // confirmation prompt for a pairing that already exists --
+        // just confirm the existing trust directly.
+        if (await isPeerTrusted(fromDeviceId)) {
+          return sendJson(res, 200, { received: true, alreadyTrusted: true })
+        }
+        const pending = createPendingIncomingRequest({
+          fromDeviceId,
+          fromDeviceName: fromDeviceName || 'Unknown Device',
+          fromPublicKeyPem,
+          myPublicKeyPem: identity.publicKeyPem
+        })
+        sendToRenderer('pairing:incoming-request', pending)
+        return sendJson(res, 200, { received: true })
+      }
+
+      // -------- Peer accepted and is confirming back (this device is the requester) --------
+      if (req.url === '/pairing/confirm') {
+        const body = await readJsonBody(req)
+        const { deviceId, deviceName, publicKeyPem, requestId, nonce, signature } = body
+        if (!deviceId || !publicKeyPem || !signature) {
+          return sendJson(res, 400, { error: 'Malformed confirmation' })
+        }
+        const payload = JSON.stringify({ deviceId, publicKeyPem, requestId, nonce })
+        if (!verifySignature(publicKeyPem, payload, signature)) {
+          return sendJson(res, 401, { error: 'Invalid signature' })
+        }
+        const outgoing = getPendingOutgoingRequest(deviceId)
+        if (!outgoing) {
+          return sendJson(res, 409, { error: 'No matching outgoing pairing request -- it may have expired.' })
+        }
+        markOutgoingAwaitingLocalConfirmation(deviceId)
+        sendToRenderer('pairing:peer-confirmed', {
+          targetDeviceId: deviceId,
+          targetDeviceName: deviceName || outgoing.targetDeviceName,
+          targetPublicKeyPem: publicKeyPem,
+          verificationCode: outgoing.verificationCode,
+          // Echoed straight through to finalize -- lets the responder
+          // look its own pending record up directly by id, rather than
+          // needing a less precise deviceId-based search.
+          peerRequestId: requestId
+        })
+        return sendJson(res, 200, { received: true })
+      }
+
+      // -------- Finalize (this device is the original responder) --------
+      if (req.url === '/pairing/finalize') {
+        const body = await readJsonBody(req)
+        const { deviceId, deviceName, publicKeyPem, requestId, confirmed, nonce, signature } = body
+        if (!deviceId || !publicKeyPem || !requestId || !signature) {
+          return sendJson(res, 400, { error: 'Malformed finalize' })
+        }
+        const payload = JSON.stringify({ deviceId, publicKeyPem, requestId, confirmed, nonce })
+        if (!verifySignature(publicKeyPem, payload, signature)) {
+          return sendJson(res, 401, { error: 'Invalid signature' })
+        }
+        const pending = getPendingIncomingRequest(requestId)
+        if (!pending || pending.fromDeviceId !== deviceId) {
+          return sendJson(res, 409, { error: 'No matching pending request -- it may have expired.' })
+        }
+        consumePendingIncomingRequest(requestId)
+        if (confirmed) {
+          await addTrustedPeer({
+            deviceId,
+            deviceName: deviceName || pending.fromDeviceName,
+            publicKeyPem,
+            pairedAt: Date.now()
+          })
+          sendToRenderer('pairing:completed', { deviceId, deviceName: deviceName || pending.fromDeviceName })
+        } else {
+          sendToRenderer('pairing:cancelled-by-peer', { deviceId, deviceName: deviceName || pending.fromDeviceName })
+        }
+        return sendJson(res, 200, { acknowledged: true })
+      }
+
+      return sendJson(res, 404, { error: 'Not found' })
+    } catch (err: any) {
+      sendJson(res, 500, { error: err.message || 'Internal error' })
+    }
+  })
+
+  await new Promise<void>((resolve) => {
+    pairingHttpServer!.listen(PREFERRED_PAIRING_PORT, () => {
+      const address = pairingHttpServer!.address()
+      pairingServerActualPort = typeof address === 'object' && address ? address.port : PREFERRED_PAIRING_PORT
+      resolve()
+    })
+    // Preferred port taken -- fall back to an OS-assigned free one.
+    // Discovery always advertises whatever port actually ended up in
+    // use (see startDiscovery's pairingPort param below), so peers
+    // never need to assume the preferred port specifically.
+    pairingHttpServer!.on('error', (err: any) => {
+      if (err.code === 'EADDRINUSE') {
+        pairingHttpServer!.listen(0, () => {
+          const address = pairingHttpServer!.address()
+          pairingServerActualPort = typeof address === 'object' && address ? address.port : 0
+          resolve()
+        })
+      }
+    })
+  })
+}
+
+// NEW: a small helper for the outbound side -- every signed request
+// this device sends to a peer follows the same shape (build a
+// canonical payload, sign it with this device's own key, POST it, and
+// never let a network failure here escape as an unhandled crash --
+// pairing with an unreachable device should fail gracefully, not take
+// the whole app down with it).
+async function postSignedToPeer(host: string, port: number, urlPath: string, bodyWithoutSignature: Record<string, any>): Promise<{ ok: boolean; status: number; data: any }> {
+  const identity = await getDeviceIdentity()
+  const payload = JSON.stringify(bodyWithoutSignature)
+  const signature = signPayload(identity.privateKeyPem, payload)
+  const fullBody = { ...bodyWithoutSignature, signature }
+
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), 10_000)
+  try {
+    const response = await fetch(`http://${host}:${port}${urlPath}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(fullBody),
+      signal: controller.signal
+    })
+    clearTimeout(timeoutId)
+    const data = await response.json().catch(() => ({}))
+    return { ok: response.ok, status: response.status, data }
+  } catch (err: any) {
+    clearTimeout(timeoutId)
+    return { ok: false, status: 0, data: { error: err.message || 'Request failed' } }
+  }
+}
+
+typedIpc.handle('devices:getIdentity', async () => {
+  const identity = await getDeviceIdentity()
+  return { deviceId: identity.deviceId, deviceName: identity.deviceName, publicKeyPem: identity.publicKeyPem }
+})
+
+typedIpc.handle('devices:setName', async (_event: any, name: string) => {
+  const identity = await setDeviceName(name)
+  // Re-advertise under the new name -- a stale advertised name would
+  // otherwise persist on the network until the next app restart.
+  stopDiscovery()
+  startDiscovery({
+    deviceId: identity.deviceId,
+    deviceName: identity.deviceName,
+    publicKeyPem: identity.publicKeyPem,
+    pairingPort: pairingServerActualPort || PREFERRED_PAIRING_PORT
+  })
+  return { success: true, deviceName: identity.deviceName }
+})
+
+typedIpc.handle('devices:listDiscovered', async () => {
+  const trusted = await getTrustedPeers()
+  const trustedIds = new Set(trusted.map(p => p.deviceId))
+  return listDiscoveredDevices().map(d => ({ ...d, isTrusted: trustedIds.has(d.deviceId) }))
+})
+
+typedIpc.handle('devices:listTrusted', async () => {
+  return await getTrustedPeers()
+})
+
+typedIpc.handle('devices:removeTrusted', async (_event: any, deviceId: string) => {
+  await removeTrustedPeer(deviceId)
+  return { success: true }
+})
+
+typedIpc.handle('devices:listPendingIncoming', async () => {
+  return listPendingIncomingRequests()
+})
+
+// NEW: step 1 of the handshake -- this device (the requester) sends a
+// signed pairing request to a discovered peer, and immediately computes
+// its own copy of the human verification code (it already has both
+// public keys at this point: its own, and the peer's from discovery).
+typedIpc.handle('devices:initiatePairing', async (_event: any, targetDeviceId: string) => {
+  const target = listDiscoveredDevices().find(d => d.deviceId === targetDeviceId)
+  if (!target) return { success: false, error: 'That device is no longer visible on the network.' }
+
+  const identity = await getDeviceIdentity()
+  const pending = createPendingOutgoingRequest({
+    targetDeviceId: target.deviceId,
+    targetDeviceName: target.deviceName,
+    targetPublicKeyPem: target.publicKeyPem,
+    myPublicKeyPem: identity.publicKeyPem
+  })
+
+  const nonce = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const result = await postSignedToPeer(target.host, target.port, '/pairing/request', {
+    fromDeviceId: identity.deviceId,
+    fromDeviceName: identity.deviceName,
+    fromPublicKeyPem: identity.publicKeyPem,
+    nonce
+  })
+
+  if (!result.ok) {
+    consumePendingOutgoingRequest(target.deviceId)
+    return { success: false, error: result.data?.error || 'Could not reach that device.' }
+  }
+
+  return { success: true, verificationCode: pending.verificationCode, targetDeviceName: target.deviceName }
+})
+
+// NEW: step 2 -- the responder's human decides. On accept, sends the
+// signed confirmation back to the requester; on reject, just discards
+// the pending request and the requester's attempt will time out
+// naturally (see PENDING_REQUEST_TTL_MS in devicePairing.ts) rather
+// than needing an explicit "you were rejected" message -- a real,
+// deliberate choice: distinguishing "declined" from "never seen" to
+// the requester isn't necessary for this to work correctly, and not
+// sending it avoids a small information-disclosure question about
+// whether declining should be silent or explicit.
+typedIpc.handle('devices:respondToIncomingRequest', async (_event: any, { requestId, accept }: { requestId: string; accept: boolean }) => {
+  const pending = getPendingIncomingRequest(requestId)
+  if (!pending) return { success: false, error: 'That pairing request is no longer available (it may have expired).' }
+
+  if (!accept) {
+    consumePendingIncomingRequest(requestId)
+    return { success: true, accepted: false }
+  }
+
+  const identity = await getDeviceIdentity()
+  // The peer that originally reached out is only known by its
+  // advertised discovery info -- look it up the same way outgoing
+  // pairing does, since incoming requests don't carry a callback
+  // address of their own (HTTP requests aren't naturally bidirectional).
+  const target = listDiscoveredDevices().find(d => d.deviceId === pending.fromDeviceId)
+  if (!target) {
+    return { success: false, error: 'That device is no longer visible on the network -- cannot send a confirmation back.' }
+  }
+
+  const nonce = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const result = await postSignedToPeer(target.host, target.port, '/pairing/confirm', {
+    deviceId: identity.deviceId,
+    deviceName: identity.deviceName,
+    publicKeyPem: identity.publicKeyPem,
+    requestId,
+    nonce
+  })
+
+  if (!result.ok) {
+    return { success: false, error: result.data?.error || 'Could not reach that device to confirm pairing.' }
+  }
+
+  // Deliberately NOT added to trusted peers yet -- this device only
+  // trusts the requester once ITS OWN human also confirms (via
+  // devices:finalizeOutgoingPairing on the requester's side triggering
+  // a /pairing/finalize call back here). Accepting here starts the
+  // final leg of the handshake; it doesn't complete it alone.
+  return { success: true, accepted: true, verificationCode: pending.verificationCode }
+})
+
+// NEW: step 3 -- the requester's human sees the peer's confirmation and
+// the matching code, and makes the FINAL call. Only on confirm does
+// this device actually add the peer as trusted locally, and only then
+// does the peer learn to do the same via /pairing/finalize.
+typedIpc.handle('devices:finalizeOutgoingPairing', async (_event: any, { targetDeviceId, peerRequestId, confirmed }: { targetDeviceId: string; peerRequestId: string; confirmed: boolean }) => {
+  const outgoing = getPendingOutgoingRequest(targetDeviceId)
+  if (!outgoing) return { success: false, error: 'That pairing attempt is no longer active (it may have expired).' }
+
+  consumePendingOutgoingRequest(targetDeviceId)
+
+  if (confirmed) {
+    await addTrustedPeer({
+      deviceId: outgoing.targetDeviceId,
+      deviceName: outgoing.targetDeviceName,
+      publicKeyPem: outgoing.targetPublicKeyPem,
+      pairedAt: Date.now()
+    })
+  }
+
+  const target = listDiscoveredDevices().find(d => d.deviceId === targetDeviceId)
+  if (!target) {
+    // Trust was still recorded locally above if confirmed -- only the
+    // final handshake message to the PEER couldn't be delivered. The
+    // peer's own copy of this pairing simply won't complete until it
+    // hears otherwise; not a reason to undo what this side already
+    // decided.
+    return { success: confirmed, error: confirmed ? 'Paired locally, but could not notify the other device (it left the network).' : undefined }
+  }
+
+  const identity = await getDeviceIdentity()
+  const nonce = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  await postSignedToPeer(target.host, target.port, '/pairing/finalize', {
+    deviceId: identity.deviceId,
+    deviceName: identity.deviceName,
+    publicKeyPem: identity.publicKeyPem,
+    requestId: peerRequestId,
+    confirmed,
+    nonce
+  })
+
+  return { success: true }
+})
+
 // 7. Window Configuration
 function createWindow() {
   const mainWindow = new BrowserWindow({
@@ -2276,6 +2786,12 @@ function createWindow() {
       webviewTag: true
     }
   })
+
+  // NEW: lets the pairing HTTP server (which has no direct access to
+  // this local variable, since it's set up separately in
+  // app.whenReady()) push events -- an incoming pairing request, a
+  // peer's confirmation -- to this window's renderer as they happen.
+  mainWindowRef = mainWindow
 
   // NEW: previously nothing was configured here at all, and modern
   // Electron blocks target="_blank"/window.open by default unless a
@@ -2356,5 +2872,27 @@ app.whenReady().then(async () => {
   // any webview could possibly try to use them.
   setupSandboxSession()
   createWindow()
+
+  // NEW: multi-device pairing startup -- after createWindow() so
+  // mainWindowRef is already set (the pairing server needs it to push
+  // events the instant they happen, e.g. an incoming request arriving
+  // before anyone's even looking at a Devices panel).
+  try {
+    await startPairingServer()
+    const identity = await getDeviceIdentity()
+    startDiscovery({
+      deviceId: identity.deviceId,
+      deviceName: identity.deviceName,
+      publicKeyPem: identity.publicKeyPem,
+      pairingPort: pairingServerActualPort || PREFERRED_PAIRING_PORT
+    })
+  } catch (err: any) {
+    // Never let a LAN-discovery/pairing startup failure (a restricted
+    // network, a firewall blocking multicast, a port genuinely
+    // unavailable even after fallback) take down the rest of the app --
+    // this is a real, but non-essential, capability.
+    console.error('[Device Pairing] Failed to start -- continuing without it:', err.message)
+  }
 })
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
+app.on('before-quit', () => { stopDiscovery() })
