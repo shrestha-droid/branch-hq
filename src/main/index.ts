@@ -33,11 +33,13 @@ import {
 import { searchRelevantCode } from './vectorStore'
 import { generateEmbedding, indexWorkspace } from './indexer'
 import { getSettings, updateSettings } from './settingsStore'
-import { recordAudit, generateAuditReport, markExecutionVerified } from './auditStore'
+import { recordAudit, generateAuditReport, generateClientSummary, markExecutionVerified } from './auditStore'
 import { recordLesson, getLearnedGuidance } from './lessonsStore'
 import { setGithubToken, hasGithubToken, clearGithubToken, getGithubTokenForInternalUse } from './credentialsStore'
 import { runMechanicalAudit, AuditResult } from './gate1'
 import { looksTransient } from './resilience'
+import { detectVerticalStarterKit } from './verticals'
+import { getClientFacts, setClientFacts } from './clientFactsStore'
 
 dotenv.config()
 
@@ -255,13 +257,19 @@ async function withTransientRetry(fn: () => Promise<string>): Promise<string> {
 }
 
 const countingProvider: ModelProvider = {
-  async generate(systemPrompt: string, history: ChatTurn[]): Promise<string> {
+  async generate(systemPrompt: string, history: ChatTurn[], modelOverride?: string): Promise<string> {
     const charsIn = systemPrompt.length + history.reduce((sum, m) => sum + m.content.length, 0)
     const settings = await getSettings()
     const provider = await selectModelProvider()
 
     try {
-      const result = await withTransientRetry(() => provider.generate(systemPrompt, history))
+      // NEW: modelOverride (e.g. settings.dwightModel) now actually
+      // reaches the provider -- previously this parameter existed on
+      // the ModelProvider interface and was used internally by the
+      // transient-outage fallback below, but countingProvider.generate
+      // itself never accepted or forwarded one, so nothing outside this
+      // file could ever request a specific model for a specific call.
+      const result = await withTransientRetry(() => provider.generate(systemPrompt, history, modelOverride))
       recordUsage(charsIn, result.length)
       return result
     } catch (err: any) {
@@ -272,7 +280,11 @@ const countingProvider: ModelProvider = {
       // up entirely. Deliberately same-provider-only: Gemini falling
       // back to a different Gemini model doesn't depend on anything
       // else being set up correctly, unlike a cross-provider fallback
-      // to local routing would.
+      // to local routing would. Deliberately does NOT use modelOverride
+      // here -- an outage fallback is about provider reliability, a
+      // separate concern from per-agent quality routing; falling back
+      // to the same configured emergency model regardless of which
+      // agent asked keeps that distinction clean.
       if (settings.modelProvider === 'gemini' && settings.fallbackGeminiModel && looksTransient(err)) {
         try {
           const result = await withTransientRetry(() => provider.generate(systemPrompt, history, settings.fallbackGeminiModel))
@@ -294,8 +306,23 @@ const countingProvider: ModelProvider = {
 // Kept as the same function names/signatures every existing call site
 // already uses -- Michael, Jim, Dwight, Riley, Pam, chat, and
 // self-healing all call these exactly as before. Only the inside changed.
-async function fetchFrontierAI(systemPrompt: string, userPrompt: string): Promise<string> {
-  return countingProvider.generate(systemPrompt, [{ role: 'user', content: userPrompt }])
+// NEW: optional modelOverride, forwarded straight through -- callers
+// that don't pass one behave exactly as before (settings.geminiModel).
+async function fetchFrontierAI(systemPrompt: string, userPrompt: string, modelOverride?: string): Promise<string> {
+  return countingProvider.generate(systemPrompt, [{ role: 'user', content: userPrompt }], modelOverride)
+}
+
+// NEW: currently only Dwight has a configurable override (settings.dwightModel)
+// -- the evidence-backed case, see settingsStore.ts's own note on this
+// field, is specific to backend generation's asymmetric failure cost.
+// Written as a small lookup rather than inlined at each call site so
+// the same resolution logic can't drift between the three places that
+// need it (runSpecialistPipeline, direct agent chat, self-healing), and
+// so extending this to another agent later is a one-line change here,
+// not three separate ones.
+function resolveModelOverride(agentKey: 'jim' | 'dwight' | 'riley', settings: Awaited<ReturnType<typeof getSettings>>): string | undefined {
+  if (agentKey === 'dwight' && settings.dwightModel) return settings.dwightModel
+  return undefined
 }
 
 async function fetchChatCompletion(systemPrompt: string, history: ChatTurn[]): Promise<string> {
@@ -493,10 +520,95 @@ function injectBackendBoilerplate(extractedFiles: Record<string, string>): Recor
         "@types/bcryptjs": "^2.4.6"
       }
     }, null, 2),
+    // NEW: real encryption-at-rest for lowdb, available whenever a
+    // generation's data is sensitive (accounts, PII, anything a real
+    // business wouldn't want sitting in a plain-text file). Injected as
+    // deterministic, pre-written boilerplate -- not something Dwight is
+    // asked to write correctly from scratch every time. AES-256-GCM has
+    // real, easy-to-get-wrong failure modes (IV reuse, mishandled auth
+    // tags) that are exactly the class of subtle mistake an LLM can
+    // introduce under prompt pressure, the same failure pattern already
+    // seen elsewhere this session -- security-critical infrastructure
+    // code belongs here, reviewed once, not regenerated per request.
+    // Uses only Node's built-in 'crypto' module -- no new dependency,
+    // stays within Dwight's existing allowlist.
+    // Deliberately NOT forced onto every generation via Gate 1: whether
+    // a given app's data actually warrants encryption is a judgment
+    // call Gate 1 isn't well-positioned to make (a public read-only
+    // catalog with zero PII genuinely doesn't need it) -- see Dwight's
+    // prompt for when he's instructed to reach for this. That means
+    // this is currently a real capability, not yet a hard guarantee the
+    // way the plaintext-password check is -- worth knowing honestly.
+    'src/encryptedAdapter.ts': `import * as fs from 'fs'
+import * as crypto from 'crypto'
+
+const ALGORITHM = 'aes-256-gcm'
+
+// Real key from a real environment variable is what a genuine
+// deployment should use. The local-file fallback below exists so a
+// fresh generation can boot and actually work in this sandbox without
+// requiring manual setup first -- it is explicitly a dev-only default,
+// not something to rely on once this leaves the sandbox.
+function getEncryptionKey(): Buffer {
+  const envKey = process.env.DB_ENCRYPTION_KEY
+  if (envKey) {
+    return crypto.createHash('sha256').update(envKey).digest()
+  }
+  const keyPath = '.db-key'
+  if (fs.existsSync(keyPath)) {
+    return Buffer.from(fs.readFileSync(keyPath, 'utf-8'), 'hex')
+  }
+  const generatedKey = crypto.randomBytes(32)
+  fs.writeFileSync(keyPath, generatedKey.toString('hex'), { mode: 0o600 })
+  console.warn('[Security] No DB_ENCRYPTION_KEY set -- generated a local dev key at .db-key. Set a real DB_ENCRYPTION_KEY environment variable before deploying this anywhere real; .db-key must never be committed or shared.')
+  return generatedKey
+}
+
+// A lowdb Adapter implementation -- drop-in replacement for lowdb/node's
+// JSONFile adapter. A fresh random IV is generated on every single
+// write (never reused), and the auth tag from AES-GCM is stored and
+// verified on read, so any tampering with the encrypted file on disk is
+// detected rather than silently accepted.
+export class EncryptedJSONFile<T> {
+  #filename: string
+  #key: Buffer
+
+  constructor(filename: string) {
+    this.#filename = filename
+    this.#key = getEncryptionKey()
+  }
+
+  async read(): Promise<T | null> {
+    if (!fs.existsSync(this.#filename)) return null
+    const raw = fs.readFileSync(this.#filename, 'utf-8')
+    if (!raw.trim()) return null
+    const { iv, authTag, data } = JSON.parse(raw)
+    const decipher = crypto.createDecipheriv(ALGORITHM, this.#key, Buffer.from(iv, 'hex'))
+    decipher.setAuthTag(Buffer.from(authTag, 'hex'))
+    const decrypted = Buffer.concat([decipher.update(Buffer.from(data, 'hex')), decipher.final()])
+    return JSON.parse(decrypted.toString('utf-8'))
+  }
+
+  async write(data: T): Promise<void> {
+    const iv = crypto.randomBytes(16)
+    const cipher = crypto.createCipheriv(ALGORITHM, this.#key, iv)
+    const plaintext = Buffer.from(JSON.stringify(data), 'utf-8')
+    const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()])
+    const authTag = cipher.getAuthTag()
+    fs.writeFileSync(this.#filename, JSON.stringify({
+      iv: iv.toString('hex'),
+      authTag: authTag.toString('hex'),
+      data: encrypted.toString('hex')
+    }))
+  }
+}
+`,
     // NEW: same real gap, same real fix as the frontend scaffold -- a
     // deploy host or git push has no way to know to skip node_modules
-    // (or the real db.json data file) without this.
-    '.gitignore': `node_modules\ndist\n.env\ndb.json\n*.log\n`
+    // (or the real db.json data file) without this. .db-key added
+    // alongside db.json for the same reason -- the dev-fallback
+    // encryption key must never end up committed either.
+    '.gitignore': `node_modules\ndist\n.env\ndb.json\n.db-key\n*.log\n`
   }
 }
 
@@ -576,6 +688,7 @@ ALWAYS wrap your code in standard Markdown code blocks (e.g., \`\`\`tsx ).
 ALWAYS declare file paths at the very start of the code blocks (e.g., // File: src/App.tsx).
 CRITICAL: src/App.tsx must always use a DEFAULT export (export default function App() ...), never a named export (export function App() ...) -- the app's entry point imports it as a default import and will fail to load otherwise.
 CRITICAL: You are ONLY allowed to use 'react', 'lucide-react', 'canvas-confetti', and 'framer-motion' as external dependencies. Do not import anything else. For real typography (not just system fonts), you may still add a single <link> or @import for a Google Font in your CSS -- this does not require an npm package and is not a dependency violation.
+CRITICAL, avoiding invented business facts: if the request includes a [VERIFIED CLIENT FACTS] context block, that is ground truth about a real business -- use it exactly. For any business-specific detail NOT covered there (a specific price, address, phone number, business hours, testimonial, or similar), whether or not that context block was provided at all, never invent a plausible-sounding specific value -- use an obviously-a-placeholder label instead (e.g. "[Add your price here]", "Contact us for details", "[Business Hours]"), so it's visibly unfinished rather than presented as if it were real. This does NOT apply to generic structural/demo content that isn't tied to a real business fact -- example rows in a table, placeholder task titles, sample data illustrating a UI's shape are fine and expected.
 
 DESIGN APPROACH -- follow this before writing any code:
 Act like a design lead giving every request its own distinct visual identity, never a template. In a short comment block at the top of your first file, plan: 2-4 named colors as hex values, two font roles (one characterful display face used with restraint, one plain body face), and one signature visual element specific to what's actually being built. Then build exactly that plan -- don't let the code drift back to defaults.
@@ -621,8 +734,10 @@ CRITICAL, confirmed real failure: NEVER build a login, sign-up, or authenticatio
   DWIGHT_BACKEND: `You are Dwight, Backend Specialist. Write complete, functional Node.js/TypeScript code using Express.
 ALWAYS wrap your code in standard Markdown code blocks (e.g., \`\`\`ts ).
 ALWAYS declare file paths at the very start of the code blocks (e.g., // File: src/server.ts).
+CRITICAL, confirmed real and repeated failure: every file goes in its OWN SEPARATE code block -- never combine two or more files into one code block, even if they're short (a types file, a validation schema, a router). The system that extracts your files only recognizes ONE "// File:" comment per code block, at the very start of it -- if you write "// File: src/db.ts" followed later in that SAME block by "// File: src/schemas.ts", only db.ts gets extracted; schemas.ts's content silently gets appended onto the end of db.ts as garbage, and schemas.ts itself is never created at all. A confirmed real failure: five files (package.json, tsconfig.json, db.ts, schemas.ts, server.ts) written across only two code blocks meant every attempt was rejected outright, with zero usable files produced, despite the code itself being correct. If you are about to write "// File:" a second time without first closing the current code block with \`\`\` and starting a brand new one, stop and start the new block first.
 CRITICAL: You are ONLY allowed to use 'express', 'cors', 'bcryptjs', 'jsonwebtoken', 'zod', 'dotenv', 'lowdb', and 'express-rate-limit' as external dependencies. Do not import anything else. In particular, never import 'bcrypt' -- use 'bcryptjs' instead, since this code runs inside a browser-based WebContainer sandbox that cannot compile native Node addons. For unique IDs, use Node's built-in crypto.randomUUID() -- no separate package needed.
 CRITICAL: your server MUST listen on process.env.PORT, with a fallback only for standalone use outside this system (e.g. const PORT = process.env.PORT || 8787; app.listen(PORT, ...)). Never hardcode a specific port number as the only option -- the actual port is assigned by the system running this, not chosen by you.
+CRITICAL, avoiding invented business facts: if the request includes a [VERIFIED CLIENT FACTS] context block, that is ground truth about a real business -- use it exactly, including in seed/default data. For any business-specific detail NOT covered there (a specific price, address, phone number, business hours, or similar), whether or not that context block was provided at all, never invent a plausible-sounding specific value in seed data or defaults -- use an obviously-a-placeholder label instead. This does NOT apply to generic structural/demo content unrelated to a real business fact -- seed rows that only illustrate the data shape (e.g. a generic example task title) are fine and expected.
 
 APPROACH -- follow this before writing any code:
 Act like a senior backend engineer reviewing a junior's first draft, not someone who just wants the endpoint to respond. Before writing code, briefly consider: what actually goes wrong with this request in the real world -- bad input, a resource that doesn't exist, a duplicate submission, no auth -- and what response shape communicates that clearly, not just "it works" for the one happy path.
@@ -637,6 +752,7 @@ AVOID THESE -- they are tells of a lazy, generic backend, not real engineering:
 
 NEW: you now have real persistence available (lowdb) and real rate limiting (express-rate-limit) -- reach for these specific, named techniques where they genuinely fit the request, not as a checklist to force into every response:
 - Real persistence via lowdb: data written in one request is actually still there on the next one, backed by a real JSON file in the sandbox -- not an array that resets. Use this by default for anything that should survive between requests. CRITICAL: point the JSONFile adapter at a file directly in the project root (e.g. new JSONFile('db.json')), never inside a subfolder like 'data/db.json' -- lowdb does not create missing parent directories, and a path pointing into a folder that doesn't exist yet fails with ENOENT the first time it tries to write. The project root always exists, so this failure mode can't happen there.
+CRITICAL, encryption at rest: a file named src/encryptedAdapter.ts already exists in this project, exporting EncryptedJSONFile -- a drop-in replacement for lowdb/node's plain JSONFile adapter that transparently encrypts everything written to disk (real AES-256-GCM, not obfuscation). Whenever the data being stored includes user accounts, passwords, or anything a real business would consider sensitive (personal contact details, financial information, health-adjacent information), import and use EncryptedJSONFile from './encryptedAdapter' instead of JSONFile from 'lowdb/node' -- same constructor signature (just the filename), same read()/write() usage, nothing else about how you use lowdb changes. Do NOT write your own encryption logic -- use this exact file. For data with genuinely nothing sensitive in it (e.g. a public read-only product catalog with no accounts), the plain JSONFile adapter is fine; use judgment rather than encrypting everything reflexively.
 - Rate limiting on anything a real attacker would abuse: login, registration, password reset, search -- apply express-rate-limit directly on that route, not globally on the whole app if only one route actually needs it.
 - Meaningful status codes: 201 for something created, 404 for a resource that doesn't exist, 409 for a duplicate/conflict, 422 for a validation failure that's well-formed but semantically wrong -- not just 200 and 500 for everything.
 - A consistent error shape across the whole API (e.g. { error: { code, message } }), not a different ad hoc string per route.
@@ -659,6 +775,7 @@ ALWAYS name your script exactly src/generate.ts -- this is the only file the sys
 CRITICAL: You are ONLY allowed to use 'pdfkit' (PDF), 'pptxgenjs' (PowerPoint), 'docx' (Word), and 'exceljs' (Excel) as external dependencies -- CSV and Markdown need no library at all, just write the file directly with Node's built-in fs. Do not import anything else.
 CRITICAL: Your script must write its output to exactly one of output.pdf, output.pptx, output.docx, output.xlsx, output.csv, or output.md in the project root, matching whichever format the request actually calls for -- that is the file that gets saved for the user. Pick the format the request genuinely needs: a written report or proposal is normally Word or PDF, a presentation is PowerPoint, tabular/numeric data is Excel or CSV, notes or documentation are Markdown.
 CRITICAL: NEVER include your own name or role ("Riley", "Research & Documents Specialist", "Published by...", etc.) anywhere in the actual document content. The document is for the user to give to their own audience -- it must never describe itself as AI-generated or reference who/what produced it.
+CRITICAL, avoiding invented business facts -- related to, but distinct from, the research-methodology honesty rule further below: if the request includes a [VERIFIED CLIENT FACTS] context block, that is ground truth about a real business -- use it exactly wherever relevant. For any business-specific detail NOT covered there (a specific price, address, phone number, business hours, testimonial, or similar), whether or not that context block was provided at all, never invent a plausible-sounding specific value -- use an obviously-a-placeholder label instead (e.g. "[Add your price here]"), so it's visibly unfinished rather than presented as if it were real.
 
 CRITICAL for page numbers in PDFs: if you add page numbers, add each one incrementally as its page is created (e.g. using pdfkit's 'pageAdded' event, tracking a running count), never in a separate loop after all pages already exist -- that requires switchToPage() and is a common source of every page number landing in the same spot instead of on its own page. A simple running "Page N" without a "of TOTAL" is safer and preferred, since knowing the total in advance requires that same error-prone two-pass approach.
 CRITICAL for shapes in PPTX files: every addShape() call's first argument must be a real shape type from pptxgen.ShapeType (e.g. pptxgen.ShapeType.rect, pptxgen.ShapeType.roundRect, pptxgen.ShapeType.line) -- never leave it missing or guess at a name. A confirmed real failure: calling addShape() with a missing or invalid shape type crashes the whole script. If you use the same shape type more than once, use the exact same correct constant every time -- do not vary it.
@@ -893,6 +1010,40 @@ typedIpc.handle('audit:export', async (_event: any, conversationId: string) => {
   }
 })
 
+// NEW: the plain-language sibling to audit:export -- same underlying
+// records, translated into something a non-technical client can
+// actually read and hand to their own stakeholders, rather than a
+// developer-facing log of Gate 1 blocker strings.
+typedIpc.handle('audit:exportClientSummary', async (_event: any, conversationId: string) => {
+  try {
+    const result = await generateClientSummary(conversationId)
+    return { success: true, ...result }
+  } catch (err: any) {
+    return { success: false, error: err.message }
+  }
+})
+
+// NEW: verified real facts about this project's actual client --
+// entered once, injected into every generation from then on. See
+// clientFactsStore.ts for the full reasoning.
+typedIpc.handle('clientFacts:get', async (_event: any, conversationId: string) => {
+  try {
+    const facts = await getClientFacts(conversationId)
+    return { success: true, facts }
+  } catch (err: any) {
+    return { success: false, error: err.message }
+  }
+})
+
+typedIpc.handle('clientFacts:set', async (_event: any, { conversationId, facts }: { conversationId: string; facts: string }) => {
+  try {
+    await setClientFacts(conversationId, facts)
+    return { success: true }
+  } catch (err: any) {
+    return { success: false, error: err.message }
+  }
+})
+
 // NEW: called from the renderer -- the only place a sandbox actually
 // runs -- the moment a generation has genuinely been executed
 // successfully (a web app reached server-ready, or a document script
@@ -974,7 +1125,8 @@ typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName,
         agentName === 'riley' ? PROMPTS.RILEY_DOCS :
         PROMPTS.JIM_FRONTEND
       const learnedGuidance = await getLearnedGuidance(agentName)
-      const specialistOutput = await fetchFrontierAI(targetPrompt, prompt + learnedGuidance)
+      const modelOverride = resolveModelOverride(agentName, await getSettings())
+      const specialistOutput = await fetchFrontierAI(targetPrompt, prompt + learnedGuidance, modelOverride)
       const { staticAudit, stageableFiles } = auditAndStage(specialistOutput, agentName)
 
       if (!staticAudit.passed) {
@@ -1043,6 +1195,8 @@ async function runSpecialistPipeline(params: {
   // NEW: self-healing memory. Real, confirmed mistakes this agent has
   // made and already had fixed before -- local to this machine only.
   const learnedGuidance = await getLearnedGuidance(agentKey)
+  const settingsForModel = await getSettings()
+  const modelOverride = resolveModelOverride(agentKey, settingsForModel)
   let currentInstructions = baseInstructions + projectContext + existingProjectSnapshot + learnedGuidance
   let specialistOutput = ''
   let staticAudit: AuditResult
@@ -1052,7 +1206,7 @@ async function runSpecialistPipeline(params: {
   for (let round = 1; round <= MAX_AUTO_FIX_ROUNDS; round++) {
     const roundTag = MAX_AUTO_FIX_ROUNDS > 1 ? ` (attempt ${round} of ${MAX_AUTO_FIX_ROUNDS})` : ''
 
-    specialistOutput = await fetchFrontierAI(targetPrompt, currentInstructions)
+    specialistOutput = await fetchFrontierAI(targetPrompt, currentInstructions, modelOverride)
     const auditResult = auditAndStage(specialistOutput, agentKey)
     staticAudit = auditResult.staticAudit
     stageableFiles = auditResult.stageableFiles
@@ -1228,15 +1382,26 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
       return { success: false, messages: [...newMessages, errMessage] }
     }
 
+    // NEW: vertical starter-kit detection -- see verticals.ts for the
+    // full reasoning. A no-op for the common case of no match; matched
+    // requests get proven, known-good scaffold guidance injected below,
+    // and the match is surfaced here for transparency, the same way RAG
+    // retrieval results always are, rather than silently steering the
+    // request without saying so.
+    const detectedVertical = detectVerticalStarterKit(prompt)
+
     const ragNote = retrievedFiles.length > 0
       ? `\n\n[RAG] Retrieved context from: ${retrievedFiles.join(', ')}`
       : `\n\n[RAG] No relevant project context retrieved.`
+    const verticalAnnounceNote = detectedVertical
+      ? `\n\n[Using a proven "${detectedVertical.name}" starting structure -- a known-good data model from repeat past requests, tailored to what was specifically asked for here.]`
+      : ''
     const michaelMsg = await addMessage(
       conversationId,
       'michael',
       rawDelegations.length > 1
-        ? `Delegating to ${rawDelegations.map(d => d.assignTo).join(' and ')} -- this needs both a real backend and a real frontend, so both are being built together.${ragNote}`
-        : `Delegating to ${rawDelegations[0].assignTo}: ${rawDelegations[0].instructions}${ragNote}`
+        ? `Delegating to ${rawDelegations.map(d => d.assignTo).join(' and ')} -- this needs both a real backend and a real frontend, so both are being built together.${ragNote}${verticalAnnounceNote}`
+        : `Delegating to ${rawDelegations[0].assignTo}: ${rawDelegations[0].instructions}${ragNote}${verticalAnnounceNote}`
     )
     newMessages.push(michaelMsg)
 
@@ -1250,6 +1415,16 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
     })
 
     const settingsForSnapshot = await getSettings()
+    // NEW: fetched once per turn, same value for every delegation this
+    // turn -- unlike existingProjectSnapshot (which varies by what the
+    // live filesystem actually contains) this is deliberately identical
+    // context handed to every specialist, since the whole point is a
+    // single, consistent source of truth about the real client that
+    // none of them should ever contradict or invent around.
+    const rawClientFacts = await getClientFacts(conversationId)
+    const clientFactsNote = rawClientFacts.trim()
+      ? `\n\n[VERIFIED CLIENT FACTS -- treat everything below as ground truth about the real business this is being built for. Use these exact details wherever relevant -- do not paraphrase away specifics like exact prices, hours, or policy wording. For any business-specific detail NOT covered here (a price, address, phone number, policy, or similar), do not invent a plausible-sounding specific value -- use an obviously-a-placeholder label instead (e.g. "[Add your price here]", "Contact us for details") so it's visibly unfinished rather than presented as if it were real. This does not apply to generic structural/demo content, like example task titles in a task manager -- only to specifics a real client would actually check against reality.]\n${rawClientFacts}`
+      : ''
     const mergedFiles: Record<string, string> = {}
     // NEW: tracks which agents' pipelines genuinely succeeded this turn,
     // as opposed to orderedDelegations, which only reflects what Michael
@@ -1299,10 +1474,18 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
         ? `\n\n[A real backend was just built for this same request, and will run at http://localhost:${NATIVE_BACKEND_PORT} -- call its actual endpoints via fetch() using that exact base URL, do not invent mock or hardcoded data. Here is exactly what Dwight wrote:]\n${dwightRawOutput}`
         : ''
 
+      // NEW: vertical starter-kit guidance -- see verticals.ts. Only for
+      // Jim/Dwight (the data-model/structure-bearing specialists); Riley
+      // produces standalone documents, which this category of guidance
+      // doesn't apply to.
+      const verticalNote = (detectedVertical && (agentKey === 'jim' || agentKey === 'dwight'))
+        ? `\n\n${detectedVertical.guidance}`
+        : ''
+
       const result = await runSpecialistPipeline({
         conversationId,
         agentKey,
-        baseInstructions: delegation.instructions + crossAgentNote,
+        baseInstructions: delegation.instructions + crossAgentNote + verticalNote + clientFactsNote,
         projectContext,
         existingProjectSnapshot,
         newMessages
@@ -1448,7 +1631,7 @@ typedIpc.handle('heal:invoke', async (_event: any, {
     // fixed each time.
     const healingInstructions = `${previousInstructions}\n\nYour previous code passed review, but FAILED WHEN ACTUALLY RUN. Here is the real error:\n\n${errorLog}\n\nFix the specific problem causing this error. If this exact kind of mistake appears more than once in your code, fix EVERY occurrence, not just the one the error happened to stop at -- the error only shows where execution failed first, which may not be the only instance. If the error says a named export doesn't exist in a library (e.g. an icon name from lucide-react that isn't real), don't guess at another specific, similarly-plausible name -- replace it with a simple, extremely well-established name from that same library that you are highly confident actually exists, since a specific-sounding guess is exactly how this kind of error happens in the first place. Do not change anything else.`
 
-    const specialistOutput = await fetchFrontierAI(targetPrompt, healingInstructions)
+    const specialistOutput = await fetchFrontierAI(targetPrompt, healingInstructions, resolveModelOverride(agentKey, await getSettings()))
     const { staticAudit, stageableFiles } = auditAndStage(specialistOutput, agentKey)
 
     // A self-heal fix still has to clear Gate 1 like anything else -- a

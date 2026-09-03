@@ -91,6 +91,120 @@ export async function getAuditRecords(conversationId: string): Promise<AuditReco
   return records.filter(r => r.conversationId === conversationId).sort((a, b) => a.timestamp - b.timestamp)
 }
 
+// NEW: the developer-facing report above is a direct, factual record --
+// exactly what a technical audit needs to be. It's also meaningless to
+// the actual client paying for this work: "SECURITY BLOCK: res.cookie()
+// call is missing httpOnly and/or secure flags entirely" tells a
+// restaurant owner or clinic manager nothing. This is a SEPARATE,
+// plain-language summary built from the exact same underlying records --
+// nothing here is invented or re-scored, it's a translation layer, not
+// a different audit. Categories are matched against gate1.ts's actual,
+// verbatim blocker message formats (see SECURITY_CATEGORIES below) --
+// not guessed at -- so a category only ever appears here if it's a real
+// check Gate 1 genuinely performs.
+interface ClientFacingCategory {
+  id: string
+  label: string
+  description: string
+  matcher: RegExp
+}
+
+const SECURITY_CATEGORIES: ClientFacingCategory[] = [
+  {
+    id: 'no-hardcoded-secrets',
+    label: 'No hardcoded secrets',
+    description: 'Passwords, API keys, and other credentials are never written directly into the application\'s code.',
+    matcher: /^SECURITY BLOCK: Hardcoded credential-like value/
+  },
+  {
+    id: 'secure-cookies',
+    label: 'Secure session cookies',
+    description: 'Session cookies (used to keep a user logged in) are protected against theft over an insecure connection and access from malicious scripts.',
+    matcher: /^SECURITY BLOCK: res\.cookie\(\) call is missing/
+  },
+  {
+    id: 'password-hashing',
+    label: 'Passwords are never stored in plain text',
+    description: 'User passwords are cryptographically scrambled (hashed) before being saved, so they can never be read back in their original form -- not even by us.',
+    matcher: /^SECURITY BLOCK: Plaintext password handling/
+  },
+  {
+    id: 'code-integrity',
+    label: 'Code integrity',
+    description: 'Every file is confirmed to be complete, valid code -- nothing broken or malformed is ever shown or shipped.',
+    matcher: /^PARSE ERROR:/
+  }
+]
+
+export async function generateClientSummary(conversationId: string): Promise<{ summary: string; generatedAt: string }> {
+  const records = await getAuditRecords(conversationId)
+  const generatedAt = new Date().toISOString()
+
+  // A category being flagged even once, on any attempt, means our
+  // automated check genuinely caught something and blocked it before it
+  // could ship -- not that the delivered product has the issue. Nothing
+  // that trips one of these categories is ever part of what's actually
+  // staged or delivered; that's the whole point of Gate 1 sitting
+  // between generation and anything the client sees.
+  const categoryEverFlagged = new Map<string, boolean>()
+  let unrecognizedBlockerCount = 0
+
+  for (const record of records) {
+    for (const file of record.perFile) {
+      for (const blocker of file.blockers) {
+        const match = SECURITY_CATEGORIES.find(c => c.matcher.test(blocker))
+        if (match) {
+          categoryEverFlagged.set(match.id, true)
+        } else {
+          // NEW: honestly counted, not silently dropped -- if Gate 1
+          // ever grows a new blocker category this mapping doesn't
+          // know about yet, the summary says so explicitly rather than
+          // quietly under-reporting what was actually caught.
+          unrecognizedBlockerCount++
+        }
+      }
+    }
+  }
+
+  // "Final state per specialist" -- records are already sorted ascending
+  // by timestamp (getAuditRecords), so the last one written for a given
+  // agentKey is whichever attempt actually ended up staged/used, whether
+  // that took one round or several self-heal/retry rounds to get there.
+  const latestRecordPerAgent = new Map<string, AuditRecord>()
+  for (const r of records) latestRecordPerAgent.set(r.agentKey, r)
+  const finalRecords = [...latestRecordPerAgent.values()]
+  const allFinalExecutionVerified = finalRecords.length > 0 && finalRecords.every(r => r.executionVerified)
+
+  const lines: string[] = []
+  lines.push('WHAT WE CHECKED -- IN PLAIN LANGUAGE')
+  lines.push('')
+  lines.push('Every piece of code built for this project passes through the same automated checks before it is ever shown to you, whether or not an issue was ever actually found:')
+  lines.push('')
+  for (const cat of SECURITY_CATEGORIES) {
+    lines.push(`- ${cat.label}`)
+    lines.push(`    ${cat.description}`)
+    if (categoryEverFlagged.get(cat.id)) {
+      lines.push(`    An issue in this category was caught automatically during development and was never included in what you received.`)
+    }
+  }
+  lines.push('')
+  if (finalRecords.length === 0) {
+    lines.push('No work has been recorded for this project yet.')
+  } else if (allFinalExecutionVerified) {
+    lines.push('Every current part of this project has been confirmed to actually run -- not just reviewed as code, but genuinely tested and working.')
+  } else {
+    lines.push('Some parts of this project have been reviewed but not yet confirmed to actually run end-to-end. Ask your developer for the full technical audit report for specifics.')
+  }
+  if (unrecognizedBlockerCount > 0) {
+    lines.push('')
+    lines.push(`Note: ${unrecognizedBlockerCount} additional issue(s) were caught during development outside the categories above. See the full technical audit report for details.`)
+  }
+  lines.push('')
+  lines.push('This is a plain-language summary for reference. For the complete, unedited technical record, request the full audit report.')
+
+  return { summary: lines.join('\n'), generatedAt }
+}
+
 // Builds a plain, factual text report -- deliberately NOT run through an
 // LLM. A compliance artifact needs to be a direct statement of what was
 // actually recorded, not a paraphrase of it.

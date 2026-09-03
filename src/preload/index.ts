@@ -19,6 +19,13 @@ contextBridge.exposeInMainWorld('api', {
   // NEW: native execution engine -- a real Node/npm runtime instead of
   // WebContainers, when one is actually available on the machine.
   detectRuntime: () => ipcRenderer.invoke('runtime:detect'),
+  // NEW: resolves the sandbox <webview>'s preload script path, its HTML
+  // src (dev server URL vs. packaged file:// path), and its session
+  // partition name -- computed here rather than in the renderer because
+  // the main process already knows __dirname and ELECTRON_RENDERER_URL
+  // reliably; duplicating that dev/prod branching in the renderer would
+  // be one more place for the two to drift out of sync.
+  getSandboxWebviewConfig: () => ipcRenderer.invoke('sandbox-webview:get-config'),
   startNativeSandbox: (runId: string, files: Record<string, string>) =>
     ipcRenderer.invoke('sandbox:startNative', { runId, files }),
   stopNativeSandbox: (runId: string) => ipcRenderer.invoke('sandbox:stopNative', { runId }),
@@ -82,6 +89,9 @@ contextBridge.exposeInMainWorld('api', {
   // NEW: exports the factual Gate1/Pam record for a conversation, with
   // an integrity hash proving the report wasn't edited after generation.
   exportAuditReport: (conversationId: string) => ipcRenderer.invoke('audit:export', conversationId),
+  exportClientSummary: (conversationId: string) => ipcRenderer.invoke('audit:exportClientSummary', conversationId),
+  getClientFacts: (conversationId: string) => ipcRenderer.invoke('clientFacts:get', conversationId),
+  setClientFacts: (conversationId: string, facts: string) => ipcRenderer.invoke('clientFacts:set', { conversationId, facts }),
   // NEW: called once the sandbox has genuinely run a generation
   // successfully -- upgrades its audit record from "Pam approved" to
   // "confirmed running." Distinct, stronger claim than Gate 2's opinion.
@@ -108,6 +118,7 @@ declare global {
         attempt: number
       }) => Promise<{ success: boolean; messages?: any[]; files?: Record<string, string>; agentKey?: 'jim' | 'dwight' | 'riley'; instructions?: string; auditId?: string; error?: string }>;
       detectRuntime: () => Promise<{ available: boolean; nodeVersion?: string; npmVersion?: string }>;
+      getSandboxWebviewConfig: () => Promise<{ preloadPath: string; src: string; partition: string }>;
       startNativeSandbox: (runId: string, files: Record<string, string>) => Promise<{ success: boolean; error?: string }>;
       stopNativeSandbox: (runId: string) => Promise<{ success: boolean }>;
       onSandboxLog: (callback: (data: { runId: string; source: string; line: string }) => void) => () => void;
@@ -127,6 +138,9 @@ declare global {
       getSettings: () => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; fallbackGeminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string; strictVerification: boolean }>;
       updateSettings: (partial: Record<string, any>) => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; fallbackGeminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string; strictVerification: boolean }>;
       exportAuditReport: (conversationId: string) => Promise<{ success: boolean; report?: string; integrityHash?: string; generatedAt?: string; error?: string }>;
+      exportClientSummary: (conversationId: string) => Promise<{ success: boolean; summary?: string; generatedAt?: string; error?: string }>;
+      getClientFacts: (conversationId: string) => Promise<{ success: boolean; facts?: string; error?: string }>;
+      setClientFacts: (conversationId: string, facts: string) => Promise<{ success: boolean; error?: string }>;
       markAuditExecuted: (auditId: string) => Promise<{ success: boolean; updated?: boolean; error?: string }>;
       createConversation: (mode: string, title?: string) => Promise<any>;
       listConversations: () => Promise<any[]>;

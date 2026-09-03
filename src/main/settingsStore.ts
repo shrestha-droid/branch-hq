@@ -22,6 +22,20 @@ export interface AppSettings {
   localModelName: string
   localEmbeddingModelName: string
   defaultTargetDir: string
+  // NEW: optional, empty by default (meaning "use geminiModel like every
+  // other agent"). The evidence for singling out Dwight specifically:
+  // across this session, Dwight's multi-file backend output failed
+  // Gate 1's extraction step twice, while Jim's single-file frontend
+  // output succeeded almost every time on the same underlying model --
+  // multi-file structured output is where a cheaper/faster model's
+  // instruction-following gets inconsistent, and a broken backend fails
+  // the whole app (a rough frontend usually still renders something).
+  // That asymmetry is a real, specific reason to spend more per-call on
+  // Dwight, not a blanket "upgrade everything" change. Left as a plain
+  // string (a real Gemini model name, e.g. "gemini-3.7-pro") rather than
+  // a boolean toggle, so it's not tied to any one specific stronger
+  // model existing at any given time.
+  dwightModel: string
   // NEW: off by default on purpose. When on, nothing is treated as
   // finished until the sandbox has actually run it successfully -- the
   // preview auto-boots the moment code is staged instead of waiting for
@@ -51,7 +65,16 @@ function defaults(): AppSettings {
     localModelBaseUrl: process.env.LOCAL_MODEL_BASE_URL || '',
     localModelName: process.env.LOCAL_MODEL_NAME || 'llama3.1',
     localEmbeddingModelName: process.env.LOCAL_EMBEDDING_MODEL_NAME || 'nomic-embed-text',
-    defaultTargetDir: process.env.DEFAULT_TARGET_DIR || '',
+    // FIXED: was empty by default, which meant the renderer fell back to
+    // a hardcoded '/Users/ShresthaPandey/branch-hq-output'. On anyone
+    // else's machine that path simply doesn't exist -- confirmed real
+    // cause of three separate reported symptoms at once: Push to Local
+    // failing, Scan Workspace finding nothing, and the "check what's
+    // actually there first" step reading an empty folder (so specialists
+    // genuinely couldn't see existing work and appeared to "forget" it).
+    // app.getPath('home') resolves correctly per user on every machine.
+    defaultTargetDir: process.env.DEFAULT_TARGET_DIR || path.join(app.getPath('home'), 'branch-hq-output'),
+    dwightModel: process.env.DWIGHT_MODEL || '',
     strictVerification: false
   }
 }

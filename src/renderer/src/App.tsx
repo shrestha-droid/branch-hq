@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import ChatInterface from './components/ChatInterface'
 import SandboxPreview from './components/SandboxPreview'
 import SettingsModal from './components/SettingsModal'
-import { Code2, FileCode, X, CheckCircle2, Play, HardDriveDownload, Loader2, AlertTriangle, Activity, ShieldCheck, Maximize2, Minimize2, Download, GitBranch } from 'lucide-react'
+import { Code2, FileCode, X, CheckCircle2, Play, HardDriveDownload, Loader2, AlertTriangle, Activity, ShieldCheck, Maximize2, Minimize2, Download, GitBranch, BookOpen } from 'lucide-react'
 
 const ACCENT = {
   text: 'text-[#409cff]',
@@ -61,6 +61,16 @@ export default function App() {
   const [githubIsPrivate, setGithubIsPrivate] = useState(true)
   const [isPushingGithub, setIsPushingGithub] = useState(false)
   const [githubPushStatus, setGithubPushStatus] = useState<string | null>(null)
+  // NEW: client facts modal state -- verified real facts about this
+  // project's actual client, so specialists stop inventing plausible-
+  // sounding business specifics (a price, hours, a policy) when they
+  // don't actually know them. See clientFactsStore.ts for the full
+  // reasoning.
+  const [clientFactsModalOpen, setClientFactsModalOpen] = useState(false)
+  const [clientFactsText, setClientFactsText] = useState('')
+  const [isLoadingClientFacts, setIsLoadingClientFacts] = useState(false)
+  const [isSavingClientFacts, setIsSavingClientFacts] = useState(false)
+  const [clientFactsSaveStatus, setClientFactsSaveStatus] = useState<string | null>(null)
   const [pushStatus, setPushStatus] = useState<string | null>(null)
   const [isIndexing, setIsIndexing] = useState(false)
   // NEW: files that already exist at the target path -- shown as a
@@ -241,6 +251,36 @@ export default function App() {
     }
   }
 
+  // NEW: the plain-language sibling to handleExportAudit -- same
+  // underlying records, translated into something a non-technical
+  // client can actually read. A separate button/download rather than a
+  // toggle on the existing one, since a developer reaching for "Export
+  // Audit" and a client-facing "here's what we checked" document are
+  // genuinely different asks, not two views of the same request.
+  const handleExportClientSummary = async () => {
+    if (!healContext?.conversationId) return
+    try {
+      // @ts-ignore
+      const res = await window.api.exportClientSummary(healContext.conversationId)
+      if (res.success && res.summary) {
+        const blob = new Blob([res.summary], { type: 'text/plain' })
+        const objectUrl = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = objectUrl
+        a.download = `project-summary-${healContext.conversationId.slice(0, 8)}.txt`
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        URL.revokeObjectURL(objectUrl)
+        setPushStatus('Client summary exported.')
+      } else {
+        setPushStatus(`Failed to export client summary: ${res.error}`)
+      }
+    } catch (err: any) {
+      setPushStatus(`Error: ${err.message}`)
+    }
+  }
+
   // NEW: a real ZIP of the currently staged files, for anyone who wants
   // to take the code elsewhere and deploy it themselves rather than
   // using Push to Local. Suggests a filename derived from the target
@@ -258,6 +298,48 @@ export default function App() {
       }
     } catch (err: any) {
       setPushStatus(`Error: ${err.message}`)
+    }
+  }
+
+  const handleOpenClientFactsModal = async () => {
+    // NEW: previously returned silently with no conversation active --
+    // harmless when this button only existed post-build (a conversation
+    // necessarily existed by then), but this button is now always
+    // visible, so silently doing nothing on click would be a real UX
+    // dead end. Opens the modal regardless; the modal itself shows an
+    // honest "start a conversation first" message when there's nothing
+    // to attach facts to yet, rather than pretending to work.
+    setClientFactsModalOpen(true)
+    setClientFactsSaveStatus(null)
+    if (!healContext?.conversationId) return
+    setIsLoadingClientFacts(true)
+    try {
+      // @ts-ignore
+      const res = await window.api.getClientFacts(healContext.conversationId)
+      if (res.success) setClientFactsText(res.facts || '')
+    } catch {
+      // Best-effort load -- an empty textarea just means starting fresh.
+    } finally {
+      setIsLoadingClientFacts(false)
+    }
+  }
+
+  const handleSaveClientFacts = async () => {
+    if (!healContext?.conversationId) return
+    setIsSavingClientFacts(true)
+    setClientFactsSaveStatus(null)
+    try {
+      // @ts-ignore
+      const res = await window.api.setClientFacts(healContext.conversationId, clientFactsText)
+      if (res.success) {
+        setClientFactsSaveStatus('Saved -- future generations for this project will use these facts.')
+      } else {
+        setClientFactsSaveStatus(`Failed to save: ${res.error}`)
+      }
+    } catch (err: any) {
+      setClientFactsSaveStatus(`Error: ${err.message}`)
+    } finally {
+      setIsSavingClientFacts(false)
     }
   }
 
@@ -299,6 +381,36 @@ export default function App() {
           conventional spot, matching how Claude/ChatGPT/Slack place it,
           instead of floating alone in the corner of the whole window. */}
       <main className={`flex flex-col h-full transition-all duration-300 ${previewFiles ? (isPreviewMaximized ? 'w-0 overflow-hidden' : 'w-1/2 border-r border-white/[0.06]') : 'flex-1'}`}>
+        {/* NEW: "Project Knowledge" -- always visible, independent of
+            whether a build has happened yet. Previously this lived as a
+            button inside the preview panel, which doesn't exist until
+            AFTER a generation -- backwards for something meant to be set
+            BEFORE building, the same way Claude Projects' "Project
+            knowledge" or Gemini's custom instructions work. Sits as its
+            own thin bar above the whole ChatInterface (sidebar + chat
+            column both) rather than inside it, so it's reachable
+            immediately without needing to modify ChatInterface.tsx's own
+            internal layout. Renamed from "Client Facts" -- the person
+            reading this button might BE the client in some contexts, so
+            a name that only makes sense from the agency's own point of
+            view was worth avoiding.
+            STILL A REAL LIMITATION, not fully solved: this modal is
+            still keyed to healContext.conversationId, which App.tsx only
+            learns AFTER a build -- true "usable before your first
+            message" parity needs ChatInterface.tsx to surface which
+            conversation is currently active, not yet wired. See the
+            modal's own empty-state message below for how this is
+            handled honestly in the meantime. */}
+        <div className="flex items-center justify-end px-3 py-2 border-b border-white/[0.04] shrink-0">
+          <button
+            onClick={handleOpenClientFactsModal}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-neutral-500 hover:text-white hover:bg-white/[0.06] text-xs font-medium rounded-md transition-colors"
+            title="Real facts about this project's business -- so builds stop guessing at prices, hours, policies"
+          >
+            <BookOpen size={13} />
+            Project Knowledge
+          </button>
+        </div>
         <ChatInterface onCodeGenerated={handleCodeGenerated} onClearPreview={handleClearPreview} onOpenSettings={() => setShowSettings(true)} />
       </main>
 
@@ -426,6 +538,15 @@ export default function App() {
                   Export Audit
                 </button>
                 <button
+                  onClick={handleExportClientSummary}
+                  disabled={!healContext?.conversationId}
+                  className="flex items-center gap-2 px-4 py-2 bg-white/[0.08] hover:bg-white/[0.14] text-[#f5f5f7] text-xs font-medium rounded-lg disabled:opacity-50 transition-colors"
+                  title="Export a plain-language summary of what was checked -- for sharing with a non-technical client"
+                >
+                  <ShieldCheck size={14} />
+                  Client Summary
+                </button>
+                <button
                   onClick={handleDownloadZip}
                   disabled={!previewFiles}
                   className="flex items-center gap-2 px-4 py-2 bg-white/[0.08] hover:bg-white/[0.14] text-[#f5f5f7] text-xs font-medium rounded-lg disabled:opacity-50 transition-colors"
@@ -512,6 +633,74 @@ export default function App() {
           </div>
 
         </section>
+      )}
+
+      {clientFactsModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center">
+          <div className="bg-[#2c2c2e] border border-white/[0.08] rounded-2xl w-full max-w-lg p-5 backdrop-blur-2xl">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <BookOpen size={16} className="text-white" />
+                <h3 className="text-sm font-medium text-white">Project Knowledge</h3>
+              </div>
+              <button onClick={() => setClientFactsModalOpen(false)} className="text-neutral-500 hover:text-white">
+                <X size={16} />
+              </button>
+            </div>
+
+            {!healContext?.conversationId ? (
+              // NEW: honest empty state -- this modal is still keyed to
+              // a conversation App.tsx doesn't know about until after a
+              // build (see this file's own note on that real, not-yet-
+              // solved limitation). Says so plainly instead of showing a
+              // textarea that would have nowhere real to save to.
+              <div className="py-6 text-center">
+                <p className="text-sm text-neutral-300">Start a conversation first.</p>
+                <p className="text-xs text-neutral-500 mt-1.5 leading-relaxed">Once you've sent a message in a chat, come back here to add real facts about that project's business -- prices, hours, policies -- so builds use them instead of guessing.</p>
+              </div>
+            ) : (
+              <>
+                <p className="text-xs text-neutral-400 mb-3 leading-relaxed">
+                  Real, verified details about this project's business -- services, pricing, hours, policies, anything specific. Builds will use exactly what's here instead of guessing, and will use an obvious placeholder (not an invented value) for anything not covered.
+                </p>
+
+                <textarea
+                  value={clientFactsText}
+                  onChange={(e) => setClientFactsText(e.target.value)}
+                  disabled={isLoadingClientFacts}
+                  placeholder={'e.g.\nBusiness name: Riverside Dental\nHours: Mon-Fri 9am-5pm, closed weekends\nServices: cleanings ($120), whitening ($350)\nPolicy: 24-hour cancellation notice required'}
+                  rows={10}
+                  className="w-full bg-black/30 border border-white/[0.06] rounded-lg px-3 py-2.5 text-xs text-neutral-200 placeholder-neutral-600 focus:outline-none focus:border-white/20 resize-none font-mono disabled:opacity-50"
+                />
+
+                {clientFactsSaveStatus && (
+                  <p className={`text-xs mt-2 ${clientFactsSaveStatus.startsWith('Saved') ? 'text-emerald-400' : 'text-red-400'}`}>
+                    {clientFactsSaveStatus}
+                  </p>
+                )}
+              </>
+            )}
+
+            <div className="flex justify-end gap-2 mt-4">
+              <button
+                onClick={() => setClientFactsModalOpen(false)}
+                className="px-3 py-1.5 text-xs text-neutral-300 hover:text-white transition-colors"
+              >
+                Close
+              </button>
+              {healContext?.conversationId && (
+                <button
+                  onClick={handleSaveClientFacts}
+                  disabled={isSavingClientFacts || isLoadingClientFacts}
+                  className={`flex items-center justify-center gap-2 px-4 py-2 ${ACCENT.bg} ${ACCENT.bgHover} text-white text-xs font-medium rounded-lg disabled:opacity-50 transition-colors`}
+                >
+                  {isSavingClientFacts ? <Loader2 size={14} className="animate-spin" /> : null}
+                  {isSavingClientFacts ? 'Saving...' : 'Save'}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
       )}
 
       {githubModalOpen && (
