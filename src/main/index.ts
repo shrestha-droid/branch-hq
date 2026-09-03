@@ -1,5 +1,6 @@
 import { app, BrowserWindow, ipcMain, session, shell, dialog } from 'electron'
 import * as path from 'path'
+import { pathToFileURL } from 'url'
 import { spawn, execFile, ChildProcess } from 'child_process'
 import * as net from 'net'
 import * as os from 'os'
@@ -803,6 +804,41 @@ function auditAndStage(rawOutput: string, agentKey?: 'jim' | 'dwight' | 'riley')
   if (agentKey === 'riley' && !extractedFiles['src/generate.ts']) {
     extractedFiles = extractRileyFallback(rawOutput)
   }
+
+  // FIXED: confirmed real, currently-occurring failure -- a specialist's
+  // response can look completely fine as raw text (real, well-written
+  // code) while still yielding ZERO extracted files, if its markdown
+  // structure doesn't match what extractCodeBlocks expects: a missing
+  // code fence around one file, or multiple files jammed into a single
+  // fence (extraction only recognizes one "// File:" comment per fence
+  // -- the first line inside it -- so a fence containing four files'
+  // worth of content still yields at most one entry). Previously,
+  // Object.keys(extractedFiles).length > 0 being false just meant
+  // stageableFiles came out undefined further down -- but staticAudit
+  // itself, from runMechanicalAudit({}), had nothing to flag on an
+  // empty set and trivially passed. Since Pam reviews rawOutput
+  // directly (not the extraction result), she'd approve genuinely good
+  // code with no idea it never actually turned into files -- the whole
+  // pipeline reported success with real code behind it, while nothing
+  // was ever staged. This is the same root failure class as the
+  // earlier same-line-comment extraction bug, just a different
+  // trigger: zero extracted files from a non-empty response is a real
+  // failure, not a vacuous pass, and is now surfaced as a blocker so it
+  // feeds the existing retry loop (MAX_AUTO_FIX_ROUNDS) instead of
+  // silently succeeding on nothing.
+  if (Object.keys(extractedFiles).length === 0 && rawOutput.trim().length > 0) {
+    return {
+      extractedFiles,
+      staticAudit: {
+        passed: false,
+        blockers: ['No files could be extracted from this response. Every file must be in its own separate markdown code block, with a "// File: path" comment as the very first line inside that block -- do not combine multiple files into one code block.'],
+        warnings: [],
+        perFile: []
+      } as AuditResult,
+      stageableFiles: undefined
+    }
+  }
+
   const staticAudit = runMechanicalAudit(extractedFiles)
   const stageableFiles =
     staticAudit.passed && Object.keys(extractedFiles).length > 0
@@ -1215,6 +1251,17 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
 
     const settingsForSnapshot = await getSettings()
     const mergedFiles: Record<string, string> = {}
+    // NEW: tracks which agents' pipelines genuinely succeeded this turn,
+    // as opposed to orderedDelegations, which only reflects what Michael
+    // DECIDED to route to. Confirmed real failure: a run where Dwight's
+    // output was hard-blocked by Gate 1 after all retry rounds still
+    // triggered the "Both are done -- backend is included under server/"
+    // message below (unchanged until this fix), since that check only
+    // ever looked at intent, never outcome -- the message claimed a
+    // backend existed while mergedFiles and the actual staged file
+    // count both silently reflected a frontend-only result. This set
+    // is the source of truth for what actually landed in mergedFiles.
+    const succeededAgents = new Set<'jim' | 'dwight' | 'riley'>()
     let dwightRawOutput: string | null = null
     // Tracks the frontend (Jim) delegation's own results specifically --
     // self-healing targets whichever agent's code is actually running
@@ -1269,6 +1316,20 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
         continue
       }
 
+      // FIXED: previously added unconditionally whenever result.success
+      // was true. Confirmed real gap: runSpecialistPipeline can return
+      // success: true with stageableFiles undefined -- e.g. when
+      // extraction yields zero files (see auditAndStage's own fix for
+      // the underlying cause) in a way Gate 1 didn't itself block.
+      // succeededAgents is what the completion message below trusts to
+      // mean "this agent's code is genuinely staged" -- gating it on
+      // stageableFiles directly, the same condition the merge below
+      // already requires, closes that gap instead of trusting
+      // result.success alone.
+      if (result.stageableFiles) {
+        succeededAgents.add(agentKey)
+      }
+
       if (agentKey === 'dwight') {
         dwightRawOutput = result.specialistOutput
       }
@@ -1299,16 +1360,40 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
       return { success: false, messages: [...newMessages, errMsg] }
     }
 
-    // NEW: when a backend was built alongside the frontend, say plainly
-    // what that does and doesn't mean right now -- the live sandbox
-    // preview can only run the frontend, so the backend is real,
-    // reviewed, and written to disk correctly, but isn't part of the
-    // in-app preview itself until run separately.
-    if (orderedDelegations.some(d => d.assignTo === 'Dwight') && orderedDelegations.some(d => d.assignTo === 'Jim')) {
+    // FIXED: confirmed real bug -- this used to check orderedDelegations
+    // (what Michael decided to route to) instead of succeededAgents
+    // (what actually made it through Gate 1/Pam and into mergedFiles).
+    // When Dwight's pipeline failed -- e.g. hard-blocked by Gate 1 after
+    // every retry round -- the loop above just does `continue` and moves
+    // on, with no flag telling this block that happened. The old check
+    // fired anyway, telling the user "the backend is included under
+    // server/" when zero backend files had actually been staged, while
+    // the file count and the live sandbox preview both correctly showed
+    // a frontend-only result. Now this reflects reality either way.
+    const bothWereAttempted = orderedDelegations.some(d => d.assignTo === 'Dwight') && orderedDelegations.some(d => d.assignTo === 'Jim')
+
+    if (bothWereAttempted && succeededAgents.has('dwight') && succeededAgents.has('jim')) {
+      // NEW: when a backend was built alongside the frontend, say plainly
+      // what that does and doesn't mean right now -- the live sandbox
+      // preview can only run the frontend, so the backend is real,
+      // reviewed, and written to disk correctly, but isn't part of the
+      // in-app preview itself until run separately.
       newMessages.push(await addMessage(
         conversationId,
         'michael',
         `Both are done -- the frontend is what you'll see in Preview, and the backend is included under server/ in the same push, written and ready to run on its own (cd server && npm run dev). They aren't wired to run together inside the live preview yet, but both are real, reviewed code you can run side by side once pushed.`
+      ))
+    } else if (bothWereAttempted) {
+      // NEW: the honest partial-failure case -- one of the two didn't
+      // make it through review. Says which one plainly instead of
+      // letting the generic file-count footer imply everything asked
+      // for is actually staged.
+      const missing = succeededAgents.has('dwight') ? 'frontend' : 'backend'
+      const staged = succeededAgents.has('jim') ? 'frontend' : 'backend'
+      newMessages.push(await addMessage(
+        conversationId,
+        'michael',
+        `Only the ${staged} made it through review this time -- the ${missing} failed Gate 1 and isn't included in what's staged (see the error above). Ask me to retry it whenever you want another attempt.`
       ))
     }
 
@@ -1484,15 +1569,83 @@ typedIpc.handle('runtime:detect', async () => {
   return await detectNativeRuntime()
 })
 
-// NEW: cached once at startup, not re-checked per-request. Used to
-// decide whether Branch HQ's OWN outer page needs COEP/COOP forced onto
-// it -- only true when native mode won't be available and WebContainers
-// will actually be the thing running, since that's the only case that
-// genuinely needs this. Confirmed via a real isolating experiment that
-// forcing this unconditionally was the actual cause of a real
-// ERR_BLOCKED_BY_RESPONSE failure blocking native mode's own frontend.
-let willUseWebContainerFallback = true
-detectNativeRuntime().then(r => { willUseWebContainerFallback = !r.available })
+// FIXED: the COOP/COEP conflict this variable existed to route around is
+// now solved architecturally instead of by guessing at request-level
+// exemptions -- see sandboxSession below. willUseWebContainerFallback
+// and activeNativePorts (which existed only to feed two increasingly
+// convoluted attempts at scoping header-forcing on session.defaultSession)
+// are removed entirely: session.defaultSession (native mode's actual
+// home) no longer has ANY isolation-header logic attached to it, so
+// there's nothing left for either of them to inform.
+
+// NEW: dedicated, non-persistent session partition for anything
+// WebContainer-dependent -- Riley's document generation always uses
+// this path; Jim/Dwight's web-app preview uses it only when native mode
+// isn't available. Deliberately NOT prefixed with 'persist:': this
+// session is wiped when the app quits rather than written to disk,
+// since it runs arbitrary AI-generated project code that could set its
+// own localStorage/cookies, and nothing generated in one run should be
+// able to leak into another. This is the actual fix for the COOP/COEP
+// tension documented above: native mode's iframe lives entirely in
+// session.defaultSession, which never gets isolation headers forced on
+// it; WebContainer content lives entirely in this separate partition,
+// which gets them forced on it unconditionally. Two sessions, two
+// policies -- no per-request exemption logic left to get wrong.
+//
+// FIXED: confirmed real, currently-occurring crash -- session.fromPartition()
+// (and any other session.* call) can only be called after Electron's app
+// module fires 'ready'. This used to run at module scope, meaning it
+// executed the instant this file was loaded -- BEFORE app.whenReady() --
+// throwing "Session can only be received when app is ready" and crashing
+// the whole app on launch, every time. The partition NAME (a plain
+// string, no Electron API involved) stays at module scope since the
+// sandbox-webview:get-config handler below needs it; the actual
+// session.fromPartition() call and its header handler are now wrapped in
+// this function, which app.whenReady().then(...) calls before
+// createWindow() -- see the bottom of this file.
+const SANDBOX_WEBVIEW_PARTITION = 'webcontainer-sandbox'
+
+function setupSandboxSession() {
+  const sandboxSession = session.fromPartition(SANDBOX_WEBVIEW_PARTITION)
+
+  // FIXED: this exact header-forcing logic used to live on
+  // session.defaultSession, gated behind willUseWebContainerFallback /
+  // isTopLevelPage / activeNativePorts checks -- three reasoned attempts
+  // at making ONE session serve native mode's "no isolation" requirement
+  // and WebContainer's "isolation required" requirement at the same time.
+  // Each attempt (port exemption, then resourceType scoping, then raw
+  // header logging to find what was still slipping through) still left a
+  // real ERR_BLOCKED_BY_RESPONSE possible on native mode's frontend,
+  // because the problem was architectural, not a targeting bug in the
+  // exemption logic. This session now ONLY ever hosts WebContainer
+  // content, so these headers apply to every response in it,
+  // unconditionally, with no exemptions left to get wrong.
+  sandboxSession.webRequest.onHeadersReceived((details, callback) => {
+    const responseHeaders = { ...details.responseHeaders }
+    delete responseHeaders['Content-Security-Policy']
+    delete responseHeaders['content-security-policy']
+    responseHeaders['Cross-Origin-Embedder-Policy'] = ['credentialless']
+    responseHeaders['Cross-Origin-Opener-Policy'] = ['same-origin']
+    responseHeaders['Content-Security-Policy'] = [
+      "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; frame-src * data: blob:; worker-src * data: blob:;"
+    ]
+    callback({ responseHeaders })
+  })
+}
+
+// NEW: the renderer needs three real, resolved values to actually mount
+// the sandbox <webview> -- its preload script's absolute path, the HTML
+// page it should load (dev server URL vs. packaged file:// path -- the
+// same branching createWindow already does for the main window, kept in
+// one place here rather than duplicated in the renderer), and the
+// partition name so the webview tag and this session stay the same one.
+typedIpc.handle('sandbox-webview:get-config', async () => {
+  const preloadPath = pathToFileURL(path.join(__dirname, '../preload/sandboxWebview.js')).toString()
+  const src = process.env['ELECTRON_RENDERER_URL']
+    ? `${process.env['ELECTRON_RENDERER_URL']}/sandbox-webview.html`
+    : pathToFileURL(path.join(__dirname, '../renderer/sandbox-webview.html')).toString()
+  return { preloadPath, src, partition: SANDBOX_WEBVIEW_PARTITION }
+})
 
 // Tracks every process spawned for a given run, so it can be torn down
 // cleanly -- switching conversations, a fresh generation replacing an old
@@ -1504,13 +1657,6 @@ interface NativeRun {
   frontendPort?: number
 }
 const activeNativeRuns = new Map<string, NativeRun>()
-// NEW: which ports are genuinely real native servers right now -- used
-// by onHeadersReceived below to exempt them from header rewriting that
-// was written for WebContainer's needs, not theirs. The fixed backend
-// port is always native whenever it's in use; the frontend's port is
-// dynamic (Vite can land on a different one each run), so it's tracked
-// here as soon as it's actually known.
-const activeNativePorts = new Set<number>([NATIVE_BACKEND_PORT])
 
 async function writeFilesToScratch(scratchDir: string, files: Record<string, string>): Promise<void> {
   for (const [relativePath, content] of Object.entries(files)) {
@@ -1574,7 +1720,6 @@ async function stopNativeRun(runId: string): Promise<void> {
   if (!run) return
   try { run.frontend?.kill() } catch { /* already gone */ }
   try { run.backend?.kill() } catch { /* already gone */ }
-  if (run.frontendPort) activeNativePorts.delete(run.frontendPort)
   await fs.rm(run.scratchDir, { recursive: true, force: true }).catch(() => {})
   activeNativeRuns.delete(runId)
 }
@@ -1648,7 +1793,6 @@ typedIpc.handle('sandbox:startNative', async (event: any, { runId, files }: { ru
       if (match) {
         frontendReady = true
         const port = Number(match[1])
-        activeNativePorts.add(port)
         run.frontendPort = port
         send('sandbox:frontend-ready', { url: `http://localhost:${port}`, port })
       }
@@ -1936,7 +2080,17 @@ function createWindow() {
       preload: path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: false,
+      // NEW: required for the sandbox <webview> (WebContainer content,
+      // loaded into its own session partition -- see sandboxSession
+      // above) to be usable at all. Electron disables the <webview> tag
+      // by default specifically because a webview loading untrusted
+      // content with the host page's own privileges is a real risk --
+      // that's exactly why sandboxWebview.ts (its preload) exposes a
+      // deliberately tiny bridge (run/log/ready/error/document-ready
+      // only) instead of the main preload's full API surface, and why
+      // it's pinned to its own non-persistent, non-default session.
+      webviewTag: true
     }
   })
 
@@ -1947,91 +2101,34 @@ function createWindow() {
   // This routes it to the OS's real default browser. Worth knowing
   // honestly: a WebContainer preview URL depends on cross-origin
   // isolation and virtual networking specific to the context that
-  // booted it (see the custom COOP/COEP headers below, only applied
-  // here inside the app) -- opening it in a genuinely separate browser
-  // process may not always render correctly, since that separate
-  // process never gets those same headers. This fix makes the click
-  // actually do something real; it does not guarantee the WebContainer
-  // preview specifically will load outside the app every time.
+  // booted it (see sandboxSession above) -- opening it in a genuinely
+  // separate browser process may not always render correctly, since
+  // that separate process never gets those same headers. This fix makes
+  // the click actually do something real; it does not guarantee the
+  // WebContainer preview specifically will load outside the app every
+  // time.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url)
     return { action: 'deny' }
   })
 
+  // FIXED: this handler used to carry all the COOP/COEP forcing logic
+  // too, gated behind willUseWebContainerFallback / activeNativePorts /
+  // resourceType checks -- see the removed code and comment trail above
+  // sandboxSession for the full history of why that approach kept
+  // producing new edge cases instead of actually resolving the
+  // conflict. All isolation-header logic now lives entirely on
+  // sandboxSession instead, which is the only session that ever hosts
+  // WebContainer content. This handler's only remaining job is
+  // defensive: strip whatever CSP an embedded native dev server or
+  // Express backend might send on its own, since a restrictive one
+  // could otherwise block this page from framing it -- nothing here
+  // adds isolation headers, and nothing here needs to distinguish
+  // native ports from anything else anymore.
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     const responseHeaders = { ...details.responseHeaders }
-
     delete responseHeaders['Content-Security-Policy']
     delete responseHeaders['content-security-policy']
-
-    // FIXED: this used to apply to any URL containing "localhost" at
-    // all, with no way to tell a WebContainer preview (which genuinely
-    // needs this) apart from a real native dev server (which doesn't --
-    // and gets broken by it). Confirmed real failure: the native
-    // engine's frontend loaded and reported ready, but Electron blocked
-    // the actual page load with ERR_BLOCKED_BY_RESPONSE, because this
-    // handler was forcing Cross-Origin-Opener-Policy onto its response
-    // regardless. Real native ports are tracked as they're discovered
-    // (see activeNativePorts above) and explicitly exempted here.
-    const urlPort = Number(new URL(details.url).port || (details.url.startsWith('https') ? 443 : 80))
-    const isKnownNativePort = activeNativePorts.has(urlPort)
-
-    // FIXED: the port-based exemption above was correctly wired but
-    // still let a real failure through -- Console showed no more
-    // specific framing-block message at all when tested, which pointed
-    // at a more fundamental scoping problem than a bookkeeping bug.
-    // This was always only supposed to apply to Branch HQ's OWN
-    // top-level page, which genuinely needs cross-origin isolation on
-    // itself for WebContainers to work -- never to anything loaded
-    // INSIDE an iframe, WebContainer's or native's. The original "any
-    // localhost URL" condition never actually caused a visible problem
-    // before, because WebContainer's real preview URLs don't typically
-    // match a plain localhost pattern in the first place -- native mode
-    // is the first time real localhost content has ever lived inside
-    // the iframe. resourceType is a structural signal Electron provides
-    // directly, not bookkeeping Branch HQ has to maintain correctly --
-    // use it as the real gate; the port-based check stays as an
-    // additional, redundant safety net, not the primary decision.
-    const isTopLevelPage = details.resourceType === 'mainFrame'
-
-    // NEW: two reasoned fixes targeting COOP/COEP have now both failed
-    // to resolve a real ERR_BLOCKED_BY_RESPONSE on native mode's
-    // frontend -- rather than guess a third time, log the actual raw
-    // headers for any request to a known native port, specifically the
-    // ones that can cause exactly this error (X-Frame-Options, a CSP
-    // frame-ancestors directive, Cross-Origin-Resource-Policy, and COOP/
-    // COEP themselves). Plain console.log, not the IPC log stream --
-    // shows up directly in the same terminal already being shared here,
-    // no DevTools digging required to get real evidence this time.
-    if (isKnownNativePort && (details.resourceType === 'mainFrame' || details.resourceType === 'subFrame')) {
-      const headerKeys = Object.keys(details.responseHeaders || {})
-      const relevant = ['x-frame-options', 'content-security-policy', 'cross-origin-resource-policy', 'cross-origin-opener-policy', 'cross-origin-embedder-policy']
-      const found: Record<string, string[]> = {}
-      for (const key of headerKeys) {
-        if (relevant.includes(key.toLowerCase())) {
-          found[key] = (details.responseHeaders as any)[key]
-        }
-      }
-      console.log(`[DIAGNOSTIC] Headers for ${details.url} (resourceType: ${details.resourceType}):`, Object.keys(found).length > 0 ? found : '(none of the relevant headers were present at all)')
-    }
-
-    // FIXED: confirmed via a real isolating experiment that forcing
-    // this unconditionally onto Branch HQ's own outer page was the
-    // actual cause of a real ERR_BLOCKED_BY_RESPONSE blocking native
-    // mode's frontend iframe -- even in COEP's "credentialless" mode,
-    // which is specifically designed not to need cooperation from what
-    // it embeds. The correct scope: this is only genuinely needed when
-    // WebContainers will actually be what's running this session, never
-    // when native mode is available, since native mode has no
-    // cross-origin-isolation requirement at all.
-    if (willUseWebContainerFallback && isTopLevelPage && !isKnownNativePort && (details.url.includes('localhost') || details.url.includes('127.0.0.1'))) {
-      responseHeaders['Cross-Origin-Embedder-Policy'] = ['credentialless']
-      responseHeaders['Cross-Origin-Opener-Policy'] = ['same-origin']
-      responseHeaders['Content-Security-Policy'] = [
-        "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; frame-src * data: blob:; worker-src * data: blob:;"
-      ]
-    }
-
     callback({ responseHeaders })
   })
 
@@ -2070,6 +2167,11 @@ app.commandLine.appendSwitch('disable-features', 'ThirdPartyStoragePartitioning'
 // diagnose by hand in DevTools each time it happens.
 app.whenReady().then(async () => {
   await session.defaultSession.clearStorageData({ storages: ['serviceworkers'] }).catch(() => {})
+  // NEW: must happen after app.whenReady() -- see setupSandboxSession's
+  // own note on why this crashed when it ran at module scope instead.
+  // Before createWindow() so the partition and its headers exist before
+  // any webview could possibly try to use them.
+  setupSandboxSession()
   createWindow()
 })
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
