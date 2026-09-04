@@ -35,7 +35,18 @@ export interface AppSettings {
   // string (a real Gemini model name, e.g. "gemini-3.7-pro") rather than
   // a boolean toggle, so it's not tied to any one specific stronger
   // model existing at any given time.
+  // NEW: per-agent global model overrides. dwightModel already existed
+  // (backend generation's asymmetric failure cost was the original,
+  // narrower case); extended to all five agents on request, so any
+  // agent's model can be tuned independently -- a cheaper/faster model
+  // for routing or QA, a stronger one for the specialist actually
+  // writing the code, etc. Empty string means "inherit the primary
+  // geminiModel," same convention as before.
+  michaelModel: string
+  jimModel: string
   dwightModel: string
+  pamModel: string
+  rileyModel: string
   // NEW: enables real, live Google Search grounding for Riley's
   // research/document generation. Off by default and deliberately
   // opt-in -- unlike everything else in this file, this has a real,
@@ -99,7 +110,11 @@ function defaults(): AppSettings {
     // genuinely couldn't see existing work and appeared to "forget" it).
     // app.getPath('home') resolves correctly per user on every machine.
     defaultTargetDir: process.env.DEFAULT_TARGET_DIR || path.join(app.getPath('home'), 'branch-hq-output'),
+    michaelModel: process.env.MICHAEL_MODEL || '',
+    jimModel: process.env.JIM_MODEL || '',
     dwightModel: process.env.DWIGHT_MODEL || '',
+    pamModel: process.env.PAM_MODEL || '',
+    rileyModel: process.env.RILEY_MODEL || '',
     enableWebSearch: false,
     masterProfile: '',
     relayServerUrl: process.env.RELAY_SERVER_URL || '',

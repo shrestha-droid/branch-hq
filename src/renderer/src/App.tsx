@@ -2,7 +2,8 @@ import { useState, useEffect, useRef } from 'react'
 import ChatInterface from './components/ChatInterface'
 import SandboxPreview from './components/SandboxPreview'
 import SettingsModal from './components/SettingsModal'
-import { Code2, FileCode, X, CheckCircle2, Play, HardDriveDownload, Loader2, AlertTriangle, Activity, ShieldCheck, Maximize2, Minimize2, Download, GitBranch, BookOpen, Laptop, Wifi, Check, Trash2, UserCircle, Link, Globe } from 'lucide-react'
+import { Code2, FileCode, X, CheckCircle2, Play, HardDriveDownload, Loader2, AlertTriangle, Activity, ShieldCheck, Maximize2, Minimize2, Download, GitBranch, BookOpen, Laptop, Wifi, Check, Trash2, UserCircle, Link, Globe, Cpu } from 'lucide-react'
+import ModelSelect from './components/ModelSelect'
 
 const ACCENT = {
   text: 'text-[#409cff]',
@@ -81,6 +82,17 @@ export default function App() {
   const [isLoadingClientFacts, setIsLoadingClientFacts] = useState(false)
   const [isSavingClientFacts, setIsSavingClientFacts] = useState(false)
   const [clientFactsSaveStatus, setClientFactsSaveStatus] = useState<string | null>(null)
+
+  // NEW: per-chat model overrides -- the narrower layer that beats the
+  // global per-agent settings (Settings modal) for one specific
+  // conversation only. Same conversation-scoped pattern as Client
+  // Facts, since it's the same shape of problem: something true for one
+  // project, not everywhere.
+  const [modelOverridesModalOpen, setModelOverridesModalOpen] = useState(false)
+  const [modelOverridesValues, setModelOverridesValues] = useState<Record<string, string>>({})
+  const [isLoadingModelOverrides, setIsLoadingModelOverrides] = useState(false)
+  const [isSavingModelOverrides, setIsSavingModelOverrides] = useState(false)
+  const [modelOverridesSaveStatus, setModelOverridesSaveStatus] = useState<string | null>(null)
 
   // NEW: multi-device pairing (Phase 1 -- discovery + secure pairing
   // only, no task handoff yet). See the main-process deviceIdentity.ts/
@@ -415,6 +427,42 @@ export default function App() {
       }
     } catch (err: any) {
       setPushStatus(`Error: ${err.message}`)
+    }
+  }
+
+  const handleOpenModelOverridesModal = async () => {
+    setModelOverridesModalOpen(true)
+    setModelOverridesSaveStatus(null)
+    if (!activeConversationId) return
+    setIsLoadingModelOverrides(true)
+    try {
+      // @ts-ignore
+      const res = await window.api.getModelOverrides(activeConversationId)
+      if (res.success) setModelOverridesValues(res.overrides || {})
+    } catch {
+      // Best-effort load -- empty fields just mean nothing's overridden
+      // for this chat yet, which is the normal, common case.
+    } finally {
+      setIsLoadingModelOverrides(false)
+    }
+  }
+
+  const handleSaveModelOverrides = async () => {
+    if (!activeConversationId) return
+    setIsSavingModelOverrides(true)
+    setModelOverridesSaveStatus(null)
+    try {
+      // @ts-ignore
+      const res = await window.api.setModelOverrides(activeConversationId, modelOverridesValues)
+      if (res.success) {
+        setModelOverridesSaveStatus('Saved -- future messages in this chat use these, everything else keeps using your global settings.')
+      } else {
+        setModelOverridesSaveStatus(`Failed to save: ${res.error}`)
+      }
+    } catch (err: any) {
+      setModelOverridesSaveStatus(`Error: ${err.message}`)
+    } finally {
+      setIsSavingModelOverrides(false)
     }
   }
 
@@ -772,6 +820,14 @@ export default function App() {
             Project Knowledge
           </button>
           <button
+            onClick={handleOpenModelOverridesModal}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-neutral-500 hover:text-white hover:bg-white/[0.06] text-xs font-medium rounded-md transition-colors"
+            title="Use a different model for one or more agents in this chat only -- everything else keeps your global settings"
+          >
+            <Cpu size={13} />
+            Model
+          </button>
+          <button
             onClick={() => { setMasterProfileModalOpen(true); setMasterProfileSaveStatus(null) }}
             className="flex items-center gap-1.5 px-2.5 py-1.5 text-neutral-500 hover:text-white hover:bg-white/[0.06] text-xs font-medium rounded-md transition-colors"
             title="Standing info about who's running Branch HQ -- applies to every project, not just this one"
@@ -1013,6 +1069,78 @@ export default function App() {
           </div>
 
         </section>
+      )}
+
+      {modelOverridesModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center">
+          <div className="bg-[#2c2c2e] border border-white/[0.08] rounded-2xl w-full max-w-lg p-5 backdrop-blur-2xl">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <Cpu size={16} className="text-white" />
+                <h3 className="text-sm font-medium text-white">Model -- this chat only</h3>
+              </div>
+              <button onClick={() => setModelOverridesModalOpen(false)} className="text-neutral-500 hover:text-white">
+                <X size={16} />
+              </button>
+            </div>
+
+            {!activeConversationId ? (
+              <div className="py-6 text-center">
+                <p className="text-sm text-neutral-300">Loading your conversation...</p>
+                <p className="text-xs text-neutral-500 mt-1.5 leading-relaxed">Use a different model for one or more agents in just this chat.</p>
+              </div>
+            ) : (
+              <>
+                <p className="text-xs text-neutral-400 mb-3 leading-relaxed">
+                  Overrides for this conversation only -- everything else keeps using your global settings. Leave any field blank to use the global setting (Settings &rarr; Per-Agent Overrides) for that agent here too.
+                </p>
+
+                <div className="flex flex-col gap-2.5">
+                  {([
+                    ['michael', 'Michael (routing)'],
+                    ['jim', 'Jim (frontend)'],
+                    ['dwight', 'Dwight (backend)'],
+                    ['pam', 'Pam (QA review)'],
+                    ['riley', 'Riley (documents)']
+                  ] as const).map(([field, label]) => (
+                    <div key={field}>
+                      <span className="text-[11px] text-neutral-400 block mb-1">{label}</span>
+                      <ModelSelect
+                        value={modelOverridesValues[field] || ''}
+                        onChange={(v) => setModelOverridesValues({ ...modelOverridesValues, [field]: v })}
+                        disabled={isLoadingModelOverrides}
+                        inheritLabel="Use global setting"
+                      />
+                    </div>
+                  ))}
+                </div>
+
+                {modelOverridesSaveStatus && (
+                  <p className={`text-xs mt-2 ${modelOverridesSaveStatus.startsWith('Saved') ? 'text-emerald-400' : 'text-red-400'}`}>
+                    {modelOverridesSaveStatus}
+                  </p>
+                )}
+
+                <div className="flex justify-end gap-2 mt-4">
+                  <button
+                    onClick={() => setModelOverridesModalOpen(false)}
+                    className="px-3 py-1.5 text-xs text-neutral-300 hover:text-white transition-colors"
+                  >
+                    Close
+                  </button>
+                  <button
+                    onClick={handleSaveModelOverrides}
+                    disabled={isSavingModelOverrides}
+                    className={`flex items-center justify-center gap-2 px-4 py-2 ${ACCENT.bg} ${ACCENT.bgHover} text-white text-xs font-medium rounded-lg disabled:opacity-50 transition-colors`}
+                  >
+                    {isSavingModelOverrides ? <Loader2 size={14} className="animate-spin" /> : null}
+                    {isSavingModelOverrides ? 'Saving...' : 'Save'}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
       )}
 
       {clientFactsModalOpen && (

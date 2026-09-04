@@ -148,6 +148,8 @@ contextBridge.exposeInMainWorld('api', {
   exportClientSummary: (conversationId: string) => ipcRenderer.invoke('audit:exportClientSummary', conversationId),
   getClientFacts: (conversationId: string) => ipcRenderer.invoke('clientFacts:get', conversationId),
   setClientFacts: (conversationId: string, facts: string) => ipcRenderer.invoke('clientFacts:set', { conversationId, facts }),
+  getModelOverrides: (conversationId: string) => ipcRenderer.invoke('modelOverrides:get', conversationId),
+  setModelOverrides: (conversationId: string, overrides: Record<string, string>) => ipcRenderer.invoke('modelOverrides:set', { conversationId, overrides }),
   // NEW: called once the sandbox has genuinely run a generation
   // successfully -- upgrades its audit record from "Pam approved" to
   // "confirmed running." Distinct, stronger claim than Gate 2's opinion.
@@ -210,12 +212,14 @@ declare global {
       clearGithubToken: () => Promise<{ success: boolean }>;
       pushToGithub: (files: Record<string, string>, repoName: string, isPrivate: boolean) => Promise<{ success: boolean; repoUrl?: string; error?: string }>;
       getUsage: (conversationId?: string) => Promise<{ success: boolean; session: { callCount: number; charsIn: number; charsOut: number }; conversation: { callCount: number; charsIn: number; charsOut: number } | null }>;
-      getSettings: () => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; fallbackGeminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string; dwightModel: string; enableWebSearch: boolean; masterProfile: string; strictVerification: boolean }>;
-      updateSettings: (partial: Record<string, any>) => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; fallbackGeminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string; dwightModel: string; enableWebSearch: boolean; masterProfile: string; strictVerification: boolean }>;
+      getSettings: () => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; fallbackGeminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string; michaelModel: string; jimModel: string; dwightModel: string; pamModel: string; rileyModel: string; enableWebSearch: boolean; masterProfile: string; relayServerUrl: string; strictVerification: boolean }>;
+      updateSettings: (partial: Record<string, any>) => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; fallbackGeminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string; michaelModel: string; jimModel: string; dwightModel: string; pamModel: string; rileyModel: string; enableWebSearch: boolean; masterProfile: string; relayServerUrl: string; strictVerification: boolean }>;
       exportAuditReport: (conversationId: string) => Promise<{ success: boolean; report?: string; integrityHash?: string; generatedAt?: string; error?: string }>;
       exportClientSummary: (conversationId: string) => Promise<{ success: boolean; summary?: string; generatedAt?: string; error?: string }>;
       getClientFacts: (conversationId: string) => Promise<{ success: boolean; facts?: string; error?: string }>;
       setClientFacts: (conversationId: string, facts: string) => Promise<{ success: boolean; error?: string }>;
+      getModelOverrides: (conversationId: string) => Promise<{ success: boolean; overrides?: Record<string, string>; error?: string }>;
+      setModelOverrides: (conversationId: string, overrides: Record<string, string>) => Promise<{ success: boolean; error?: string }>;
       markAuditExecuted: (auditId: string) => Promise<{ success: boolean; updated?: boolean; error?: string }>;
       createConversation: (mode: string, title?: string) => Promise<any>;
       listConversations: () => Promise<any[]>;

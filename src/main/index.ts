@@ -52,6 +52,7 @@ import { auditAndStage, prefixStageableFiles } from './extraction'
 import { looksTransient } from './resilience'
 import { detectVerticalStarterKit } from './verticals'
 import { getClientFacts, setClientFacts } from './clientFactsStore'
+import { getConversationModelOverrides, setConversationModelOverrides } from './modelOverridesStore'
 
 dotenv.config()
 
@@ -371,17 +372,30 @@ async function fetchFrontierAI(systemPrompt: string, userPrompt: string, modelOv
   return countingProvider.generate(systemPrompt, [{ role: 'user', content: userPrompt }], modelOverride, useSearchGrounding)
 }
 
-// NEW: currently only Dwight has a configurable override (settings.dwightModel)
-// -- the evidence-backed case, see settingsStore.ts's own note on this
-// field, is specific to backend generation's asymmetric failure cost.
-// Written as a small lookup rather than inlined at each call site so
-// the same resolution logic can't drift between the three places that
-// need it (runSpecialistPipeline, direct agent chat, self-healing), and
-// so extending this to another agent later is a one-line change here,
-// not three separate ones.
-function resolveModelOverride(agentKey: 'jim' | 'dwight' | 'riley', settings: Awaited<ReturnType<typeof getSettings>>): string | undefined {
-  if (agentKey === 'dwight' && settings.dwightModel) return settings.dwightModel
-  return undefined
+// NEW: extended from Dwight-only to all five agents, and from a single
+// global layer to two layers -- see modelOverridesStore.ts for the
+// per-conversation half. Resolution order: a conversation-specific
+// override (if this chat has one) beats the global per-agent setting
+// (if set), which beats the primary geminiModel (implicit -- returning
+// undefined here means "use the primary," same convention as before).
+// Now async because the conversation layer requires a real read from
+// disk; every call site was updated to await it.
+async function resolveModelOverride(
+  agentKey: 'michael' | 'jim' | 'dwight' | 'pam' | 'riley',
+  settings: Awaited<ReturnType<typeof getSettings>>,
+  conversationId?: string
+): Promise<string | undefined> {
+  if (conversationId) {
+    const convOverrides = await getConversationModelOverrides(conversationId)
+    if (convOverrides[agentKey]) return convOverrides[agentKey]
+  }
+  const globalOverride =
+    agentKey === 'michael' ? settings.michaelModel :
+    agentKey === 'jim' ? settings.jimModel :
+    agentKey === 'dwight' ? settings.dwightModel :
+    agentKey === 'pam' ? settings.pamModel :
+    settings.rileyModel
+  return globalOverride || undefined
 }
 
 // NEW: currently only Riley gets real search grounding -- see
@@ -395,8 +409,8 @@ function shouldUseSearchGrounding(agentKey: 'jim' | 'dwight' | 'riley', settings
   return agentKey === 'riley' && settings.enableWebSearch
 }
 
-async function fetchChatCompletion(systemPrompt: string, history: ChatTurn[]): Promise<string> {
-  return countingProvider.generate(systemPrompt, history)
+async function fetchChatCompletion(systemPrompt: string, history: ChatTurn[], modelOverride?: string): Promise<string> {
+  return countingProvider.generate(systemPrompt, history, modelOverride)
 }
 
 // 5. System Prompts
@@ -748,6 +762,26 @@ typedIpc.handle('clientFacts:set', async (_event: any, { conversationId, facts }
   }
 })
 
+// NEW: per-chat model overrides -- see modelOverridesStore.ts's own
+// note on how this layers on top of the global per-agent settings.
+typedIpc.handle('modelOverrides:get', async (_event: any, conversationId: string) => {
+  try {
+    const overrides = await getConversationModelOverrides(conversationId)
+    return { success: true, overrides }
+  } catch (err: any) {
+    return { success: false, error: err.message }
+  }
+})
+
+typedIpc.handle('modelOverrides:set', async (_event: any, { conversationId, overrides }: { conversationId: string; overrides: Record<string, string> }) => {
+  try {
+    await setConversationModelOverrides(conversationId, overrides)
+    return { success: true }
+  } catch (err: any) {
+    return { success: false, error: err.message }
+  }
+})
+
 // NEW: called from the renderer -- the only place a sandbox actually
 // runs -- the moment a generation has genuinely been executed
 // successfully (a web app reached server-ready, or a document script
@@ -830,7 +864,7 @@ typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName,
         PROMPTS.JIM_FRONTEND
       const learnedGuidance = await getLearnedGuidance(agentName)
       const settingsForCall = await getSettings()
-      const modelOverride = resolveModelOverride(agentName, settingsForCall)
+      const modelOverride = await resolveModelOverride(agentName, settingsForCall, conversationId)
       const specialistOutput = await fetchFrontierAI(targetPrompt, prompt + learnedGuidance, modelOverride, shouldUseSearchGrounding(agentName, settingsForCall))
       const { staticAudit, stageableFiles } = auditAndStage(specialistOutput, agentName)
 
@@ -863,7 +897,8 @@ typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName,
     // written by hand, anything), on demand, outside the normal
     // generate-then-review flow.
     if (agentName === 'pam') {
-      const pamReview = await fetchFrontierAI(PROMPTS.PAM_AUDITOR_LOGIC, prompt)
+      const settingsForPam = await getSettings()
+      const pamReview = await fetchFrontierAI(PROMPTS.PAM_AUDITOR_LOGIC, prompt, await resolveModelOverride('pam', settingsForPam, conversationId))
       const pamMsg = await addMessage(conversationId, 'pam', pamReview)
       newMessages.push(pamMsg)
       return { success: true, messages: newMessages }
@@ -901,7 +936,7 @@ async function runSpecialistPipeline(params: {
   // made and already had fixed before -- local to this machine only.
   const learnedGuidance = await getLearnedGuidance(agentKey)
   const settingsForModel = await getSettings()
-  const modelOverride = resolveModelOverride(agentKey, settingsForModel)
+  const modelOverride = await resolveModelOverride(agentKey, settingsForModel, conversationId)
   let currentInstructions = baseInstructions + projectContext + existingProjectSnapshot + learnedGuidance
   let specialistOutput = ''
   let staticAudit: AuditResult
@@ -942,7 +977,7 @@ async function runSpecialistPipeline(params: {
       ? `\n\n[Gate 1 Heuristic Warnings to Review]:\n- ${staticAudit.warnings.join('\n- ')}`
       : ''
 
-    const pamReview = await fetchFrontierAI(PROMPTS.PAM_AUDITOR_LOGIC, specialistOutput + warningContext)
+    const pamReview = await fetchFrontierAI(PROMPTS.PAM_AUDITOR_LOGIC, specialistOutput + warningContext, await resolveModelOverride('pam', settingsForModel, conversationId))
     const pamMsg = await addMessage(conversationId, 'pam', pamReview)
     newMessages.push(pamMsg)
 
@@ -1033,7 +1068,8 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
             { role: 'user' as const, content: 'That was not valid JSON. Respond with ONLY the JSON object -- no explanation, no markdown formatting, nothing else.' }
           ]
 
-      managerResponse = await fetchChatCompletion(PROMPTS.MICHAEL_MANAGER, historyForAttempt)
+      const settingsForMichael = await getSettings()
+      managerResponse = await fetchChatCompletion(PROMPTS.MICHAEL_MANAGER, historyForAttempt, await resolveModelOverride('michael', settingsForMichael, conversationId))
 
       try {
         // FIXED: if the model wraps its JSON in a markdown code fence
@@ -1299,14 +1335,17 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
 
     if (bothWereAttempted && succeededAgents.has('dwight') && succeededAgents.has('jim')) {
       // NEW: when a backend was built alongside the frontend, say plainly
-      // what that does and doesn't mean right now -- the live sandbox
-      // preview can only run the frontend, so the backend is real,
-      // reviewed, and written to disk correctly, but isn't part of the
-      // in-app preview itself until run separately.
+      // FIXED: confirmed real, stale text -- this message and comment
+      // predated the native execution engine entirely and were never
+      // updated once it landed. Native mode genuinely spawns both
+      // frontend and backend together as real Node processes (see
+      // sandbox:startNative) -- this was telling people to manually run
+      // a backend that the app is actually capable of running for them
+      // automatically, which is actively misleading, not just outdated.
       newMessages.push(await addMessage(
         conversationId,
         'michael',
-        `Both are done -- the frontend is what you'll see in Preview, and the backend is included under server/ in the same push, written and ready to run on its own (cd server && npm run dev). They aren't wired to run together inside the live preview yet, but both are real, reviewed code you can run side by side once pushed.`
+        `Both are done -- the backend is included under server/ in the same push. In Native mode, both should already be running together automatically (check the Container Output log below the preview -- you should see both [frontend] and [backend] activity). If the backend shows as offline in the preview, check that log for what actually happened; it's real, reviewed code either way, and cd server && npm run dev always works as a manual fallback if native mode isn't available.`
       ))
     } else if (bothWereAttempted) {
       // NEW: the honest partial-failure case -- one of the two didn't
@@ -1374,7 +1413,7 @@ typedIpc.handle('heal:invoke', async (_event: any, {
     const healingInstructions = `${previousInstructions}\n\nYour previous code passed review, but FAILED WHEN ACTUALLY RUN. Here is the real error:\n\n${errorLog}\n\nFix the specific problem causing this error. If this exact kind of mistake appears more than once in your code, fix EVERY occurrence, not just the one the error happened to stop at -- the error only shows where execution failed first, which may not be the only instance. If the error says a named export doesn't exist in a library (e.g. an icon name from lucide-react that isn't real), don't guess at another specific, similarly-plausible name -- replace it with a simple, extremely well-established name from that same library that you are highly confident actually exists, since a specific-sounding guess is exactly how this kind of error happens in the first place. Do not change anything else.`
 
     const settingsForHeal = await getSettings()
-    const specialistOutput = await fetchFrontierAI(targetPrompt, healingInstructions, resolveModelOverride(agentKey, settingsForHeal), shouldUseSearchGrounding(agentKey, settingsForHeal))
+    const specialistOutput = await fetchFrontierAI(targetPrompt, healingInstructions, await resolveModelOverride(agentKey, settingsForHeal, conversationId), shouldUseSearchGrounding(agentKey, settingsForHeal))
     const { staticAudit, stageableFiles } = auditAndStage(specialistOutput, agentKey)
 
     // A self-heal fix still has to clear Gate 1 like anything else -- a
@@ -1399,7 +1438,7 @@ typedIpc.handle('heal:invoke', async (_event: any, {
 
     // Re-run Pam too -- a runtime fix deserves the same review any other
     // change would get, not a pass just because it's a repair.
-    const pamReview = await fetchFrontierAI(PROMPTS.PAM_AUDITOR_LOGIC, specialistOutput)
+    const pamReview = await fetchFrontierAI(PROMPTS.PAM_AUDITOR_LOGIC, specialistOutput, await resolveModelOverride('pam', settingsForHeal, conversationId))
     const pamMsg = await addMessage(conversationId, 'pam', pamReview)
     newMessages.push(pamMsg)
 

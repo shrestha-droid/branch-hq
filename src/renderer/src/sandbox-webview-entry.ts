@@ -28,18 +28,6 @@ const FATAL_ERROR_PATTERNS = [
 // elsewhere in this codebase is ts-ignored rather than globally typed.
 const bridge = window.sandboxBridge
 
-// NEW: real, immediate diagnostic -- reports whether this page is
-// actually cross-origin-isolated (the hard prerequisite WebContainer
-// needs, since it depends on SharedArrayBuffer) the moment the page
-// loads, before any generation is even attempted. This is the fastest,
-// most reliable way to confirm or rule out an isolation-header problem
-// as the cause of a real hang -- checking this directly in Electron's
-// own webview devtools is possible but fiddly and version-dependent;
-// this puts the answer straight into the Container Output log instead,
-// where it's already being watched.
-bridge.reportLog(`[Diagnostic] crossOriginIsolated: ${typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'undefined'}`)
-bridge.reportLog(`[Diagnostic] SharedArrayBuffer available: ${typeof SharedArrayBuffer !== 'undefined'}`)
-
 // NEW: confirmed real need, not speculative -- without this, a genuine
 // WebContainer.boot() hang and normal (if slow) progress are
 // completely indistinguishable to anyone watching the log, forever.
@@ -52,7 +40,7 @@ async function getWebContainerWithTimeout(): Promise<Awaited<ReturnType<typeof g
   return Promise.race([
     getWebContainer(),
     new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`WebContainer did not finish booting within ${WEBCONTAINER_BOOT_TIMEOUT_MS / 1000}s -- this usually means the sandbox page isn't genuinely cross-origin-isolated (see the [Diagnostic] lines logged at page load) rather than it just being slow.`)), WEBCONTAINER_BOOT_TIMEOUT_MS)
+      setTimeout(() => reject(new Error(`WebContainer did not finish booting within ${WEBCONTAINER_BOOT_TIMEOUT_MS / 1000}s -- this usually means the sandbox page isn't genuinely cross-origin-isolated (see the [Diagnostic] lines logged just above this) rather than it just being slow.`)), WEBCONTAINER_BOOT_TIMEOUT_MS)
     )
   ])
 }
@@ -143,6 +131,16 @@ async function installDependencies(
 async function bootWebApp(files: Record<string, string>, runToken: number) {
   try {
     bridge.reportLog('System: Booting WebAssembly Container...')
+    // NEW: moved here deliberately, not at page-load time -- this
+    // exact reportLog call is proven to reach the Container Output
+    // log (it's the line right above), where the page-load-time
+    // version of this diagnostic never once appeared despite
+    // repeated confirmed-fresh test runs. Rather than chase why
+    // early messages specifically might be lost, placing the
+    // check at a point already proven to deliver sidesteps that
+    // question entirely and just gets the actual answer.
+    bridge.reportLog(`[Diagnostic] crossOriginIsolated: ${typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'undefined'}`)
+    bridge.reportLog(`[Diagnostic] SharedArrayBuffer available: ${typeof SharedArrayBuffer !== 'undefined'}`)
     const wc = await getWebContainerWithTimeout()
     if (runToken !== currentRunToken) return
 
@@ -192,6 +190,16 @@ async function bootWebApp(files: Record<string, string>, runToken: number) {
 async function runDocumentScript(files: Record<string, string>, runToken: number) {
   try {
     bridge.reportLog('System: Booting WebAssembly Container...')
+    // NEW: moved here deliberately, not at page-load time -- this
+    // exact reportLog call is proven to reach the Container Output
+    // log (it's the line right above), where the page-load-time
+    // version of this diagnostic never once appeared despite
+    // repeated confirmed-fresh test runs. Rather than chase why
+    // early messages specifically might be lost, placing the
+    // check at a point already proven to deliver sidesteps that
+    // question entirely and just gets the actual answer.
+    bridge.reportLog(`[Diagnostic] crossOriginIsolated: ${typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'undefined'}`)
+    bridge.reportLog(`[Diagnostic] SharedArrayBuffer available: ${typeof SharedArrayBuffer !== 'undefined'}`)
     const wc = await getWebContainerWithTimeout()
     if (runToken !== currentRunToken) return
 

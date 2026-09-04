@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { X, Save } from 'lucide-react'
+import ModelSelect from './ModelSelect'
 
 interface Settings {
   modelProvider: 'gemini' | 'local'
@@ -10,6 +11,15 @@ interface Settings {
   localEmbeddingModelName: string
   defaultTargetDir: string
   strictVerification: boolean
+  // NEW: per-agent global overrides -- empty means "inherit geminiModel
+  // above." A further, narrower per-chat layer also exists (the new
+  // "Model" button above each individual chat) that beats these when
+  // set for one specific conversation.
+  michaelModel: string
+  jimModel: string
+  dwightModel: string
+  pamModel: string
+  rileyModel: string
 }
 
 const ACCENT = {
@@ -26,10 +36,6 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   const [settings, setSettings] = useState<Settings | null>(null)
   const [isSaving, setIsSaving] = useState(false)
   const [saveStatus, setSaveStatus] = useState<string | null>(null)
-  // NEW: kept deliberately separate from the regular settings object --
-  // this goes through the secure credentials store, not the plain
-  // settings JSON. hasGithubToken never returns the actual token, only
-  // whether one is set.
   const [hasGithubToken, setHasGithubToken] = useState(false)
   const [githubTokenInput, setGithubTokenInput] = useState('')
   const [githubStatus, setGithubStatus] = useState<string | null>(null)
@@ -127,28 +133,49 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
             <>
               <div>
                 <label className="text-xs font-medium text-neutral-400 block mb-1.5">Gemini Model</label>
-                <input
-                  type="text"
+                <ModelSelect
                   value={settings.geminiModel}
-                  onChange={(e) => setSettings({ ...settings, geminiModel: e.target.value })}
-                  className={`w-full bg-black/30 border border-white/[0.06] rounded-md px-3 py-2 text-xs text-neutral-200 focus:${ACCENT.border} outline-none transition-colors`}
+                  onChange={(v) => setSettings({ ...settings, geminiModel: v })}
                 />
                 <p className="text-[11px] text-neutral-500 mt-1.5">
-                  Pick based on what you're about to build -- a faster/cheaper model for simple changes, a stronger one for a complex or high-stakes build.
+                  Pick based on what you're about to build -- a faster/cheaper model for simple changes, a stronger one for a complex or high-stakes build. "Latest Flash/Pro" always tracks Google's newest release automatically.
                 </p>
               </div>
               <div>
                 <label className="text-xs font-medium text-neutral-400 block mb-1.5">Fallback Model (optional)</label>
-                <input
-                  type="text"
+                <ModelSelect
                   value={settings.fallbackGeminiModel}
-                  onChange={(e) => setSettings({ ...settings, fallbackGeminiModel: e.target.value })}
-                  placeholder="e.g. a different Gemini model"
-                  className={`w-full bg-black/30 border border-white/[0.06] rounded-md px-3 py-2 text-xs text-neutral-200 focus:${ACCENT.border} outline-none transition-colors`}
+                  onChange={(v) => setSettings({ ...settings, fallbackGeminiModel: v })}
+                  inheritLabel="None -- disabled"
                 />
                 <p className="text-[11px] text-neutral-500 mt-1.5">
-                  If the model above is genuinely down (not just a bad response -- a real outage), this one is tried automatically before giving up. Leave blank to disable.
+                  If the model above is genuinely down (not just a bad response -- a real outage), this one is tried automatically before giving up.
                 </p>
+              </div>
+
+              <div className="pt-1">
+                <label className="text-xs font-medium text-neutral-400 block mb-1">Per-Agent Overrides (optional)</label>
+                <p className="text-[11px] text-neutral-500 mb-2.5 leading-relaxed">
+                  Leave any of these on "inherit" to use the primary model above for that agent. A cheaper/faster model for routing or QA, a stronger one for the specialist actually writing the code, or vice versa -- your call. These apply everywhere; a further per-chat override (in the chat itself) beats these for one specific conversation only.
+                </p>
+                <div className="flex flex-col gap-2.5">
+                  {([
+                    ['michaelModel', 'Michael (routing)'],
+                    ['jimModel', 'Jim (frontend)'],
+                    ['dwightModel', 'Dwight (backend)'],
+                    ['pamModel', 'Pam (QA review)'],
+                    ['rileyModel', 'Riley (documents)']
+                  ] as const).map(([field, label]) => (
+                    <div key={field}>
+                      <span className="text-[11px] text-neutral-400 block mb-1">{label}</span>
+                      <ModelSelect
+                        value={settings[field]}
+                        onChange={(v) => setSettings({ ...settings, [field]: v })}
+                        inheritLabel="Inherit primary model"
+                      />
+                    </div>
+                  ))}
+                </div>
               </div>
             </>
           ) : (
