@@ -105,6 +105,12 @@ const SURFACE = {
 export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenSettings, onActiveConversationChange }: ChatInterfaceProps) {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeConvoId, setActiveConvoId] = useState<string | null>(null)
+  // NEW: needed so the live message listener below (set up once, in a
+  // mount-level effect) always checks against the CURRENT active
+  // conversation, not whatever it was when the listener was first
+  // created -- the same closure-staleness reasoning as runIdRef
+  // elsewhere in this codebase.
+  const activeConvoIdRef = useRef<string | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [attachedFile, setAttachedFile] = useState<{ name: string; text: string; truncated: boolean } | null>(null)
@@ -126,7 +132,33 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
 
   useEffect(() => {
     onActiveConversationChange?.(activeConvoId)
+    activeConvoIdRef.current = activeConvoId
   }, [activeConvoId])
+
+  // NEW: confirmed real, long-standing UX gap -- the chat previously
+  // showed nothing at all while a multi-agent build ran, however long
+  // that legitimately took, indistinguishable from a hang the whole
+  // time. Each message now arrives here the instant it's actually
+  // created on the main-process side (see addMessageAndBroadcast in
+  // index.ts), not just once at the very end. The user's own message
+  // is skipped here specifically -- it's already shown optimistically
+  // the moment they hit send, in handleSend below, so appending it
+  // again here would show it twice.
+  useEffect(() => {
+    // @ts-ignore
+    const unsub = window.api.onChatMessageAdded((data: any) => {
+      if (data.conversationId !== activeConvoIdRef.current) return
+      if (data.message?.role === 'user') return
+      setMessages(prev => [...prev, data.message])
+      if (data.message?.role && ['michael', 'jim', 'dwight', 'pam', 'riley'].includes(data.message.role)) {
+        setAgentStatuses(prev => ({ ...prev, [data.message.role]: 'working' }))
+        setTimeout(() => {
+          setAgentStatuses(prev => ({ ...prev, [data.message.role]: 'done' }))
+        }, 1200)
+      }
+    })
+    return () => unsub?.()
+  }, [])
 
   const loadConversations = async () => {
     try {
@@ -276,6 +308,7 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
 
     const startLen = messages.length
     setMessages(prev => [...prev, { role: 'user', content: displayText }])
+    setAnimateFromIndex(startLen + 1)
 
     const activeConversation = conversations.find(c => c.id === activeConvoId)
     const isChatMode = activeConversation?.mode === 'chat'

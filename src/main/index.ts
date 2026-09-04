@@ -846,7 +846,7 @@ typedIpc.handle('workspace:index', async (_event: any, targetPath?: string) => {
 typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName, prompt }: { conversationId: string; agentName: 'jim' | 'dwight' | 'pam' | 'riley' | 'chat'; prompt: string }) => {
   const newMessages: any[] = []
   try {
-    const userMsg = await addMessage(conversationId, 'user', prompt)
+    const userMsg = await addMessageAndBroadcast(conversationId, 'user', prompt)
     newMessages.push(userMsg)
 
     if (agentName === 'chat') {
@@ -857,7 +857,7 @@ typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName,
         .map((m: any) => ({ role: (m.role === 'chat' ? 'assistant' : 'user') as 'user' | 'assistant', content: m.content }))
 
       const response = await fetchChatCompletion(PROMPTS.GENERAL_CHAT, history)
-      const chatMsg = await addMessage(conversationId, 'chat', response)
+      const chatMsg = await addMessageAndBroadcast(conversationId, 'chat', response)
       newMessages.push(chatMsg)
       return { success: true, messages: newMessages }
     }
@@ -886,11 +886,11 @@ typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName,
           conversationId, agentKey: agentName, attempt: 1,
           gate1Passed: false, perFile: staticAudit.perFile, pamVerdict: 'UNKNOWN'
         })
-        const errMsg = await addMessage(conversationId, 'error', `Gate 1 Hard Blockers Enforced:\n- ${staticAudit.blockers.join('\n- ')}`)
+        const errMsg = await addMessageAndBroadcast(conversationId, 'error', `Gate 1 Hard Blockers Enforced:\n- ${staticAudit.blockers.join('\n- ')}`)
         return { success: false, messages: [...newMessages, errMsg] }
       }
 
-      const agentMsg = await addMessage(conversationId, agentName, specialistOutput, prefixStageableFiles(stageableFiles, agentName))
+      const agentMsg = await addMessageAndBroadcast(conversationId, agentName, specialistOutput, prefixStageableFiles(stageableFiles, agentName))
       newMessages.push(agentMsg)
 
       // Recorded honestly: Gate 1 genuinely ran and passed, Pam's
@@ -915,15 +915,15 @@ typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName,
     if (agentName === 'pam') {
       const settingsForPam = await getSettings()
       const pamReview = await fetchFrontierAI(PROMPTS.PAM_AUDITOR_LOGIC, prompt, await resolveModelOverride('pam', settingsForPam, conversationId))
-      const pamMsg = await addMessage(conversationId, 'pam', pamReview)
+      const pamMsg = await addMessageAndBroadcast(conversationId, 'pam', pamReview)
       newMessages.push(pamMsg)
       return { success: true, messages: newMessages }
     }
 
-    const errMsg = await addMessage(conversationId, 'error', `Unrecognized direct chat target: ${agentName}`)
+    const errMsg = await addMessageAndBroadcast(conversationId, 'error', `Unrecognized direct chat target: ${agentName}`)
     return { success: false, messages: [...newMessages, errMsg] }
   } catch (error: any) {
-    const errMsg = await addMessage(conversationId, 'error', error.message || 'Chat error.')
+    const errMsg = await addMessageAndBroadcast(conversationId, 'error', error.message || 'Chat error.')
     return { success: false, messages: [...newMessages, errMsg] }
   }
 })
@@ -969,7 +969,7 @@ async function runSpecialistPipeline(params: {
 
     if (!staticAudit.passed) {
       if (round < MAX_AUTO_FIX_ROUNDS) {
-        newMessages.push(await addMessage(
+        newMessages.push(await addMessageAndBroadcast(
           conversationId,
           agentKey,
           `${specialistOutput}\n\n[Gate 1 blocked this attempt${roundTag} -- retrying automatically]`
@@ -981,7 +981,7 @@ async function runSpecialistPipeline(params: {
         conversationId, agentKey, attempt: round,
         gate1Passed: false, perFile: staticAudit.perFile, pamVerdict: 'UNKNOWN'
       })
-      const errMsg = await addMessage(conversationId, 'error', `Gate 1 Hard Blockers Enforced (after ${round} attempts):\n- ${staticAudit.blockers.join('\n- ')}`)
+      const errMsg = await addMessageAndBroadcast(conversationId, 'error', `Gate 1 Hard Blockers Enforced (after ${round} attempts):\n- ${staticAudit.blockers.join('\n- ')}`)
       newMessages.push(errMsg)
       return { success: false, auditId: null, specialistOutput, errorMessage: `Gate 1 blocked ${agentKey}'s output` }
     }
@@ -996,7 +996,7 @@ async function runSpecialistPipeline(params: {
     // self-heal, reachable through a third path this time. Prefixing
     // here too keeps this message's own record consistent with what
     // the real merged/staged result actually contains.
-    const agentMsg = await addMessage(conversationId, agentKey, specialistOutput + roundTag, prefixStageableFiles(stageableFiles, agentKey))
+    const agentMsg = await addMessageAndBroadcast(conversationId, agentKey, specialistOutput + roundTag, prefixStageableFiles(stageableFiles, agentKey))
     newMessages.push(agentMsg)
 
     const warningContext = staticAudit.warnings.length > 0
@@ -1004,7 +1004,7 @@ async function runSpecialistPipeline(params: {
       : ''
 
     const pamReview = await fetchFrontierAI(PROMPTS.PAM_AUDITOR_LOGIC, specialistOutput + warningContext, await resolveModelOverride('pam', settingsForModel, conversationId))
-    const pamMsg = await addMessage(conversationId, 'pam', pamReview)
+    const pamMsg = await addMessageAndBroadcast(conversationId, 'pam', pamReview)
     newMessages.push(pamMsg)
 
     const verdictMatch = pamReview.match(/PAM_VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/i)
@@ -1034,7 +1034,7 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
   const newMessages: any[] = []
   currentUsageConversationId = conversationId
   try {
-    const userMsg = await addMessage(conversationId, 'user', prompt)
+    const userMsg = await addMessageAndBroadcast(conversationId, 'user', prompt)
     newMessages.push(userMsg)
 
     let projectContext = ''
@@ -1110,7 +1110,7 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
         break
       } catch {
         if (jsonAttempt === MAX_ROUTING_JSON_RETRIES) {
-          const errMessage = await addMessage(conversationId, 'error', `Manager routing failed after ${MAX_ROUTING_JSON_RETRIES} attempts: malformed JSON response.`)
+          const errMessage = await addMessageAndBroadcast(conversationId, 'error', `Manager routing failed after ${MAX_ROUTING_JSON_RETRIES} attempts: malformed JSON response.`)
           return { success: false, messages: [...newMessages, errMessage] }
         }
         // fall through to the next attempt
@@ -1118,7 +1118,7 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
     }
 
     if (!decision) {
-      const errMessage = await addMessage(conversationId, 'error', "Manager routing failed: no valid decision produced.")
+      const errMessage = await addMessageAndBroadcast(conversationId, 'error', "Manager routing failed: no valid decision produced.")
       return { success: false, messages: [...newMessages, errMessage] }
     }
 
@@ -1126,7 +1126,7 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
     // no Pam. This is the whole reason one chatbox can now do both
     // casual conversation and real build requests without switching.
     if (decision.action === 'respond') {
-      const michaelMsg = await addMessage(conversationId, 'michael', decision.response || '(no response)')
+      const michaelMsg = await addMessageAndBroadcast(conversationId, 'michael', decision.response || '(no response)')
       newMessages.push(michaelMsg)
       return { success: true, messages: newMessages }
     }
@@ -1145,7 +1145,7 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
           : []
 
     if (rawDelegations.length === 0) {
-      const errMessage = await addMessage(conversationId, 'error', "Manager routing failed: delegate action had no assignment.")
+      const errMessage = await addMessageAndBroadcast(conversationId, 'error', "Manager routing failed: delegate action had no assignment.")
       return { success: false, messages: [...newMessages, errMessage] }
     }
 
@@ -1190,7 +1190,7 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
     const researchAnnounceNote = researchFindings.trim()
       ? `\n\n[Real research was gathered before this build -- see the specialists' own context for what was found.]`
       : ''
-    const michaelMsg = await addMessage(
+    const michaelMsg = await addMessageAndBroadcast(
       conversationId,
       'michael',
       rawDelegations.length > 1
@@ -1370,7 +1370,7 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
           healTargetAuditId = result.auditId
         }
       } catch (delegationError: any) {
-        newMessages.push(await addMessage(
+        newMessages.push(await addMessageAndBroadcast(
           conversationId,
           'error',
           `${delegation.assignTo}'s part of this build failed unexpectedly: ${delegationError.message || 'unknown error'}. Any other agent's work that already completed is still staged below.`
@@ -1380,7 +1380,7 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
     }
 
     if (Object.keys(mergedFiles).length === 0) {
-      const errMsg = await addMessage(conversationId, 'error', 'All delegated work failed Gate 1 -- nothing to stage.')
+      const errMsg = await addMessageAndBroadcast(conversationId, 'error', 'All delegated work failed Gate 1 -- nothing to stage.')
       return { success: false, messages: [...newMessages, errMsg] }
     }
 
@@ -1405,7 +1405,7 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
       // sandbox:startNative) -- this was telling people to manually run
       // a backend that the app is actually capable of running for them
       // automatically, which is actively misleading, not just outdated.
-      newMessages.push(await addMessage(
+      newMessages.push(await addMessageAndBroadcast(
         conversationId,
         'michael',
         `Both are done -- the backend is included under server/ in the same push. In Native mode, both should already be running together automatically (check the Container Output log below the preview -- you should see both [frontend] and [backend] activity). If the backend shows as offline in the preview, check that log for what actually happened; it's real, reviewed code either way, and cd server && npm run dev always works as a manual fallback if native mode isn't available.`
@@ -1417,7 +1417,7 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
       // for is actually staged.
       const missing = succeededAgents.has('dwight') ? 'frontend' : 'backend'
       const staged = succeededAgents.has('jim') ? 'frontend' : 'backend'
-      newMessages.push(await addMessage(
+      newMessages.push(await addMessageAndBroadcast(
         conversationId,
         'michael',
         `Only the ${staged} made it through review this time -- the ${missing} failed Gate 1 and isn't included in what's staged (see the error above). Ask me to retry it whenever you want another attempt.`
@@ -1441,7 +1441,7 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
       auditId: healTargetAuditId
     }
   } catch (error: any) {
-    const errMsg = await addMessage(conversationId, 'error', error.message || 'Fatal pipeline error.')
+    const errMsg = await addMessageAndBroadcast(conversationId, 'error', error.message || 'Fatal pipeline error.')
     return { success: false, messages: [...newMessages, errMsg] }
   }
 })
@@ -1462,7 +1462,7 @@ typedIpc.handle('heal:invoke', async (_event: any, {
   const newMessages: any[] = []
   try {
     if (attempt > MAX_SELF_HEAL_ROUNDS) {
-      const errMsg = await addMessage(
+      const errMsg = await addMessageAndBroadcast(
         conversationId,
         'error',
         `Self-healing gave up after ${MAX_SELF_HEAL_ROUNDS} attempts -- the code still doesn't run. This needs a manual look.`
@@ -1491,7 +1491,7 @@ typedIpc.handle('heal:invoke', async (_event: any, {
     // repair is not a shortcut around the same safety check everything
     // else goes through.
     if (!staticAudit.passed) {
-      const errMsg = await addMessage(
+      const errMsg = await addMessageAndBroadcast(
         conversationId,
         'error',
         `Self-healing attempt ${attempt} was rejected by Gate 1:\n- ${staticAudit.blockers.join('\n- ')}`
@@ -1499,7 +1499,7 @@ typedIpc.handle('heal:invoke', async (_event: any, {
       return { success: false, messages: [errMsg] }
     }
 
-    const agentMsg = await addMessage(
+    const agentMsg = await addMessageAndBroadcast(
       conversationId,
       agentKey,
       `${specialistOutput}\n\n[Self-healing attempt ${attempt} of ${MAX_SELF_HEAL_ROUNDS} -- fixing a real runtime failure]`,
@@ -1510,7 +1510,7 @@ typedIpc.handle('heal:invoke', async (_event: any, {
     // Re-run Pam too -- a runtime fix deserves the same review any other
     // change would get, not a pass just because it's a repair.
     const pamReview = await fetchFrontierAI(PROMPTS.PAM_AUDITOR_LOGIC, specialistOutput, await resolveModelOverride('pam', settingsForHeal, conversationId))
-    const pamMsg = await addMessage(conversationId, 'pam', pamReview)
+    const pamMsg = await addMessageAndBroadcast(conversationId, 'pam', pamReview)
     newMessages.push(pamMsg)
 
     // NEW: previously self-healing produced no audit record at all --
@@ -1537,7 +1537,7 @@ typedIpc.handle('heal:invoke', async (_event: any, {
 
     return { success: true, messages: newMessages, files: healedFiles, agentKey, instructions: previousInstructions, auditId: auditRecord.id }
   } catch (error: any) {
-    const errMsg = await addMessage(conversationId, 'error', error.message || 'Self-healing failed.')
+    const errMsg = await addMessageAndBroadcast(conversationId, 'error', error.message || 'Self-healing failed.')
     return { success: false, messages: [errMsg] }
   }
 })
@@ -2303,6 +2303,22 @@ function sendToRenderer(channel: string, payload: any) {
   if (mainWindowRef && !mainWindowRef.isDestroyed()) {
     mainWindowRef.webContents.send(channel, payload)
   }
+}
+
+// NEW: confirmed real, long-standing UX gap -- the entire multi-agent
+// pipeline previously ran as one single, opaque request-response.
+// Nothing reached the chat until EVERYTHING (every agent, every Gate 1
+// retry) had genuinely finished, which could legitimately take
+// minutes -- indistinguishable from a hang the whole time it ran. This
+// wraps addMessage to also push the new message to the renderer the
+// instant it's actually created, not just once at the very end. Every
+// addMessage call site in this file now goes through this wrapper
+// instead, so this one change covers all of them without needing to
+// touch each site's own logic individually.
+async function addMessageAndBroadcast(...args: Parameters<typeof addMessage>) {
+  const message = await addMessage(...args)
+  sendToRenderer('chat:message-added', { conversationId: args[0], message })
+  return message
 }
 
 function readJsonBody(req: http.IncomingMessage): Promise<any> {

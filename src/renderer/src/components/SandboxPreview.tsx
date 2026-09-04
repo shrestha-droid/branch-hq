@@ -61,6 +61,12 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
   const [healAttempt, setHealAttempt] = useState(0)
   const logsEndRef = useRef<HTMLDivElement>(null)
   const runIdRef = useRef<number>(0)
+  // NEW: mirrors backendReady state -- needed because the frontend-ready
+  // event handler is created once per run and would otherwise only ever
+  // see whatever backendReady was AT THAT MOMENT (React closure
+  // staleness), not any update backend-ready makes afterward. A ref
+  // always reflects the current value regardless of when it's read.
+  const backendReadyRef = useRef(false)
 
   const healingRef = useRef(false)
   const justHealedRef = useRef(false)
@@ -86,6 +92,16 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
   // though it was only ever a matter of a few more seconds.
   const [backendExpected, setBackendExpected] = useState(false)
   const [backendReady, setBackendReady] = useState(false)
+  // NEW: confirmed real, long-standing bug -- the frontend iframe used
+  // to show up and start running its own JS the moment Vite was ready,
+  // completely independent of whether a backend it needs was actually
+  // up yet. Whether the frontend's first real request succeeded was
+  // then entirely down to whatever retry logic the specialist happened
+  // to write that specific build -- not a guarantee, since it's
+  // generated fresh every time, not fixed infrastructure. This holds
+  // a frontend URL that arrived before the backend did, so it can be
+  // shown only once both are actually ready, instead of racing.
+  const [pendingFrontendUrl, setPendingFrontendUrl] = useState<string | null>(null)
   // NEW: set only for a backend-only native run (direct-chat-to-Dwight-
   // alone) -- distinct from `url`, which drives the actual iframe.
   // There's no visual preview for a backend-only response, so this is
@@ -452,6 +468,7 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
         setStatus('booting')
         setUrl(null)
         setBackendOnlyUrl(null)
+        setPendingFrontendUrl(null)
         setActiveMode('native')
         addLog('System: Starting native runtime (real Node process, both frontend and backend if present)...')
 
@@ -464,6 +481,7 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
         const hasBackendThisRun = Object.keys(files).some(f => f.startsWith('server/'))
         setBackendExpected(hasBackendThisRun)
         setBackendReady(!hasBackendThisRun)
+        backendReadyRef.current = !hasBackendThisRun
 
         // @ts-ignore
         const unsubLog = window.api.onSandboxLog((data: any) => {
@@ -474,6 +492,23 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
         const unsubFrontendReady = window.api.onSandboxFrontendReady((data: any) => {
           if (data.runId !== runId || !mounted || currentRunId !== runIdRef.current) return
           frontendReadyReceived = true
+          // FIXED: confirmed real, long-standing bug -- this used to
+          // show the iframe unconditionally the moment Vite was ready,
+          // with zero regard for whether a backend it needs was
+          // actually up yet. The frontend's own first request (its
+          // useEffect firing the instant the page loads) would then
+          // race the backend's own startup, and whether that first
+          // request succeeded was entirely down to whatever retry logic
+          // the specialist happened to generate that specific build --
+          // not a guarantee, since it's written fresh every time, not
+          // fixed infrastructure. Holding the URL here until the
+          // backend is actually confirmed closes the race at the
+          // source, regardless of what the generated retry code does.
+          if (hasBackendThisRun && !backendReadyRef.current) {
+            setPendingFrontendUrl(data.url)
+            addLog('System: Frontend is ready -- waiting for the backend to finish starting before showing the preview, so its first real request doesn\'t race the backend\'s own startup.')
+            return
+          }
           setUrl(data.url)
           setStatus('ready')
           reportExecutionSuccess()
@@ -483,6 +518,18 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
           if (data.runId !== runId || !mounted) return
           addLog(`System: Backend confirmed running at ${data.url}`)
           setBackendReady(true)
+          backendReadyRef.current = true
+          // If the frontend was already ready and held back waiting on
+          // this, show it now -- both are genuinely up together, not
+          // one racing ahead of the other.
+          setPendingFrontendUrl((pending) => {
+            if (pending) {
+              setUrl(pending)
+              setStatus('ready')
+              reportExecutionSuccess()
+            }
+            return null
+          })
         })
         // NEW: fires only for a backend-only run (a direct-chat-to-
         // Dwight-alone response, correctly identified as backend-only
@@ -510,6 +557,24 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
           // triggers self-healing.
           if (data.source === 'frontend' || data.source === 'system') {
             attemptSelfHeal(`Native process failed (${data.source}): ${data.message}`)
+          }
+          // FIXED: confirmed real gap in the backend-readiness gating
+          // above -- if the backend fails outright rather than just
+          // being slow, a frontend held back waiting for it would
+          // otherwise wait forever for a backend that's already
+          // confirmed dead, which is worse than the race this fix was
+          // meant to close. Show it anyway; a backend-dependent frontend
+          // failing its own requests is a real, visible, honest state
+          // -- an indefinite blank "Awaiting server URL..." is not.
+          if (data.source === 'backend') {
+            setPendingFrontendUrl((pending) => {
+              if (pending) {
+                setUrl(pending)
+                setStatus('ready')
+                reportExecutionSuccess()
+              }
+              return null
+            })
           }
         })
 

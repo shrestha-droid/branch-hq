@@ -80,6 +80,11 @@ contextBridge.exposeInMainWorld('api', {
   // signals arrive over time, not as a single request/response. Each
   // listener returns an unsubscribe function so the caller can clean up
   // when it stops caring (switching runs, unmounting).
+  onChatMessageAdded: (callback: (data: { conversationId: string; message: any }) => void) => {
+    const listener = (_event: any, data: any) => callback(data)
+    ipcRenderer.on('chat:message-added', listener)
+    return () => ipcRenderer.removeListener('chat:message-added', listener)
+  },
   onSandboxLog: (callback: (data: { runId: string; source: string; line: string }) => void) => {
     const listener = (_event: any, data: any) => callback(data)
     ipcRenderer.on('sandbox:log', listener)
@@ -198,6 +203,7 @@ declare global {
       onPairingCancelledByPeer: (callback: (data: { deviceId: string; deviceName: string }) => void) => () => void;
       startNativeSandbox: (runId: string, files: Record<string, string>) => Promise<{ success: boolean; error?: string }>;
       stopNativeSandbox: (runId: string) => Promise<{ success: boolean }>;
+      onChatMessageAdded: (callback: (data: { conversationId: string; message: any }) => void) => () => void;
       onSandboxLog: (callback: (data: { runId: string; source: string; line: string }) => void) => () => void;
       onSandboxFrontendReady: (callback: (data: { runId: string; url: string; port: number }) => void) => () => void;
       onSandboxBackendReady: (callback: (data: { runId: string; url: string; port: number }) => void) => () => void;
