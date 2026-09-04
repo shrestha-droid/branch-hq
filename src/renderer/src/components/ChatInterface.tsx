@@ -10,8 +10,6 @@ interface Message {
   files?: Record<string, string>
 }
 
-// Shared between the static and animated renderers so they never drift
-// out of sync with each other.
 const markdownComponents = {
   p: ({ node, ...props }: any) => <p className="mb-4 last:mb-0" {...props} />,
   code: ({ node, inline, ...props }: any) =>
@@ -25,11 +23,6 @@ const markdownComponents = {
   )
 }
 
-// NEW: reveals text progressively instead of pasting the whole response
-// at once. Duration is bounded (0.3s-1.8s) regardless of message length,
-// so a short reply doesn't feel instant and a long one doesn't take
-// forever -- only used on messages that just arrived, never on history
-// being reopened.
 function TypewriterMarkdown({ text }: { text: string }) {
   const [shown, setShown] = useState('')
 
@@ -68,15 +61,7 @@ interface GeneratedResult {
   conversationId: string
   agentKey?: 'jim' | 'dwight' | 'riley'
   instructions?: string
-  // NEW: a suggested, filesystem-safe per-project folder name, derived
-  // from the conversation's own title -- lets each project land in its
-  // own folder automatically instead of everything colliding into the
-  // same static target folder every time.
   suggestedFolderName?: string
-  // NEW: the audit record's real id for this generation, so the
-  // sandbox can report back "this actually ran successfully" once it
-  // genuinely happens, upgrading the record from Pam's opinion to
-  // confirmed execution.
   auditId?: string | null
 }
 
@@ -87,38 +72,17 @@ function slugifyForFolder(title: string, conversationId: string): string {
     .replace(/^-+|-+$/g, '')
     .slice(0, 40)
     .replace(/-+$/g, '')
-  // A short id suffix keeps two similarly-titled conversations (two
-  // different "hello"s, say) from landing in the exact same folder --
-  // practical uniqueness without needing a perfect one.
   const suffix = conversationId.replace(/-/g, '').slice(0, 6)
   return (slug || 'project') + '-' + suffix
 }
 
 interface ChatInterfaceProps {
   onCodeGenerated?: (result: GeneratedResult) => void
-  // NEW: called whenever the active conversation has nothing staged of
-  // its own -- switching to it (or starting a new one) must not leave a
-  // PREVIOUS conversation's sandbox sitting open, showing content that
-  // no longer belongs to what's on screen.
   onClearPreview?: () => void
-  // NEW: Settings now lives here, in the sidebar's own header, instead
-  // of floating alone in the corner of the whole window.
   onOpenSettings?: () => void
-  // NEW: surfaces which conversation is currently open the moment it
-  // changes -- created, selected, or deleted-and-fallen-back-to. This is
-  // genuinely known here well before any message is ever sent (the
-  // instant a conversation exists in the sidebar), unlike App.tsx's own
-  // healContext, which previously only ever learned a conversation id
-  // AFTER a successful generation. Lets a parent feature (like Project
-  // Knowledge) be usable from the moment a conversation is open, the
-  // same way Claude Projects' own project-level context works, instead
-  // of being gated behind a build having already happened.
   onActiveConversationChange?: (conversationId: string | null) => void
 }
 
-// Plain-word note: this is the only place the "brand red" lives, as one
-// small set of values, so it's easy to find and change later without
-// hunting through every className.
 const ACCENT = {
   text: 'text-[#409cff]',
   bg: 'bg-[#0a84ff]',
@@ -127,13 +91,6 @@ const ACCENT = {
   border: 'border-[#0a84ff]/30',
 }
 
-// NEW: real macOS system-gray values (systemGray6/5 dark-mode
-// equivalents), not arbitrary dark grays -- the same layered surface
-// levels Apple's own apps use, so panels read as genuinely elevated
-// rather than just a different flat shade. -apple-system renders real
-// San Francisco on macOS directly from the OS's own installed font,
-// with no font files embedded here at all -- falls back cleanly
-// everywhere else.
 const SURFACE = {
   base: '#1c1c1e',
   sidebar: 'backdrop-blur-2xl bg-[#1c1c1e]/70',
@@ -150,53 +107,23 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
   const [activeConvoId, setActiveConvoId] = useState<string | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
-  // NEW: real file upload -- scoped to genuinely text-extractable
-  // documents (PDF, plain text/markdown/csv/json). Image upload would
-  // need real vision-model support, a separate, larger piece of work.
   const [attachedFile, setAttachedFile] = useState<{ name: string; text: string; truncated: boolean } | null>(null)
   const [isExtracting, setIsExtracting] = useState(false)
   const [attachError, setAttachError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [isTyping, setIsTyping] = useState(false)
-  // NEW: real status per agent, driven by actual pipeline activity --
-  // not randomized or purely decorative. Honest about its own
-  // resolution: Michael is marked working the moment a message is sent
-  // (he genuinely always processes first), and whichever specialists
-  // actually appear in the response are marked working, then briefly
-  // done, once it arrives. This is real participation data, not a
-  // granular live step-by-step feed of every internal pipeline stage --
-  // that would need the backend to stream progress events, a separate,
-  // bigger piece not built here.
   const [agentStatuses, setAgentStatuses] = useState<Record<string, 'idle' | 'working' | 'done'>>({})
-  // NEW: which agent (if any) is the current direct-chat target,
-  // selected by clicking their character. null means normal mode --
-  // Michael routes as he always has.
   const [directTarget, setDirectTarget] = useState<'jim' | 'dwight' | 'pam' | 'riley' | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
-  // NEW: the conversation list is already long enough from testing alone
-  // that scanning it by eye is a real annoyance -- this filters by title.
   const [searchQuery, setSearchQuery] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
-  // NEW: needed to measure actual scroll position -- the old effect had
-  // no way to tell "user scrolled up to read something" from "brand new
-  // message just arrived," so it force-scrolled to bottom every single
-  // time either changed, overriding anyone reading earlier messages.
   const messagesContainerRef = useRef<HTMLDivElement>(null)
-  // NEW: index boundary for the typewriter effect -- only messages at or
-  // past this index (the ones that just arrived) animate in; reopening
-  // or switching conversations never re-types old history.
   const [animateFromIndex, setAnimateFromIndex] = useState<number | null>(null)
 
   useEffect(() => {
     loadConversations()
   }, [])
 
-  // NEW: fires whenever activeConvoId actually changes, regardless of
-  // which code path changed it (initial load, manual selection, a new
-  // conversation being created, or falling back after a delete) -- a
-  // single effect here is more robust than calling the callback
-  // manually at each of those separate call sites, since it can't drift
-  // out of sync if another one is added later.
   useEffect(() => {
     onActiveConversationChange?.(activeConvoId)
   }, [activeConvoId])
@@ -218,17 +145,12 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
 
   const createNewConversation = async () => {
     try {
-      // One conversation type now -- Michael himself decides per message
-      // whether to chat or build something, so there's no mode to choose
-      // when starting a new one.
       // @ts-ignore
       const newConvo = await window.api.createConversation('pipeline')
       setConversations(prev => [newConvo, ...prev])
       setActiveConvoId(newConvo.id)
       setMessages([])
       setAnimateFromIndex(null)
-      // A brand new conversation never has anything staged -- don't leave
-      // whatever was open from wherever the user just was.
       onClearPreview?.()
     } catch (err) {
       console.error('Failed to create conversation:', err)
@@ -243,10 +165,23 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
       const data = await window.api.getConversation(id)
       if (data && data.messages) {
         setMessages(data.messages)
-        const lastMsgWithFiles = [...data.messages].reverse().find(m => m.files && Object.keys(m.files).length > 0)
-        if (lastMsgWithFiles?.files && onCodeGenerated) {
+        // FIXED: confirmed real bug -- this used to scan data.messages
+        // in reverse for the last one with a `files` field and treat
+        // THAT as the finished result. That's an individual agent's own
+        // message, not necessarily the true final merged/staged output
+        // -- and confirmed real failure: if this conversation's build
+        // was a multi-agent one and got reselected while a LATER agent
+        // was still mid-retry, the FIRST agent's already-saved message
+        // would be found instead, silently loading an incomplete,
+        // in-progress snapshot as if it were done. Reading from
+        // stagedFilesStore.ts instead -- written once, only when a
+        // pipeline genuinely completes -- gives a real answer instead
+        // of a guess.
+        // @ts-ignore
+        const staged = await window.api.getStagedFiles(id)
+        if (staged.success && staged.files && Object.keys(staged.files).length > 0 && onCodeGenerated) {
           onCodeGenerated({
-            files: lastMsgWithFiles.files,
+            files: staged.files,
             conversationId: id,
             suggestedFolderName: slugifyForFolder(data.conversation?.title || '', id)
           })
@@ -286,10 +221,6 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
   }
 
   useEffect(() => {
-    // FIXED: previously scrolled to bottom unconditionally on every
-    // change, which meant scrolling up to read an earlier message got
-    // silently undone the instant anything else updated. Now it only
-    // follows along if the user was already near the bottom.
     const container = messagesContainerRef.current
     if (!container) return
     const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight
@@ -299,16 +230,6 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
     }
   }, [messages, isTyping])
 
-  // NEW: reads the picked file's real bytes in the renderer (a plain
-  // browser API, no Node needed for this part) and sends them to the
-  // main process for actual text extraction.
-  // NEW: shared between the large empty-state office and the compact
-  // strip shown once a conversation is active, so both behave
-  // identically. Michael isn't a direct-chat target himself -- there's
-  // no real "bypass Michael's routing to talk to Michael" concept,
-  // since he IS the router. Clicking him is how you explicitly return
-  // to normal mode. Every other character toggles the same way as
-  // before: click again to deselect.
   const handleCharacterClick = (agentId: string) => {
     if (agentId === 'michael') {
       setDirectTarget(null)
@@ -342,11 +263,6 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
   const handleSend = async () => {
     if (!input.trim() || isTyping || !activeConvoId) return
     const promptText = input.trim()
-    // NEW: the displayed chat bubble stays clean (just what the user
-    // typed, plus a small visible marker) -- the FULL extracted document
-    // text goes into a separate string used only for the actual API
-    // call, so a long PDF's contents never clutter the visible
-    // transcript the way the raw prompt would.
     const attachmentForApi = attachedFile
       ? `[Attached file: ${attachedFile.name}${attachedFile.truncated ? ' -- truncated' : ''}]\n${attachedFile.text}\n\n`
       : ''
@@ -358,23 +274,13 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
     setIsTyping(true)
     setAgentStatuses({ [directTarget || 'michael']: 'working' })
 
-    // NEW: captured before the optimistic append below, so this marks
-    // exactly where the newly-arriving messages will start once the
-    // response replaces the array -- the boundary the typewriter effect
-    // uses to know what's new vs. old history.
     const startLen = messages.length
     setMessages(prev => [...prev, { role: 'user', content: displayText }])
 
-    // Kept only so any conversation created before this change (back when
-    // "Chat" was picked as a separate mode) still works correctly. Every
-    // new conversation is 'pipeline' now, and goes through Michael, who
-    // decides for himself whether to just talk or delegate.
     const activeConversation = conversations.find(c => c.id === activeConvoId)
     const isChatMode = activeConversation?.mode === 'chat'
 
     try {
-      // NEW: a selected character takes priority over normal routing --
-      // this is the actual point of clicking one.
       const response = directTarget
         // @ts-ignore
         ? await window.api.invokeAgent(activeConvoId, directTarget, apiPromptText)
@@ -388,9 +294,6 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
         setMessages(response.messages)
         setAnimateFromIndex(startLen + 1)
 
-        // NEW: real participation, not decoration -- whichever agents
-        // actually posted a message in this response are the ones shown
-        // as having worked. A brief "done" pulse, then back to idle.
         const involvedAgents = new Set(
           response.messages.slice(startLen)
             .map((m: any) => m.role)
@@ -402,7 +305,6 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
         }, 1200)
         setTimeout(() => setAgentStatuses({}), 3200)
 
-        // CRITICAL: Pass generated files up to App.tsx to trigger the sandbox split-pane
         if (response.files && Object.keys(response.files).length > 0 && onCodeGenerated) {
           const activeTitle = conversations.find(c => c.id === activeConvoId)?.title || promptText
           onCodeGenerated({
@@ -433,9 +335,6 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
 
   return (
     <div className="flex h-full relative bg-[#1c1c1e] text-[#f5f5f7] overflow-hidden" style={{ fontFamily: SURFACE.fontStack }}>
-      {/* Sidebar -- real vibrancy, translucent and blurred, the way
-          Finder or Messages actually render their sidebar, not a flat
-          panel with a different shade. */}
       <div className={`${sidebarOpen ? 'w-64' : 'w-0'} transition-all duration-300 ${SURFACE.sidebar} border-r ${SURFACE.hairline} flex flex-col shrink-0 overflow-hidden z-20`}>
         <div className={`p-4 border-b ${SURFACE.hairline} flex items-center justify-between`}>
           <span className={`text-sm font-medium ${SURFACE.textSecondary}`}>Chats</span>
@@ -491,9 +390,7 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
         </div>
       </div>
 
-      {/* Main Chat View */}
       <div className="flex-1 flex flex-col h-full relative overflow-hidden bg-[#1c1c1e]">
-        {/* Top toggle -- small, precise, native-feeling control */}
         <div className="absolute top-4 left-4 z-30">
           <button
             onClick={() => setSidebarOpen(!sidebarOpen)}
@@ -503,9 +400,6 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
           </button>
         </div>
 
-        {/* NEW: the office scene -- persistent, not just shown at empty
-            state, since the whole point is seeing real activity while
-            it's actually happening. */}
         {messages.length > 0 && (
           <div className="pt-14 pb-1 shrink-0 border-b border-white/[0.06] bg-black/20">
             <OfficeScene
@@ -559,18 +453,11 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
                           {msg.role}
                         </div>
                         {msg.files && Object.keys(msg.files).length > 0 ? (
-                          // NEW: a finished piece of work gets a short card
-                          // pointing at the panel, instead of the whole
-                          // file being pasted into the chat a second time.
                           <button
                             onClick={() => msg.files && activeConvoId && onCodeGenerated?.({
                               files: msg.files,
                               conversationId: activeConvoId,
                               agentKey: (msg.role === 'jim' || msg.role === 'dwight' || msg.role === 'riley') ? msg.role : undefined
-                              // Note: re-opening an older card doesn't carry the
-                              // original instructions with it (only new messages
-                              // do), so self-healing isn't available on a
-                              // reopened result -- only on one just generated.
                             })}
                             className="w-full flex items-center gap-3 bg-black/20 hover:bg-black/30 border border-white/[0.06] rounded-xl px-4 py-3 text-left transition-colors"
                           >

@@ -146,6 +146,7 @@ contextBridge.exposeInMainWorld('api', {
   // an integrity hash proving the report wasn't edited after generation.
   exportAuditReport: (conversationId: string) => ipcRenderer.invoke('audit:export', conversationId),
   exportClientSummary: (conversationId: string) => ipcRenderer.invoke('audit:exportClientSummary', conversationId),
+  getStagedFiles: (conversationId: string) => ipcRenderer.invoke('stagedFiles:get', conversationId),
   getClientFacts: (conversationId: string) => ipcRenderer.invoke('clientFacts:get', conversationId),
   setClientFacts: (conversationId: string, facts: string) => ipcRenderer.invoke('clientFacts:set', { conversationId, facts }),
   getModelOverrides: (conversationId: string) => ipcRenderer.invoke('modelOverrides:get', conversationId),
@@ -216,6 +217,7 @@ declare global {
       updateSettings: (partial: Record<string, any>) => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; fallbackGeminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string; michaelModel: string; jimModel: string; dwightModel: string; pamModel: string; rileyModel: string; enableWebSearch: boolean; masterProfile: string; relayServerUrl: string; strictVerification: boolean }>;
       exportAuditReport: (conversationId: string) => Promise<{ success: boolean; report?: string; integrityHash?: string; generatedAt?: string; error?: string }>;
       exportClientSummary: (conversationId: string) => Promise<{ success: boolean; summary?: string; generatedAt?: string; error?: string }>;
+      getStagedFiles: (conversationId: string) => Promise<{ success: boolean; files?: Record<string, string> | null; error?: string }>;
       getClientFacts: (conversationId: string) => Promise<{ success: boolean; facts?: string; error?: string }>;
       setClientFacts: (conversationId: string, facts: string) => Promise<{ success: boolean; error?: string }>;
       getModelOverrides: (conversationId: string) => Promise<{ success: boolean; overrides?: Record<string, string>; error?: string }>;

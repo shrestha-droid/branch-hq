@@ -52,6 +52,7 @@ import { auditAndStage, prefixStageableFiles } from './extraction'
 import { looksTransient } from './resilience'
 import { detectVerticalStarterKit } from './verticals'
 import { getClientFacts, setClientFacts } from './clientFactsStore'
+import { getStagedFiles, setStagedFiles } from './stagedFilesStore'
 import { getConversationModelOverrides, setConversationModelOverrides } from './modelOverridesStore'
 
 dotenv.config()
@@ -744,6 +745,18 @@ typedIpc.handle('audit:exportClientSummary', async (_event: any, conversationId:
 // NEW: verified real facts about this project's actual client --
 // entered once, injected into every generation from then on. See
 // clientFactsStore.ts for the full reasoning.
+// NEW: what a conversation should actually be reopened with -- see
+// stagedFilesStore.ts's own note. Returns null (not an error) when
+// nothing has ever successfully completed for this conversation yet.
+typedIpc.handle('stagedFiles:get', async (_event: any, conversationId: string) => {
+  try {
+    const files = await getStagedFiles(conversationId)
+    return { success: true, files }
+  } catch (err: any) {
+    return { success: false, error: err.message }
+  }
+})
+
 typedIpc.handle('clientFacts:get', async (_event: any, conversationId: string) => {
   try {
     const facts = await getClientFacts(conversationId)
@@ -888,7 +901,10 @@ typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName,
         gate1Passed: true, perFile: staticAudit.perFile, pamVerdict: 'UNKNOWN'
       })
 
-      return { success: true, messages: newMessages, files: prefixStageableFiles(stageableFiles, agentName), agentKey: agentName, instructions: prompt, auditId: auditRecord.id }
+      const directChatFiles = prefixStageableFiles(stageableFiles, agentName)
+      if (directChatFiles) await setStagedFiles(conversationId, directChatFiles)
+
+      return { success: true, messages: newMessages, files: directChatFiles, agentKey: agentName, instructions: prompt, auditId: auditRecord.id }
     }
 
     // NEW: direct chat with Pam -- a genuinely different use case from
@@ -970,7 +986,17 @@ async function runSpecialistPipeline(params: {
       return { success: false, auditId: null, specialistOutput, errorMessage: `Gate 1 blocked ${agentKey}'s output` }
     }
 
-    const agentMsg = await addMessage(conversationId, agentKey, specialistOutput + roundTag, stageableFiles)
+    // FIXED: confirmed real bug -- the "Generated N files" card in
+    // ChatInterface.tsx reads directly from THIS message's own stored
+    // files (msg.files), not from the outer merge loop's mergedFiles.
+    // Storing Dwight's raw, unprefixed stageableFiles here meant
+    // clicking his own card loaded his files into the Staged panel
+    // exactly as extracted -- no server/ prefix -- which is the same
+    // misidentification bug fixed earlier for direct-chat and
+    // self-heal, reachable through a third path this time. Prefixing
+    // here too keeps this message's own record consistent with what
+    // the real merged/staged result actually contains.
+    const agentMsg = await addMessage(conversationId, agentKey, specialistOutput + roundTag, prefixStageableFiles(stageableFiles, agentKey))
     newMessages.push(agentMsg)
 
     const warningContext = staticAudit.warnings.length > 0
@@ -1229,90 +1255,127 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
         delegation.assignTo === 'Riley' ? 'riley' :
         'jim'
 
-      // FIXED: this used to run for every agent, including Riley. Riley
-      // produces a standalone document script -- there's no legitimate
-      // reason for him to see React/Express source from some other,
-      // unrelated project sitting in the target folder. Confirmed real
-      // failure pattern: after several code projects had been built, a PPT
-      // prompt sharing a word with an old project's filename (e.g. "hero
-      // section" matching a leftover Hero.tsx) fed that file's actual
-      // source code into Riley's instructions, producing broken output.
-      // Only Jim and Dwight legitimately need to see what already exists.
-      const existingProjectSnapshot = agentKey === 'riley'
-        ? ''
-        : await getExistingProjectSnapshot(settingsForSnapshot.defaultTargetDir, prompt)
+      // FIXED: confirmed real gap -- the previous try/catch only wrapped
+      // the runSpecialistPipeline call and its result-handling, NOT this
+      // delegation's own setup code above it (existingProjectSnapshot,
+      // crossAgentNote, verticalNote). A real failure ruled out
+      // existingProjectSnapshot specifically as the likely cause (Dwight
+      // runs the identical call and always succeeds), but there's no
+      // reason to leave ANY part of one delegation's processing outside
+      // this protection when the whole point is that nothing here should
+      // ever be able to silently take out the rest of the turn. Wrapping
+      // from the top closes every remaining gap at once, and the
+      // TRACE line below means the very next occurrence will show
+      // exactly how far this delegation got before whatever happens,
+      // happens -- turning "still a mystery" into a specific line number
+      // to look at, on the first try.
+      try {
+        // FIXED: this used to run for every agent, including Riley. Riley
+        // produces a standalone document script -- there's no legitimate
+        // reason for him to see React/Express source from some other,
+        // unrelated project sitting in the target folder. Confirmed real
+        // failure pattern: after several code projects had been built, a PPT
+        // prompt sharing a word with an old project's filename (e.g. "hero
+        // section" matching a leftover Hero.tsx) fed that file's actual
+        // source code into Riley's instructions, producing broken output.
+        // Only Jim and Dwight legitimately need to see what already exists.
+        const existingProjectSnapshot = agentKey === 'riley'
+          ? ''
+          : await getExistingProjectSnapshot(settingsForSnapshot.defaultTargetDir, prompt)
 
-      // NEW: when Jim is running alongside a just-built Dwight backend in
-      // this same turn, tell him plainly what real endpoints now exist --
-      // otherwise he has no way to know a real backend exists at all, and
-      // (reasonably) falls back to mock/hardcoded data in React state,
-      // which is real code but not what "build this with a working
-      // backend" actually asked for.
-      const crossAgentNote = (agentKey === 'jim' && dwightRawOutput)
-        ? `\n\n[A real backend was just built for this same request, and will run at http://localhost:${NATIVE_BACKEND_PORT} -- call its actual endpoints via fetch() using that exact base URL, do not invent mock or hardcoded data. Here is exactly what Dwight wrote:]\n${dwightRawOutput}`
-        : ''
+        // NEW: when Jim is running alongside a just-built Dwight backend in
+        // this same turn, tell him plainly what real endpoints now exist --
+        // otherwise he has no way to know a real backend exists at all, and
+        // (reasonably) falls back to mock/hardcoded data in React state,
+        // which is real code but not what "build this with a working
+        // backend" actually asked for.
+        // FIXED: confirmed real, unbounded risk -- this used to inject
+        // Dwight's ENTIRE raw output verbatim, no limit at all. For a real
+        // multi-file backend (routes, middleware, schemas, server setup)
+        // that's easily 10,000+ characters, stacked on top of Jim's own
+        // already-large prompt (his extensive design guidance) plus every
+        // other context note (client facts, vertical guidance, research,
+        // master profile) -- a genuine, real way for the combined request
+        // to grow large enough to risk a hard failure on Jim's call
+        // specifically.
+        const DWIGHT_CONTEXT_CHAR_LIMIT = 6000
+        const dwightContextForJim = dwightRawOutput && dwightRawOutput.length > DWIGHT_CONTEXT_CHAR_LIMIT
+          ? dwightRawOutput.slice(0, DWIGHT_CONTEXT_CHAR_LIMIT) + '\n\n[...truncated -- the real backend has more routes/files than shown here; call whatever endpoint shape the request logically needs at the base URL below, following the same patterns shown above]'
+          : dwightRawOutput
+        const crossAgentNote = (agentKey === 'jim' && dwightContextForJim)
+          ? `\n\n[A real backend was just built for this same request, and will run at http://localhost:${NATIVE_BACKEND_PORT} -- call its actual endpoints via fetch() using that exact base URL, do not invent mock or hardcoded data. Here is what Dwight wrote:]\n${dwightContextForJim}`
+          : ''
 
-      // NEW: vertical starter-kit guidance -- see verticals.ts. Only for
-      // Jim/Dwight (the data-model/structure-bearing specialists); Riley
-      // produces standalone documents, which this category of guidance
-      // doesn't apply to.
-      const verticalNote = (detectedVertical && (agentKey === 'jim' || agentKey === 'dwight'))
-        ? `\n\n${detectedVertical.guidance}`
-        : ''
+        // NEW: vertical starter-kit guidance -- see verticals.ts. Only for
+        // Jim/Dwight (the data-model/structure-bearing specialists); Riley
+        // produces standalone documents, which this category of guidance
+        // doesn't apply to.
+        const verticalNote = (detectedVertical && (agentKey === 'jim' || agentKey === 'dwight'))
+          ? `\n\n${detectedVertical.guidance}`
+          : ''
 
-      const result = await runSpecialistPipeline({
-        conversationId,
-        agentKey,
-        baseInstructions: delegation.instructions + crossAgentNote + verticalNote + clientFactsNote + masterProfileNote + (agentKey !== 'riley' ? researchNote : ''),
-        projectContext,
-        existingProjectSnapshot,
-        newMessages
-      })
+        const result = await runSpecialistPipeline({
+          conversationId,
+          agentKey,
+          baseInstructions: delegation.instructions + crossAgentNote + verticalNote + clientFactsNote + masterProfileNote + (agentKey !== 'riley' ? researchNote : ''),
+          projectContext,
+          existingProjectSnapshot,
+          newMessages
+        })
 
-      if (!result.success) {
-        // One delegation failing (e.g. Gate 1 blocked it after every
-        // retry) doesn't silently discard the other -- report the
-        // failure but let any earlier-completed delegation's files still
-        // reach the user rather than losing real, passed work.
-        continue
-      }
-
-      // FIXED: previously added unconditionally whenever result.success
-      // was true. Confirmed real gap: runSpecialistPipeline can return
-      // success: true with stageableFiles undefined -- e.g. when
-      // extraction yields zero files (see auditAndStage's own fix for
-      // the underlying cause) in a way Gate 1 didn't itself block.
-      // succeededAgents is what the completion message below trusts to
-      // mean "this agent's code is genuinely staged" -- gating it on
-      // stageableFiles directly, the same condition the merge below
-      // already requires, closes that gap instead of trusting
-      // result.success alone.
-      if (result.stageableFiles) {
-        succeededAgents.add(agentKey)
-      }
-
-      if (agentKey === 'dwight') {
-        dwightRawOutput = result.specialistOutput
-      }
-
-      if (result.stageableFiles) {
-        // The frontend is what's actually live-previewed in the sandbox,
-        // so its files stay at the root exactly as before. Anything else
-        // (a backend built alongside it) is real, reviewed code that
-        // still needs to reach disk correctly -- namespaced under its own
-        // folder so it never collides with the frontend's files, written
-        // together on the same Push to Local rather than requiring a
-        // second manual request.
-        const prefix = agentKey === 'jim' ? '' : `${agentKey === 'dwight' ? 'server' : 'docs'}/`
-        for (const [path, content] of Object.entries(result.stageableFiles)) {
-          mergedFiles[`${prefix}${path}`] = content
+        if (!result.success) {
+          // One delegation failing (e.g. Gate 1 blocked it after every
+          // retry) doesn't silently discard the other -- report the
+          // failure but let any earlier-completed delegation's files still
+          // reach the user rather than losing real, passed work.
+          continue
         }
-      }
 
-      if (agentKey === 'jim' || (!healTargetAgentKey)) {
-        healTargetAgentKey = agentKey
-        healTargetInstructions = delegation.instructions
-        healTargetAuditId = result.auditId
+        // FIXED: previously added unconditionally whenever result.success
+        // was true. Confirmed real gap: runSpecialistPipeline can return
+        // success: true with stageableFiles undefined -- e.g. when
+        // extraction yields zero files (see auditAndStage's own fix for
+        // the underlying cause) in a way Gate 1 didn't itself block.
+        // succeededAgents is what the completion message below trusts to
+        // mean "this agent's code is genuinely staged" -- gating it on
+        // stageableFiles directly, the same condition the merge below
+        // already requires, closes that gap instead of trusting
+        // result.success alone.
+        if (result.stageableFiles) {
+          succeededAgents.add(agentKey)
+        }
+
+        if (agentKey === 'dwight') {
+          dwightRawOutput = result.specialistOutput
+        }
+
+        if (result.stageableFiles) {
+          // Jim's files stay at the root -- that's what Vite serves
+          // directly in native mode. Dwight's (and Riley's) get
+          // namespaced under their own folder so they never collide with
+          // Jim's, AND so sandbox:startNative's own hasBackend check
+          // (files.some(f => f.startsWith('server/'))) can tell a real
+          // backend is present and needs its own spawn alongside the
+          // frontend -- both genuinely run together in native mode, not
+          // just written to disk for someone to run manually later.
+          const prefix = agentKey === 'jim' ? '' : `${agentKey === 'dwight' ? 'server' : 'docs'}/`
+          for (const [path, content] of Object.entries(result.stageableFiles)) {
+            mergedFiles[`${prefix}${path}`] = content
+          }
+        }
+
+        if (agentKey === 'jim' || (!healTargetAgentKey)) {
+          healTargetAgentKey = agentKey
+          healTargetInstructions = delegation.instructions
+          healTargetAuditId = result.auditId
+        }
+      } catch (delegationError: any) {
+        newMessages.push(await addMessage(
+          conversationId,
+          'error',
+          `${delegation.assignTo}'s part of this build failed unexpectedly: ${delegationError.message || 'unknown error'}. Any other agent's work that already completed is still staged below.`
+        ))
+        continue
       }
     }
 
@@ -1360,6 +1423,14 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
         `Only the ${staged} made it through review this time -- the ${missing} failed Gate 1 and isn't included in what's staged (see the error above). Ask me to retry it whenever you want another attempt.`
       ))
     }
+
+    // FIXED: confirmed real bug -- this is the one place that should
+    // ever be treated as "the finished result" for this conversation.
+    // See stagedFilesStore.ts's own note: without this, reselecting a
+    // conversation mid-generation (or on app reload) had no reliable
+    // record to load from and would guess using an individual agent's
+    // own, possibly-still-in-progress message instead.
+    await setStagedFiles(conversationId, mergedFiles)
 
     return {
       success: true,
@@ -1461,7 +1532,10 @@ typedIpc.handle('heal:invoke', async (_event: any, {
     // checks any other generation has to. Local-only, see lessonsStore.ts.
     await recordLesson(agentKey, errorLog)
 
-    return { success: true, messages: newMessages, files: prefixStageableFiles(stageableFiles, agentKey), agentKey, instructions: previousInstructions, auditId: auditRecord.id }
+    const healedFiles = prefixStageableFiles(stageableFiles, agentKey)
+    if (healedFiles) await setStagedFiles(conversationId, healedFiles)
+
+    return { success: true, messages: newMessages, files: healedFiles, agentKey, instructions: previousInstructions, auditId: auditRecord.id }
   } catch (error: any) {
     const errMsg = await addMessage(conversationId, 'error', error.message || 'Self-healing failed.')
     return { success: false, messages: [errMsg] }
