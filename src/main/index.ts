@@ -12,6 +12,7 @@ import {
 } from './devicePairing'
 import { startDiscovery, stopDiscovery, listDiscoveredDevices } from './deviceDiscovery'
 import { spawn, execFile, ChildProcess } from 'child_process'
+import * as crypto from 'crypto'
 import { promisify } from 'util'
 import * as net from 'net'
 import * as os from 'os'
@@ -452,6 +453,7 @@ ALWAYS declare file paths at the very start of the code blocks (e.g., // File: s
 CRITICAL: src/App.tsx must always use a DEFAULT export (export default function App() ...), never a named export (export function App() ...) -- the app's entry point imports it as a default import and will fail to load otherwise.
 CRITICAL: You are ONLY allowed to use 'react', 'lucide-react', 'canvas-confetti', and 'framer-motion' as external dependencies. Do not import anything else. For real typography (not just system fonts), you may still add a single <link> or @import for a Google Font in your CSS -- this does not require an npm package and is not a dependency violation.
 CRITICAL, avoiding invented business facts: if the request includes a [VERIFIED CLIENT FACTS] context block, that is ground truth about a real business -- use it exactly. For any business-specific detail NOT covered there (a specific price, address, phone number, business hours, testimonial, or similar), whether or not that context block was provided at all, never invent a plausible-sounding specific value -- use an obviously-a-placeholder label instead (e.g. "[Add your price here]", "Contact us for details", "[Business Hours]"), so it's visibly unfinished rather than presented as if it were real. This does NOT apply to generic structural/demo content that isn't tied to a real business fact -- example rows in a table, placeholder task titles, sample data illustrating a UI's shape are fine and expected.
+CRITICAL, confirmed real failure: if a real backend was built alongside you (you'll be told its base URL directly if so), and you need to check whether it's reachable yet -- to show a connection status, or before making a real request -- poll GET /api/health specifically, the one endpoint every backend in this system always includes for exactly this purpose. Never invent your own ad-hoc check against some other path; nothing guarantees any other path exists, and a confirmed real failure came from exactly this -- a frontend stuck showing "backend offline" forever because it was checking a path nothing was ever built to answer, even though the backend was genuinely running. Space retries with a real, growing delay (starting at roughly 1-2 seconds, backing off from there) -- never a tight loop with no delay between attempts; a backend that's still starting up does not need to be asked dozens of times per second.
 
 DESIGN APPROACH -- follow this before writing any code:
 Act like a design lead giving every request its own distinct visual identity, never a template. In a short comment block at the top of your first file, plan: 2-4 named colors as hex values, two font roles (one characterful display face used with restraint, one plain body face), and one signature visual element specific to what's actually being built. Then build exactly that plan -- don't let the code drift back to defaults.
@@ -502,6 +504,7 @@ CRITICAL: You are ONLY allowed to use 'express', 'cors', 'bcryptjs', 'jsonwebtok
 CRITICAL: your server MUST listen on process.env.PORT, with a fallback only for standalone use outside this system (e.g. const PORT = process.env.PORT || 8787; app.listen(PORT, ...)). Never hardcode a specific port number as the only option -- the actual port is assigned by the system running this, not chosen by you.
 CRITICAL, avoiding invented business facts: if the request includes a [VERIFIED CLIENT FACTS] context block, that is ground truth about a real business -- use it exactly, including in seed/default data. For any business-specific detail NOT covered there (a specific price, address, phone number, business hours, or similar), whether or not that context block was provided at all, never invent a plausible-sounding specific value in seed data or defaults -- use an obviously-a-placeholder label instead. This does NOT apply to generic structural/demo content unrelated to a real business fact -- seed rows that only illustrate the data shape (e.g. a generic example task title) are fine and expected.
 CRITICAL, confirmed real and repeated failure: whenever the request needs a login endpoint, it needs a matching registration (create account / sign up) endpoint in the SAME response -- never build login alone. A login endpoint with no way to ever create the account it's checking against is not a working feature; it's a dead end the very first time anyone actually tries to use it, since there is no account in the database to log into yet. If the request only explicitly asks for "login," treat that as shorthand for "a working authentication system" and build both /register (or /signup) and /login together, with the same validation, hashing, and error-handling rigor for each. The only exception is when the request is explicitly and unambiguously about adding login to a system that already has real, existing user accounts (e.g. a follow-up request in the same project, where account creation was already built in an earlier response) -- in every other case, build both.
+CRITICAL, confirmed real failure: ALWAYS include a plain GET /api/health endpoint that returns 200 with a small JSON body (e.g. { status: 'ok' }) -- no auth, no dependencies on other setup, always the very first route registered. The frontend built alongside you needs one reliable, predictable place to check whether the backend is actually reachable yet, and it can only poll that reliably if it exists at the exact same path in every single backend you build, not a path invented fresh each time. Without this, a real, confirmed failure occurs: the frontend has nothing guaranteed to check, so its own connectivity check either hits a path that was never built (a permanent, incorrect "backend offline" state even once the backend is genuinely running) or polls something too aggressively while guessing. This is the one endpoint that must never vary in name or path.
 
 APPROACH -- follow this before writing any code:
 Act like a senior backend engineer reviewing a junior's first draft, not someone who just wants the endpoint to respond. Before writing code, briefly consider: what actually goes wrong with this request in the real world -- bad input, a resource that doesn't exist, a duplicate submission, no auth -- and what response shape communicates that clearly, not just "it works" for the one happy path.
@@ -1770,6 +1773,80 @@ async function killWhateverIsOnPort(port: number): Promise<void> {
   }
 }
 
+// NEW: shared dependency cache, keyed by exact package.json content --
+// completely additive alongside the existing per-run scratch directory
+// install below, never a replacement for it. Confirmed real, significant
+// cost: every single native boot ran a full npm install from a
+// genuinely empty directory, even when regenerating the exact same
+// conversation with an identical dependency set moments earlier -- the
+// scratch directory is deliberately unique per run (runId-keyed, see
+// stopNativeRun's own reasoning elsewhere), so npm never had any way to
+// know nothing had actually changed. A cache MISS (a genuinely new or
+// different dependency set) falls straight through to the exact same
+// npm install this file has always run, completely unchanged -- that
+// path is untouched. A cache HIT (the overwhelmingly common case,
+// since most generated frontends and backends share a near-identical
+// base dependency set) symlinks an already-installed node_modules into
+// place instead, in a fraction of a second instead of tens of seconds.
+const depInstallInFlight = new Map<string, Promise<void>>()
+
+async function installWithCache(scratchDir: string, packageJsonContent: string, namespace: 'frontend' | 'backend', log: (line: string) => void): Promise<void> {
+  const hash = crypto.createHash('sha256').update(packageJsonContent).digest('hex').slice(0, 16)
+  const cacheDir = path.join(os.tmpdir(), 'branch-hq-dep-cache', namespace, hash)
+  const cachedNodeModules = path.join(cacheDir, 'node_modules')
+  const targetPath = path.join(scratchDir, 'node_modules')
+
+  const linkIn = async () => {
+    try {
+      await fs.symlink(cachedNodeModules, targetPath, 'dir')
+    } catch {
+      // Symlinks can fail in some environments (permissions, filesystem
+      // type) -- a real copy is slower than a symlink but still far
+      // faster than a fresh npm install, and this should never block
+      // the run entirely over it.
+      await fs.cp(cachedNodeModules, targetPath, { recursive: true })
+    }
+  }
+
+  try {
+    await fs.access(cachedNodeModules)
+    log('Reusing already-installed dependencies (identical package.json seen before)...')
+    await linkIn()
+    return
+  } catch {
+    // Not cached yet -- fall through to a real install below.
+  }
+
+  // De-duplicates concurrent identical installs (e.g. two builds landing
+  // on the same dependency set around the same time) rather than racing
+  // two npm processes over the same cache directory.
+  const existing = depInstallInFlight.get(hash)
+  if (existing) {
+    log('Waiting for an identical in-progress dependency install to finish...')
+    await existing
+    await linkIn()
+    return
+  }
+
+  const installPromise = (async () => {
+    await fs.mkdir(cacheDir, { recursive: true })
+    await fs.writeFile(path.join(cacheDir, 'package.json'), packageJsonContent, 'utf-8')
+    await new Promise<void>((resolve, reject) => {
+      const install = spawn('npm', ['install'], { cwd: cacheDir, shell: true, env: cleanInstallEnv() })
+      install.stdout.on('data', (d: Buffer) => log(d.toString()))
+      install.stderr.on('data', (d: Buffer) => log(d.toString()))
+      install.on('exit', (code: number | null) => code === 0 ? resolve() : reject(new Error(`${namespace} npm install exited with code ${code}`)))
+    })
+  })()
+  depInstallInFlight.set(hash, installPromise)
+  try {
+    await installPromise
+  } finally {
+    depInstallInFlight.delete(hash)
+  }
+  await linkIn()
+}
+
 async function writeFilesToScratch(scratchDir: string, files: Record<string, string>): Promise<void> {
   for (const [relativePath, content] of Object.entries(files)) {
     const absolutePath = path.join(scratchDir, relativePath)
@@ -1888,12 +1965,7 @@ typedIpc.handle('sandbox:startNative', async (event: any, { runId, files }: { ru
     // -------- Frontend (only if one genuinely exists) --------
     if (hasFrontend) {
     send('sandbox:log', { source: 'frontend', line: 'Installing frontend dependencies...' })
-    await new Promise<void>((resolve, reject) => {
-      const install = spawn('npm', ['install'], { cwd: scratchDir, shell: true, env: cleanInstallEnv() })
-      install.stdout.on('data', (d: Buffer) => send('sandbox:log', { source: 'frontend', line: d.toString() }))
-      install.stderr.on('data', (d: Buffer) => send('sandbox:log', { source: 'frontend', line: d.toString() }))
-      install.on('exit', (code: number | null) => code === 0 ? resolve() : reject(new Error(`Frontend npm install exited with code ${code}`)))
-    })
+    await installWithCache(scratchDir, frontendFiles['package.json'], 'frontend', (line) => send('sandbox:log', { source: 'frontend', line }))
 
     const frontendDev = spawn('npm', ['run', 'dev'], { cwd: scratchDir, shell: true })
     run.frontend = frontendDev
@@ -1946,12 +2018,7 @@ typedIpc.handle('sandbox:startNative', async (event: any, { runId, files }: { ru
     if (hasBackend) {
       const serverDir = path.join(scratchDir, 'server')
       send('sandbox:log', { source: 'backend', line: 'Installing backend dependencies...' })
-      await new Promise<void>((resolve, reject) => {
-        const install = spawn('npm', ['install'], { cwd: serverDir, shell: true, env: cleanInstallEnv() })
-        install.stdout.on('data', (d: Buffer) => send('sandbox:log', { source: 'backend', line: d.toString() }))
-        install.stderr.on('data', (d: Buffer) => send('sandbox:log', { source: 'backend', line: d.toString() }))
-        install.on('exit', (code: number | null) => code === 0 ? resolve() : reject(new Error(`Backend npm install exited with code ${code}`)))
-      })
+      await installWithCache(serverDir, backendFiles['package.json'], 'backend', (line) => send('sandbox:log', { source: 'backend', line }))
 
       // FIXED: see currentBackendProcess's own note above -- always kill
       // whatever's currently holding the fixed backend port before
