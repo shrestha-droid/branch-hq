@@ -1,0 +1,12 @@
+{
+  "name": "branch-hq-pairing-relay",
+  "version": "1.0.0",
+  "description": "Standalone relay server for Branch HQ worldwide device pairing. Deployed separately from the main Branch HQ Electron app.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

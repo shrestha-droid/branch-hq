@@ -44,6 +44,23 @@ export interface AppSettings {
   // per prompt), so it shouldn't turn on silently just because a
   // feature exists.
   enableWebSearch: boolean
+  // NEW: describes who's actually running Branch HQ -- the person or
+  // agency itself, not any one project. Deliberately global, unlike
+  // Project Knowledge (clientFactsStore.ts), which is scoped per
+  // conversation on purpose since different projects have different
+  // clients. This has exactly one value, always the same regardless of
+  // which conversation is open -- who you are doesn't change project to
+  // project. Injected into every generation across every conversation,
+  // the same way a person's own standing context should be.
+  masterProfile: string
+  // NEW: opt-in worldwide (non-LAN) device pairing. Empty by default --
+  // until this is explicitly set to a real relay server's wss:// URL,
+  // worldwide pairing is entirely unavailable and nothing about it is
+  // ever attempted; LAN pairing (which needs no external server at all)
+  // is completely unaffected either way. See relay-server/README.md for
+  // what running one actually involves and, just as importantly, what
+  // it can and cannot see.
+  relayServerUrl: string
   // NEW: off by default on purpose. When on, nothing is treated as
   // finished until the sandbox has actually run it successfully -- the
   // preview auto-boots the moment code is staged instead of waiting for
@@ -84,6 +101,8 @@ function defaults(): AppSettings {
     defaultTargetDir: process.env.DEFAULT_TARGET_DIR || path.join(app.getPath('home'), 'branch-hq-output'),
     dwightModel: process.env.DWIGHT_MODEL || '',
     enableWebSearch: false,
+    masterProfile: '',
+    relayServerUrl: process.env.RELAY_SERVER_URL || '',
     strictVerification: false
   }
 }

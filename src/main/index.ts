@@ -2,14 +2,17 @@ import { app, BrowserWindow, ipcMain, session, shell, dialog } from 'electron'
 import * as path from 'path'
 import { pathToFileURL } from 'url'
 import * as http from 'http'
+import WebSocket from 'ws'
 import { getDeviceIdentity, setDeviceName, signPayload, verifySignature } from './deviceIdentity'
 import {
   getTrustedPeers, isPeerTrusted, addTrustedPeer, removeTrustedPeer,
   createPendingIncomingRequest, getPendingIncomingRequest, consumePendingIncomingRequest, listPendingIncomingRequests,
-  createPendingOutgoingRequest, getPendingOutgoingRequest, markOutgoingAwaitingLocalConfirmation, consumePendingOutgoingRequest
+  createPendingOutgoingRequest, getPendingOutgoingRequest, markOutgoingAwaitingLocalConfirmation, consumePendingOutgoingRequest,
+  createPairingInvite, consumeAndValidateInvite
 } from './devicePairing'
 import { startDiscovery, stopDiscovery, listDiscoveredDevices } from './deviceDiscovery'
 import { spawn, execFile, ChildProcess } from 'child_process'
+import { promisify } from 'util'
 import * as net from 'net'
 import * as os from 'os'
 import * as fs from 'fs/promises'
@@ -44,7 +47,8 @@ import { getSettings, updateSettings } from './settingsStore'
 import { recordAudit, generateAuditReport, generateClientSummary, markExecutionVerified } from './auditStore'
 import { recordLesson, getLearnedGuidance } from './lessonsStore'
 import { setGithubToken, hasGithubToken, clearGithubToken, getGithubTokenForInternalUse } from './credentialsStore'
-import { runMechanicalAudit, AuditResult } from './gate1'
+import { AuditResult } from './gate1'
+import { auditAndStage, prefixStageableFiles } from './extraction'
 import { looksTransient } from './resilience'
 import { detectVerticalStarterKit } from './verticals'
 import { getClientFacts, setClientFacts } from './clientFactsStore'
@@ -395,328 +399,6 @@ async function fetchChatCompletion(systemPrompt: string, history: ChatTurn[]): P
   return countingProvider.generate(systemPrompt, history)
 }
 
-// 2. Gate 1 (deterministic security linter) -- logic now lives in
-// ./gate1.ts so it can be unit tested without booting Electron.
-
-// 3. Robust Artifact Extractor with Path Normalization
-function normalizeFilePath(rawPath: string): string {
-  let filename = rawPath.trim()
-  if (
-    (filename.endsWith('.tsx') || filename.endsWith('.ts')) &&
-    !filename.startsWith('src/') &&
-    filename !== 'vite.config.ts'
-  ) {
-    filename = `src/${filename}`
-  }
-  return filename
-}
-
-function extractCodeBlocks(markdown: string): Record<string, string> {
-  const files: Record<string, string> = {}
-
-  const regex = /```(?:\w+)?\s+([\w./-]+)\n([\s\S]*?)```/g
-  let match: RegExpExecArray | null
-
-  while ((match = regex.exec(markdown)) !== null) {
-    const filename = normalizeFilePath(match[1])
-    files[filename] = match[2].trim()
-  }
-
-  const genericRegex = /```(?:\w+)?\s*\n([\s\S]*?)```/g
-  while ((match = genericRegex.exec(markdown)) !== null) {
-    const content = match[1].trim()
-    const firstLine = content.split('\n')[0].trim()
-
-    // FIXED: previously required the ENTIRE first line to be nothing but
-    // the file-path comment (anchored with $ at the end). Confirmed real
-    // failure: when a model puts the start of another comment on that
-    // same line right after the path (e.g. "// File: src/App.tsx /*
-    // DESIGN PLAN: ..."), the old regex failed to match at all -- zero
-    // files got extracted, Gate 1 trivially "passed" on an empty file
-    // set, and everything silently vanished with nothing staged, even
-    // though Pam had reviewed and approved the real underlying code (she
-    // sees the raw text, not the failed extraction). No longer anchored
-    // to end-of-line -- just capture the path and stop there.
-    const commentMatch = firstLine.match(/^(?:\/\/|#|\/\*)\s*(?:(?:file|filename):\s*)?([\w./-]+)/i)
-
-    if (commentMatch) {
-      const filename = normalizeFilePath(commentMatch[1])
-      if (!files[filename]) {
-        // NEW: don't just drop the whole first line -- keep whatever
-        // followed the matched path on that same line (like the start of
-        // a design-plan comment) instead of losing it, which would
-        // otherwise leave a dangling, unopened closing marker later in
-        // the file.
-        const matchEndIndex = (commentMatch.index ?? 0) + commentMatch[0].length
-        const restOfFirstLine = firstLine.slice(matchEndIndex).trim()
-        const remainingLines = content.split('\n').slice(1).join('\n')
-        const cleanContent = (restOfFirstLine ? restOfFirstLine + '\n' : '') + remainingLines
-        files[filename] = cleanContent.trim()
-      }
-    }
-  }
-
-  return files
-}
-
-// 4. Virtual Environment Scaffolder
-function findBackendEntryFile(files: Record<string, string>): string | null {
-  const listenFile = Object.entries(files).find(([, content]) => /\.listen\s*\(/.test(content))
-  if (listenFile) return listenFile[0]
-  const tsFile = Object.keys(files).find(f => f.endsWith('.ts'))
-  return tsFile ?? null
-}
-
-function injectFrontendBoilerplate(extractedFiles: Record<string, string>): Record<string, string> {
-  const hasAppComponent = Object.keys(extractedFiles).includes('src/App.tsx')
-
-  // NEW: don't just assume App.tsx used a default export -- check. A
-  // named export (`export function App()`) is equally valid TypeScript,
-  // it just needs a different import line. Detecting this instead of
-  // hardcoding one assumption means a mismatch here can't crash the
-  // sandbox even if the specialist doesn't follow the prompt instruction.
-  const appFileContent = extractedFiles['src/App.tsx'] || ''
-  const appUsesDefaultExport = /export\s+default\b/.test(appFileContent)
-  const appImportLine = appUsesDefaultExport
-    ? `import App from './App'`
-    : `import { App } from './App'`
-
-  return {
-    ...extractedFiles,
-    'package.json': JSON.stringify({
-      name: "branch-hq-preview",
-      type: "module",
-      scripts: {
-        dev: "vite",
-        build: "tsc && vite build",
-        preview: "vite preview"
-      },
-      dependencies: {
-        "react": "^18.2.0",
-        "react-dom": "^18.2.0",
-        "lucide-react": "^0.263.1",
-        "canvas-confetti": "^1.9.2",
-        "framer-motion": "^11.0.0"
-      },
-      devDependencies: {
-        "@vitejs/plugin-react": "^4.2.1",
-        "vite": "^5.1.0",
-        "typescript": "^5.2.2",
-        "@types/react": "^18.2.66",
-        "@types/react-dom": "^18.2.22",
-        "@types/canvas-confetti": "^1.6.4",
-        "tailwindcss": "^3.4.1",
-        "postcss": "^8.4.35",
-        "autoprefixer": "^10.4.17"
-      }
-    }, null, 2),
-    'vite.config.ts': `import { defineConfig } from 'vite'\nimport react from '@vitejs/plugin-react'\n\nexport default defineConfig({\n  plugins: [react()],\n  server: { port: 3000, strictPort: false }\n})`,
-    'tailwind.config.js': `/** @type {import('tailwindcss').Config} */\nexport default {\n  content: [\n    "./index.html",\n    "./src/**/*.{js,ts,jsx,tsx}",\n  ],\n  theme: {\n    extend: {},\n  },\n  plugins: [],\n}`,
-    'postcss.config.js': `export default {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n}`,
-    // NEW: confirmed real, long-standing bug -- the build script below
-    // runs `tsc`, but no tsconfig.json was ever generated for it to
-    // use. With no config and nothing explicit to compile, tsc's real,
-    // documented fallback is to print its own help/usage text and exit
-    // with an error -- exactly what a real Vercel deploy surfaced,
-    // since this is the first time the build script (as opposed to
-    // `npm run dev`, which never touches tsc at all) had ever actually
-    // been exercised. Standard Vite+React+TS config, matching what
-    // `npm create vite` itself generates. noEmit is correct here --
-    // Vite's own build step does the actual bundling; tsc's only job
-    // in "tsc && vite build" is type-checking.
-    'tsconfig.json': JSON.stringify({
-      compilerOptions: {
-        target: "ES2020",
-        useDefineForClassFields: true,
-        lib: ["ES2020", "DOM", "DOM.Iterable"],
-        module: "ESNext",
-        skipLibCheck: true,
-        moduleResolution: "bundler",
-        allowImportingTsExtensions: true,
-        resolveJsonModule: true,
-        isolatedModules: true,
-        noEmit: true,
-        jsx: "react-jsx",
-        strict: true,
-        esModuleInterop: true
-      },
-      include: ["src"]
-    }, null, 2),
-    'index.html': `<!DOCTYPE html>\n<html lang="en">\n  <head>\n    <meta charset="UTF-8" />\n    <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n    <title>Sandbox Preview</title>\n  </head>\n  <body>\n    <div id="root"></div>\n    <script>\n      // NEW: confirmed real gap -- errors happening inside this page\n      // after it loads (a bad import, a runtime exception) were never\n      // detected at all, meaning self-healing had zero chance to ever\n      // see or fix them. Registered before the app's own module below,\n      // so it catches even module-load-time errors, not just ones\n      // after React mounts.\n      window.addEventListener('error', function(e) {\n        try {\n          window.parent.postMessage({ type: 'branch-hq-runtime-error', message: (e.error && e.error.stack) || e.message || String(e) }, '*')\n        } catch (err) {}\n      })\n      window.addEventListener('unhandledrejection', function(e) {\n        try {\n          window.parent.postMessage({ type: 'branch-hq-runtime-error', message: 'Unhandled promise rejection: ' + ((e.reason && e.reason.stack) || e.reason || String(e)) }, '*')\n        } catch (err) {}\n      })\n    </script>\n    <script type="module" src="/src/main.tsx"></script>\n  </body>\n</html>`,
-    'src/main.tsx': hasAppComponent
-      ? `import React from 'react'\nimport ReactDOM from 'react-dom/client'\n${appImportLine}\nimport './assets/main.css'\n\nReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(\n  <React.StrictMode>\n    <App />\n  </React.StrictMode>\n)`
-      : `import './assets/main.css'\n\n// No src/App.tsx in this response -- likely a utility/non-visual file\n// (constants, types, helpers), not a renderable component. Nothing to\n// mount here; see the Code tab for what was actually generated.\nconst root = document.getElementById('root')\nif (root) {\n  root.innerHTML = '<div style="font-family: monospace; padding: 2rem; color: #888;">No root App component in this response. Check the Code tab.</div>'\n}`,
-    'src/assets/main.css': `@tailwind base;\n@tailwind components;\n@tailwind utilities;\n`,
-    // NEW: confirmed real failure -- without this, a deploy tool like
-    // Vercel or git has no way to know to skip node_modules, causing a
-    // multi-GIGABYTE upload attempt instead of a normal few-MB one, since
-    // it has nothing telling it those files aren't meant to be tracked.
-    '.gitignore': `node_modules\ndist\n.env\n.env.local\n*.log\n`
-  }
-}
-
-function injectBackendBoilerplate(extractedFiles: Record<string, string>): Record<string, string> {
-  const entryFile = findBackendEntryFile(extractedFiles)
-  return {
-    ...extractedFiles,
-    'package.json': JSON.stringify({
-      name: "branch-hq-preview-backend",
-      type: "module",
-      scripts: {
-        dev: entryFile
-          ? `tsx watch ${entryFile}`
-          : `echo "No runnable entry file found (no .listen() call detected in any generated file)" && exit 1`
-      },
-      dependencies: {
-        "express": "^4.19.2",
-        "cors": "^2.8.5",
-        "bcryptjs": "^2.4.3",
-        "jsonwebtoken": "^9.0.2",
-        "zod": "^3.23.8",
-        "dotenv": "^16.4.5",
-        "lowdb": "^7.0.1",
-        "express-rate-limit": "^7.2.0"
-      },
-      devDependencies: {
-        "typescript": "^5.4.5",
-        "tsx": "^4.7.0",
-        "@types/express": "^4.17.21",
-        "@types/cors": "^2.8.17",
-        "@types/jsonwebtoken": "^9.0.6",
-        "@types/bcryptjs": "^2.4.6"
-      }
-    }, null, 2),
-    // NEW: real encryption-at-rest for lowdb, available whenever a
-    // generation's data is sensitive (accounts, PII, anything a real
-    // business wouldn't want sitting in a plain-text file). Injected as
-    // deterministic, pre-written boilerplate -- not something Dwight is
-    // asked to write correctly from scratch every time. AES-256-GCM has
-    // real, easy-to-get-wrong failure modes (IV reuse, mishandled auth
-    // tags) that are exactly the class of subtle mistake an LLM can
-    // introduce under prompt pressure, the same failure pattern already
-    // seen elsewhere this session -- security-critical infrastructure
-    // code belongs here, reviewed once, not regenerated per request.
-    // Uses only Node's built-in 'crypto' module -- no new dependency,
-    // stays within Dwight's existing allowlist.
-    // Deliberately NOT forced onto every generation via Gate 1: whether
-    // a given app's data actually warrants encryption is a judgment
-    // call Gate 1 isn't well-positioned to make (a public read-only
-    // catalog with zero PII genuinely doesn't need it) -- see Dwight's
-    // prompt for when he's instructed to reach for this. That means
-    // this is currently a real capability, not yet a hard guarantee the
-    // way the plaintext-password check is -- worth knowing honestly.
-    'src/encryptedAdapter.ts': `import * as fs from 'fs'
-import * as crypto from 'crypto'
-
-const ALGORITHM = 'aes-256-gcm'
-
-// Real key from a real environment variable is what a genuine
-// deployment should use. The local-file fallback below exists so a
-// fresh generation can boot and actually work in this sandbox without
-// requiring manual setup first -- it is explicitly a dev-only default,
-// not something to rely on once this leaves the sandbox.
-function getEncryptionKey(): Buffer {
-  const envKey = process.env.DB_ENCRYPTION_KEY
-  if (envKey) {
-    return crypto.createHash('sha256').update(envKey).digest()
-  }
-  const keyPath = '.db-key'
-  if (fs.existsSync(keyPath)) {
-    return Buffer.from(fs.readFileSync(keyPath, 'utf-8'), 'hex')
-  }
-  const generatedKey = crypto.randomBytes(32)
-  fs.writeFileSync(keyPath, generatedKey.toString('hex'), { mode: 0o600 })
-  console.warn('[Security] No DB_ENCRYPTION_KEY set -- generated a local dev key at .db-key. Set a real DB_ENCRYPTION_KEY environment variable before deploying this anywhere real; .db-key must never be committed or shared.')
-  return generatedKey
-}
-
-// A lowdb Adapter implementation -- drop-in replacement for lowdb/node's
-// JSONFile adapter. A fresh random IV is generated on every single
-// write (never reused), and the auth tag from AES-GCM is stored and
-// verified on read, so any tampering with the encrypted file on disk is
-// detected rather than silently accepted.
-export class EncryptedJSONFile<T> {
-  #filename: string
-  #key: Buffer
-
-  constructor(filename: string) {
-    this.#filename = filename
-    this.#key = getEncryptionKey()
-  }
-
-  async read(): Promise<T | null> {
-    if (!fs.existsSync(this.#filename)) return null
-    const raw = fs.readFileSync(this.#filename, 'utf-8')
-    if (!raw.trim()) return null
-    const { iv, authTag, data } = JSON.parse(raw)
-    const decipher = crypto.createDecipheriv(ALGORITHM, this.#key, Buffer.from(iv, 'hex'))
-    decipher.setAuthTag(Buffer.from(authTag, 'hex'))
-    const decrypted = Buffer.concat([decipher.update(Buffer.from(data, 'hex')), decipher.final()])
-    return JSON.parse(decrypted.toString('utf-8'))
-  }
-
-  async write(data: T): Promise<void> {
-    const iv = crypto.randomBytes(16)
-    const cipher = crypto.createCipheriv(ALGORITHM, this.#key, iv)
-    const plaintext = Buffer.from(JSON.stringify(data), 'utf-8')
-    const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()])
-    const authTag = cipher.getAuthTag()
-    fs.writeFileSync(this.#filename, JSON.stringify({
-      iv: iv.toString('hex'),
-      authTag: authTag.toString('hex'),
-      data: encrypted.toString('hex')
-    }))
-  }
-}
-`,
-    // NEW: same real gap, same real fix as the frontend scaffold -- a
-    // deploy host or git push has no way to know to skip node_modules
-    // (or the real db.json data file) without this. .db-key added
-    // alongside db.json for the same reason -- the dev-fallback
-    // encryption key must never end up committed either.
-    '.gitignore': `node_modules\ndist\n.env\ndb.json\n.db-key\n*.log\n`
-  }
-}
-
-// NEW: Riley (document generation) gets its own scaffold, separate from
-// frontend/backend -- there's no page to render and no server to run, just
-// a script that produces a file once and exits.
-function injectDocumentBoilerplate(extractedFiles: Record<string, string>): Record<string, string> {
-  const hasEntryScript = Object.keys(extractedFiles).includes('src/generate.ts')
-  return {
-    ...extractedFiles,
-    'package.json': JSON.stringify({
-      name: "branch-hq-preview-docs",
-      type: "module",
-      scripts: {
-        dev: hasEntryScript
-          ? 'tsx src/generate.ts'
-          : 'echo "No src/generate.ts found -- Riley must name the script exactly that" && exit 1'
-      },
-      // All four are pure JS/TS, no native compilation -- same
-      // WebContainer-safety reasoning as bcryptjs over bcrypt for Dwight.
-      dependencies: {
-        "pdfkit": "^0.15.0",
-        "pptxgenjs": "^3.12.0",
-        "docx": "^9.0.2",
-        "exceljs": "^4.4.0"
-      },
-      devDependencies: {
-        "typescript": "^5.4.5",
-        "tsx": "^4.7.0",
-        "@types/pdfkit": "^0.13.4"
-      }
-    }, null, 2)
-  }
-}
-
-function injectBoilerplate(extractedFiles: Record<string, string>, agentKey?: 'jim' | 'dwight' | 'riley'): Record<string, string> {
-  if (Object.keys(extractedFiles).length === 0) return extractedFiles
-  if (agentKey === 'dwight') return injectBackendBoilerplate(extractedFiles)
-  if (agentKey === 'riley') return injectDocumentBoilerplate(extractedFiles)
-  return injectFrontendBoilerplate(extractedFiles)
-}
-
 // 5. System Prompts
 const PROMPTS = {
   MICHAEL_MANAGER: `You are Michael -- the single point of contact for this workspace. People talk to you directly for everything: casual conversation, day-to-day questions, brainstorming, AND requests to build code or documents. For each message, decide whether it needs something actually built, or whether you can just answer it yourself.
@@ -804,6 +486,7 @@ CRITICAL, confirmed real and repeated failure: every file goes in its OWN SEPARA
 CRITICAL: You are ONLY allowed to use 'express', 'cors', 'bcryptjs', 'jsonwebtoken', 'zod', 'dotenv', 'lowdb', and 'express-rate-limit' as external dependencies. Do not import anything else. In particular, never import 'bcrypt' -- use 'bcryptjs' instead, since this code runs inside a browser-based WebContainer sandbox that cannot compile native Node addons. For unique IDs, use Node's built-in crypto.randomUUID() -- no separate package needed.
 CRITICAL: your server MUST listen on process.env.PORT, with a fallback only for standalone use outside this system (e.g. const PORT = process.env.PORT || 8787; app.listen(PORT, ...)). Never hardcode a specific port number as the only option -- the actual port is assigned by the system running this, not chosen by you.
 CRITICAL, avoiding invented business facts: if the request includes a [VERIFIED CLIENT FACTS] context block, that is ground truth about a real business -- use it exactly, including in seed/default data. For any business-specific detail NOT covered there (a specific price, address, phone number, business hours, or similar), whether or not that context block was provided at all, never invent a plausible-sounding specific value in seed data or defaults -- use an obviously-a-placeholder label instead. This does NOT apply to generic structural/demo content unrelated to a real business fact -- seed rows that only illustrate the data shape (e.g. a generic example task title) are fine and expected.
+CRITICAL, confirmed real and repeated failure: whenever the request needs a login endpoint, it needs a matching registration (create account / sign up) endpoint in the SAME response -- never build login alone. A login endpoint with no way to ever create the account it's checking against is not a working feature; it's a dead end the very first time anyone actually tries to use it, since there is no account in the database to log into yet. If the request only explicitly asks for "login," treat that as shorthand for "a working authentication system" and build both /register (or /signup) and /login together, with the same validation, hashing, and error-handling rigor for each. The only exception is when the request is explicitly and unambiguously about adding login to a system that already has real, existing user accounts (e.g. a follow-up request in the same project, where account creation was already built in an earlier response) -- in every other case, build both.
 
 APPROACH -- follow this before writing any code:
 Act like a senior backend engineer reviewing a junior's first draft, not someone who just wants the endpoint to respond. Before writing code, briefly consider: what actually goes wrong with this request in the real world -- bad input, a resource that doesn't exist, a duplicate submission, no auth -- and what response shape communicates that clearly, not just "it works" for the one happy path.
@@ -860,7 +543,24 @@ If the instructions include an attached file's real extracted content (marked as
 IMPORTANT: Live web search may or may not be available for any given request -- see the research methodology rule above. Never claim with certainty that you searched the web, and never write your own "Sources:" section -- real ones, when found, are appended automatically. If the user needs current or live information and none was found, say so plainly rather than inventing facts.`,
   // NEW: the plain chatbot -- not part of the pipeline, no code, no Gate 1,
   // just a normal back-and-forth conversation.
-  GENERAL_CHAT: `You are a helpful, general-purpose assistant inside Branch HQ. Unlike Michael, Jim, Dwight, Pam, and Riley, you are not part of the coding/document pipeline -- you have a normal, free-ranging conversation with the user about anything they want: questions, advice, writing help, brainstorming, or just talking. You do not generate stageable files, and nothing you write goes through Gate 1 or gets pushed to the sandbox. Be direct, clear, and genuinely helpful.`
+  GENERAL_CHAT: `You are a helpful, general-purpose assistant inside Branch HQ. Unlike Michael, Jim, Dwight, Pam, and Riley, you are not part of the coding/document pipeline -- you have a normal, free-ranging conversation with the user about anything they want: questions, advice, writing help, brainstorming, or just talking. You do not generate stageable files, and nothing you write goes through Gate 1 or gets pushed to the sandbox. Be direct, clear, and genuinely helpful.`,
+  // NEW: runs once, before Jim/Dwight ever start building, when live web
+  // search is enabled -- real, current facts relevant to the request,
+  // handed to the specialists as context the same way VERIFIED CLIENT
+  // FACTS already is. Deliberately a separate, narrower role from
+  // Riley's own research work: this is a quick pre-build grounding
+  // pass, not a full document -- a few concrete, genuinely useful
+  // findings, not an essay. Uses real Google Search grounding (see
+  // GeminiProvider's useSearchGrounding), so this can actually find
+  // real, current information -- not just restate general training
+  // knowledge dressed up as if it were freshly looked up.
+  RESEARCH_BEFORE_BUILD: `You are doing a real research pass before an application gets built from the request below, using live web search where it's available to you for this call. Your job is NOT to write code, and NOT to write a full report -- but this is genuine research, not a token gesture, and it has one clear priority.
+
+PRIORITY ONE, above everything else: if the request names a real, specific business, organization, or professional (a business name, a person's practice, a named brand) -- identify it and actually search for real, current, verifiable facts about THAT specific entity: hours of operation, physical address or service area, services or products actually offered, publicly listed pricing, contact information, how long it's been operating, and anything else a real customer of theirs would actually see. This is the single most valuable thing this research step can do -- a real business's real hours and real services, found via genuine search, is worth far more to the eventual build than generic industry commentary. Do not hold back on length for this specific case -- a real, named business is worth a genuinely thorough set of findings, not a token bullet point.
+
+If NO real, specific, named entity is mentioned, fall back to brief, general research: real current conventions or standard features for this category of application, or current best practices genuinely relevant to what's being built. Keep this fallback case short -- a handful of concise bullet points, not an essay. General app-category research is far less valuable than real findings about a real named business, and shouldn't be padded to look equally substantial.
+
+Be honest and precise about WHERE each finding came from and how confident you actually are -- note plainly when something is a real search result versus your own general knowledge, since those carry different reliability. These findings were found via automated search, not confirmed by the business itself -- they are a strong starting point, not the same tier of certainty as information a human has explicitly verified. Never invent a specific-sounding fact, statistic, address, phone number, or price you didn't actually find -- if a real search turned up nothing for a specific named entity (it may not have an online presence, or the name may be ambiguous), say so plainly rather than filling the gap with a plausible-sounding guess. An honest "found nothing verifiable" is correct far more often than people expect, and is much better than a confident, invented paragraph.`,
 }
 
 // How many total tries the specialist gets before we stop auto-retrying and
@@ -966,68 +666,6 @@ async function getExistingProjectSnapshot(targetDir: string, userPrompt: string)
   } catch {
     return ''
   }
-}
-
-// NEW: Riley's script is always named src/generate.ts by convention --
-// if he forgets to declare that path on the first line (unlike Jim and
-// Dwight, who have that instruction spelled out and reliably follow it),
-// the normal extractor finds nothing at all, and the whole document
-// pipeline silently produces no stageable file. Since we already know
-// deterministically what the file must be called, just grab the first
-// code fence directly instead of depending on him naming it correctly.
-function extractRileyFallback(rawOutput: string): Record<string, string> {
-  const anyFenceRegex = /```(?:\w+)?\s*\n?([\s\S]*?)```/
-  const match = rawOutput.match(anyFenceRegex)
-  if (!match) return {}
-  return { 'src/generate.ts': match[1].trim() }
-}
-
-function auditAndStage(rawOutput: string, agentKey?: 'jim' | 'dwight' | 'riley') {
-  let extractedFiles = extractCodeBlocks(rawOutput)
-  if (agentKey === 'riley' && !extractedFiles['src/generate.ts']) {
-    extractedFiles = extractRileyFallback(rawOutput)
-  }
-
-  // FIXED: confirmed real, currently-occurring failure -- a specialist's
-  // response can look completely fine as raw text (real, well-written
-  // code) while still yielding ZERO extracted files, if its markdown
-  // structure doesn't match what extractCodeBlocks expects: a missing
-  // code fence around one file, or multiple files jammed into a single
-  // fence (extraction only recognizes one "// File:" comment per fence
-  // -- the first line inside it -- so a fence containing four files'
-  // worth of content still yields at most one entry). Previously,
-  // Object.keys(extractedFiles).length > 0 being false just meant
-  // stageableFiles came out undefined further down -- but staticAudit
-  // itself, from runMechanicalAudit({}), had nothing to flag on an
-  // empty set and trivially passed. Since Pam reviews rawOutput
-  // directly (not the extraction result), she'd approve genuinely good
-  // code with no idea it never actually turned into files -- the whole
-  // pipeline reported success with real code behind it, while nothing
-  // was ever staged. This is the same root failure class as the
-  // earlier same-line-comment extraction bug, just a different
-  // trigger: zero extracted files from a non-empty response is a real
-  // failure, not a vacuous pass, and is now surfaced as a blocker so it
-  // feeds the existing retry loop (MAX_AUTO_FIX_ROUNDS) instead of
-  // silently succeeding on nothing.
-  if (Object.keys(extractedFiles).length === 0 && rawOutput.trim().length > 0) {
-    return {
-      extractedFiles,
-      staticAudit: {
-        passed: false,
-        blockers: ['No files could be extracted from this response. Every file must be in its own separate markdown code block, with a "// File: path" comment as the very first line inside that block -- do not combine multiple files into one code block.'],
-        warnings: [],
-        perFile: []
-      } as AuditResult,
-      stageableFiles: undefined
-    }
-  }
-
-  const staticAudit = runMechanicalAudit(extractedFiles)
-  const stageableFiles =
-    staticAudit.passed && Object.keys(extractedFiles).length > 0
-      ? injectBoilerplate(extractedFiles, agentKey)
-      : undefined
-  return { extractedFiles, staticAudit, stageableFiles }
 }
 
 // 6. IPC Invocation Pipeline & Conversation Handlers
@@ -1205,7 +843,7 @@ typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName,
         return { success: false, messages: [...newMessages, errMsg] }
       }
 
-      const agentMsg = await addMessage(conversationId, agentName, specialistOutput, stageableFiles)
+      const agentMsg = await addMessage(conversationId, agentName, specialistOutput, prefixStageableFiles(stageableFiles, agentName))
       newMessages.push(agentMsg)
 
       // Recorded honestly: Gate 1 genuinely ran and passed, Pam's
@@ -1216,7 +854,7 @@ typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName,
         gate1Passed: true, perFile: staticAudit.perFile, pamVerdict: 'UNKNOWN'
       })
 
-      return { success: true, messages: newMessages, files: stageableFiles, agentKey: agentName, instructions: prompt, auditId: auditRecord.id }
+      return { success: true, messages: newMessages, files: prefixStageableFiles(stageableFiles, agentName), agentKey: agentName, instructions: prompt, auditId: auditRecord.id }
     }
 
     // NEW: direct chat with Pam -- a genuinely different use case from
@@ -1457,18 +1095,45 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
     // request without saying so.
     const detectedVertical = detectVerticalStarterKit(prompt)
 
+    // NEW: research-before-building. Moved the settings fetch earlier
+    // (was further down, right before existingProjectSnapshot) so this
+    // can decide -- and announce -- whether research actually ran, in
+    // the same message as everything else this turn's context already
+    // gets announced in. Only attempted when a real code build is
+    // actually happening (Jim or Dwight delegated to) -- a Riley-only
+    // or pure-chat turn has no use for this and shouldn't pay for a
+    // search call it can't use.
+    const settingsForSnapshot = await getSettings()
+    const involvesRealBuild = rawDelegations.some(d => d.assignTo === 'Jim' || d.assignTo === 'Dwight')
+    let researchFindings = ''
+    if (settingsForSnapshot.enableWebSearch && involvesRealBuild) {
+      try {
+        researchFindings = await fetchFrontierAI(PROMPTS.RESEARCH_BEFORE_BUILD, prompt, undefined, true)
+      } catch {
+        // Best-effort -- a failed research call shouldn't block the
+        // actual build; specialists just proceed without it, the same
+        // as when the setting is off entirely.
+      }
+    }
+    const researchNote = researchFindings.trim()
+      ? `\n\n[RESEARCH -- real findings gathered via live web search before this build, prioritizing any specific named business/organization in the request. These are genuine search results, not invented -- use them, especially real business specifics like hours, services, and contact details. They are NOT the same tier of certainty as VERIFIED CLIENT FACTS below (if present): those were confirmed directly by the actual client; these were found by automated search and could be outdated or about the wrong entity if the name is ambiguous. If the two ever conflict, VERIFIED CLIENT FACTS wins.]\n${researchFindings.trim()}`
+      : ''
+
     const ragNote = retrievedFiles.length > 0
       ? `\n\n[RAG] Retrieved context from: ${retrievedFiles.join(', ')}`
       : `\n\n[RAG] No relevant project context retrieved.`
     const verticalAnnounceNote = detectedVertical
       ? `\n\n[Using a proven "${detectedVertical.name}" starting structure -- a known-good data model from repeat past requests, tailored to what was specifically asked for here.]`
       : ''
+    const researchAnnounceNote = researchFindings.trim()
+      ? `\n\n[Real research was gathered before this build -- see the specialists' own context for what was found.]`
+      : ''
     const michaelMsg = await addMessage(
       conversationId,
       'michael',
       rawDelegations.length > 1
-        ? `Delegating to ${rawDelegations.map(d => d.assignTo).join(' and ')} -- this needs both a real backend and a real frontend, so both are being built together.${ragNote}${verticalAnnounceNote}`
-        : `Delegating to ${rawDelegations[0].assignTo}: ${rawDelegations[0].instructions}${ragNote}${verticalAnnounceNote}`
+        ? `Delegating to ${rawDelegations.map(d => d.assignTo).join(' and ')} -- this needs both a real backend and a real frontend, so both are being built together.${ragNote}${verticalAnnounceNote}${researchAnnounceNote}`
+        : `Delegating to ${rawDelegations[0].assignTo}: ${rawDelegations[0].instructions}${ragNote}${verticalAnnounceNote}${researchAnnounceNote}`
     )
     newMessages.push(michaelMsg)
 
@@ -1481,7 +1146,6 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
       return rank(a.assignTo) - rank(b.assignTo)
     })
 
-    const settingsForSnapshot = await getSettings()
     // NEW: fetched once per turn, same value for every delegation this
     // turn -- unlike existingProjectSnapshot (which varies by what the
     // live filesystem actually contains) this is deliberately identical
@@ -1491,6 +1155,17 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
     const rawClientFacts = await getClientFacts(conversationId)
     const clientFactsNote = rawClientFacts.trim()
       ? `\n\n[VERIFIED CLIENT FACTS -- treat everything below as ground truth about the real business this is being built for. Use these exact details wherever relevant -- do not paraphrase away specifics like exact prices, hours, or policy wording. For any business-specific detail NOT covered here (a price, address, phone number, policy, or similar), do not invent a plausible-sounding specific value -- use an obviously-a-placeholder label instead (e.g. "[Add your price here]", "Contact us for details") so it's visibly unfinished rather than presented as if it were real. This does not apply to generic structural/demo content, like example task titles in a task manager -- only to specifics a real client would actually check against reality.]\n${rawClientFacts}`
+      : ''
+    // NEW: global, not per-conversation -- who's actually running
+    // Branch HQ, not who any one project is for. See settingsStore.ts's
+    // own note on this field. Injected into every specialist alongside
+    // (never instead of) VERIFIED CLIENT FACTS -- a real conflict
+    // between "who I am" and "who this specific project is for" should
+    // resolve in favor of the project's own client facts, since those
+    // are what the delivered app actually needs to reflect.
+    const rawMasterProfile = (settingsForSnapshot.masterProfile || '').trim()
+    const masterProfileNote = rawMasterProfile
+      ? `\n\n[ABOUT THE PERSON/AGENCY BUILDING THIS -- standing context about who is using Branch HQ, true across every project, not specific to this one. Useful for tone, standard conventions, or defaults this person/agency prefers -- if this conflicts with VERIFIED CLIENT FACTS for this specific project, VERIFIED CLIENT FACTS wins.]\n${rawMasterProfile}`
       : ''
     const mergedFiles: Record<string, string> = {}
     // NEW: tracks which agents' pipelines genuinely succeeded this turn,
@@ -1552,7 +1227,7 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
       const result = await runSpecialistPipeline({
         conversationId,
         agentKey,
-        baseInstructions: delegation.instructions + crossAgentNote + verticalNote + clientFactsNote,
+        baseInstructions: delegation.instructions + crossAgentNote + verticalNote + clientFactsNote + masterProfileNote + (agentKey !== 'riley' ? researchNote : ''),
         projectContext,
         existingProjectSnapshot,
         newMessages
@@ -1718,7 +1393,7 @@ typedIpc.handle('heal:invoke', async (_event: any, {
       conversationId,
       agentKey,
       `${specialistOutput}\n\n[Self-healing attempt ${attempt} of ${MAX_SELF_HEAL_ROUNDS} -- fixing a real runtime failure]`,
-      stageableFiles
+      prefixStageableFiles(stageableFiles, agentKey)
     )
     newMessages.push(agentMsg)
 
@@ -1747,7 +1422,7 @@ typedIpc.handle('heal:invoke', async (_event: any, {
     // checks any other generation has to. Local-only, see lessonsStore.ts.
     await recordLesson(agentKey, errorLog)
 
-    return { success: true, messages: newMessages, files: stageableFiles, agentKey, instructions: previousInstructions, auditId: auditRecord.id }
+    return { success: true, messages: newMessages, files: prefixStageableFiles(stageableFiles, agentKey), agentKey, instructions: previousInstructions, auditId: auditRecord.id }
   } catch (error: any) {
     const errMsg = await addMessage(conversationId, 'error', error.message || 'Self-healing failed.')
     return { success: false, messages: [errMsg] }
@@ -1927,6 +1602,61 @@ const activeNativeRuns = new Map<string, NativeRun>()
 // backend spawns, regardless of which run it originally belonged to.
 let currentBackendProcess: ChildProcess | null = null
 
+const execFileAsync = promisify(execFile)
+
+// FIXED: confirmed real, currently-occurring gap in the fix above --
+// currentBackendProcess only ever knows about processes THIS running
+// app session spawned itself. Confirmed real failure: EADDRINUSE on
+// the very FIRST native boot of a session, before this session had
+// ever spawned a backend of its own -- meaning nothing tracked here
+// could have been the culprit. The actual cause: a backend process
+// orphaned by an EARLIER app launch that crashed, was force-quit, or
+// was killed by the OS before its own cleanup (stopNativeRun) could
+// run, left alive and still bound to the fixed port. This function
+// closes that gap directly: ask the OS itself what's on the port,
+// regardless of which process (or which app session) put it there,
+// and kill it. macOS/Linux via lsof (both ship it by default, unlike
+// e.g. the platform SDK 'mdns' package needed); Windows via
+// netstat + taskkill, since lsof isn't a Windows tool. Deliberately
+// defensive throughout -- this must never crash the app if the
+// platform command is missing or behaves unexpectedly. lsof/netstat
+// finding nothing (the common, expected case when nothing needs
+// clearing) also exits non-zero / throws -- caught and treated as
+// "nothing to do," not a real error.
+async function killWhateverIsOnPort(port: number): Promise<void> {
+  try {
+    if (process.platform === 'win32') {
+      const { stdout } = await execFileAsync('netstat', ['-ano'])
+      const pids = new Set<string>()
+      for (const line of stdout.split('\n')) {
+        if (line.includes(`:${port}`) && line.toUpperCase().includes('LISTENING')) {
+          const parts = line.trim().split(/\s+/)
+          const pid = parts[parts.length - 1]
+          if (pid && /^\d+$/.test(pid)) pids.add(pid)
+        }
+      }
+      for (const pid of pids) {
+        await execFileAsync('taskkill', ['/PID', pid, '/F']).catch(() => {})
+      }
+      if (pids.size > 0) await new Promise(resolve => setTimeout(resolve, 300))
+    } else {
+      const { stdout } = await execFileAsync('lsof', ['-ti', `:${port}`])
+      const pids = stdout.split('\n').map(s => s.trim()).filter(Boolean)
+      for (const pid of pids) {
+        try { process.kill(Number(pid), 'SIGKILL') } catch { /* already gone, or not ours to kill -- either way, nothing more to do */ }
+      }
+      if (pids.length > 0) await new Promise(resolve => setTimeout(resolve, 300))
+    }
+  } catch {
+    // lsof/netstat not found, or genuinely found nothing listening
+    // (lsof's real, documented behavior: exits non-zero when there's
+    // no match, which is the common case, not an error) -- either way,
+    // silently proceed. The existing EADDRINUSE detection in the spawn
+    // logic below still catches and reports it if this genuinely
+    // couldn't clear the port for some reason.
+  }
+}
+
 async function writeFilesToScratch(scratchDir: string, files: Record<string, string>): Promise<void> {
   for (const [relativePath, content] of Object.entries(files)) {
     const absolutePath = path.join(scratchDir, relativePath)
@@ -2020,14 +1750,30 @@ typedIpc.handle('sandbox:startNative', async (event: any, { runId, files }: { ru
       if (p.startsWith('server/')) backendFiles[p.slice('server/'.length)] = content
       else frontendFiles[p] = content
     }
+    // FIXED: confirmed real, necessary companion to the prefixing fix
+    // above -- once Dwight's (or Riley's) output is correctly prefixed
+    // rather than misidentified as frontend content, a direct-chat
+    // response with ONLY a backend (no Jim involved at all) genuinely
+    // has zero frontend files. Without this check, the code below would
+    // still unconditionally try to npm install in an empty scratch
+    // directory with no package.json -- trading the original
+    // EADDRINUSE-from-misidentification bug for a new, different
+    // failure, not actually fixing the underlying scenario. A real
+    // frontend always has an injected package.json (see
+    // injectFrontendBoilerplate) -- its absence is the honest signal
+    // there's nothing to run here.
+    const hasFrontend = 'package.json' in frontendFiles
 
-    await writeFilesToScratch(scratchDir, frontendFiles)
+    if (hasFrontend) {
+      await writeFilesToScratch(scratchDir, frontendFiles)
+    }
     if (hasBackend) await writeFilesToScratch(path.join(scratchDir, 'server'), backendFiles)
 
     const run: NativeRun = { scratchDir }
     activeNativeRuns.set(runId, run)
 
-    // -------- Frontend --------
+    // -------- Frontend (only if one genuinely exists) --------
+    if (hasFrontend) {
     send('sandbox:log', { source: 'frontend', line: 'Installing frontend dependencies...' })
     await new Promise<void>((resolve, reject) => {
       const install = spawn('npm', ['install'], { cwd: scratchDir, shell: true, env: cleanInstallEnv() })
@@ -2074,6 +1820,14 @@ typedIpc.handle('sandbox:startNative', async (event: any, { runId, files }: { ru
     frontendDev.on('exit', (code: number | null) => {
       if (code !== null && code !== 0) send('sandbox:error', { source: 'frontend', message: `Frontend dev server exited with code ${code}` })
     })
+    } else {
+      // NEW: honest, explicit signal for the backend-only case -- no
+      // frontend was ever attempted, so there's genuinely no "frontend
+      // ready" event coming. Without this, the renderer would just wait
+      // forever for one, showing "Awaiting server URL..." indefinitely
+      // even after the backend is confirmed running.
+      send('sandbox:log', { source: 'system', line: 'No frontend in this response -- running the backend only.' })
+    }
 
     // -------- Backend (only if one was actually built alongside it) --------
     if (hasBackend) {
@@ -2089,9 +1843,11 @@ typedIpc.handle('sandbox:startNative', async (event: any, { runId, files }: { ru
       // FIXED: see currentBackendProcess's own note above -- always kill
       // whatever's currently holding the fixed backend port before
       // spawning a new one, regardless of which run it belonged to.
-      // This is the deterministic fix for the confirmed real
-      // EADDRINUSE crash; it doesn't depend on the renderer's effect
-      // cleanup timing being perfect.
+      // This catches same-session collisions; it does NOT catch a
+      // process orphaned by an earlier, already-closed app session,
+      // since currentBackendProcess is a fresh, empty variable on
+      // every app launch. killWhateverIsOnPort (below) is the part
+      // that actually closes that second, confirmed-real gap.
       if (currentBackendProcess) {
         try { currentBackendProcess.kill() } catch { /* already gone */ }
         currentBackendProcess = null
@@ -2103,6 +1859,15 @@ typedIpc.handle('sandbox:startNative', async (event: any, { runId, files }: { ru
         // is gone).
         await new Promise(resolve => setTimeout(resolve, 300))
       }
+      // FIXED: confirmed real failure -- EADDRINUSE on the very FIRST
+      // native boot of a fresh app session, when currentBackendProcess
+      // was still null and had nothing to kill. Asks the OS directly
+      // what's actually bound to the port, regardless of which app
+      // session (this one or an earlier, already-closed one) put it
+      // there. See killWhateverIsOnPort's own note for the full
+      // reasoning; safe to always call, even when nothing needs
+      // clearing.
+      await killWhateverIsOnPort(NATIVE_BACKEND_PORT)
 
       const backendDev = spawn('npm', ['run', 'dev'], {
         cwd: serverDir,
@@ -2147,6 +1912,14 @@ typedIpc.handle('sandbox:startNative', async (event: any, { runId, files }: { ru
       const backendUp = await waitForPort(NATIVE_BACKEND_PORT, 30000)
       if (backendUp) {
         send('sandbox:backend-ready', { url: `http://localhost:${NATIVE_BACKEND_PORT}`, port: NATIVE_BACKEND_PORT })
+        // NEW: when there's no frontend at all (a direct-chat-to-Dwight
+        // response, correctly identified as backend-only now that it's
+        // properly prefixed), the backend coming up IS the whole run
+        // succeeding -- there's no separate frontend-ready event ever
+        // coming to tell the renderer the run is actually done.
+        if (!hasFrontend) {
+          send('sandbox:backend-only-complete', { url: `http://localhost:${NATIVE_BACKEND_PORT}`, port: NATIVE_BACKEND_PORT })
+        }
       } else {
         send('sandbox:error', { source: 'backend', message: `Backend did not start listening on port ${NATIVE_BACKEND_PORT} within 30s.` })
       }
@@ -2442,6 +2215,27 @@ function sendJson(res: http.ServerResponse, status: number, data: any) {
   res.end(JSON.stringify(data))
 }
 
+// NEW: needed for invite-based pairing -- the shareable invite string
+// has to embed an IP address the OTHER device can actually reach over
+// the LAN, not 'localhost' (which only ever means "this same machine"
+// to whoever receives it). Picks the first non-internal IPv4 address,
+// which is the ordinary case for a normal LAN connection; falls back
+// to localhost rather than throwing if nothing suitable is found (an
+// invite generated on a genuinely offline machine just won't be usable
+// by another device, which is an honest, expected limitation, not a
+// crash).
+function getLocalLanAddress(): string {
+  const interfaces = os.networkInterfaces()
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name] || []) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        return iface.address
+      }
+    }
+  }
+  return '127.0.0.1'
+}
+
 async function startPairingServer(): Promise<void> {
   const identity = await getDeviceIdentity()
 
@@ -2511,6 +2305,43 @@ async function startPairingServer(): Promise<void> {
           peerRequestId: requestId
         })
         return sendJson(res, 200, { received: true })
+      }
+
+      // -------- Invite-based pairing (this device generated the invite) --------
+      // NEW: a genuinely different, simpler flow from the three above --
+      // see devicePairing.ts's own note on the security reasoning. No
+      // human confirmation step on this side: the request only reaches
+      // here at all if the caller presented the exact secret embedded
+      // in an invite THIS device generated and chose to share, which is
+      // itself the consent.
+      if (req.url === '/pairing/invite-request') {
+        const body = await readJsonBody(req)
+        const { fromDeviceId, fromDeviceName, fromPublicKeyPem, inviteCode, inviteSecret, nonce, signature } = body
+        if (!fromDeviceId || !fromPublicKeyPem || !inviteCode || !inviteSecret || !signature) {
+          return sendJson(res, 400, { error: 'Malformed invite pairing request' })
+        }
+        const payload = JSON.stringify({ fromDeviceId, fromPublicKeyPem, inviteCode, inviteSecret, nonce })
+        if (!verifySignature(fromPublicKeyPem, payload, signature)) {
+          return sendJson(res, 401, { error: 'Invalid signature' })
+        }
+        // Deliberately vague on failure (see consumeAndValidateInvite's
+        // own note) -- wrong code, wrong secret, expired, and
+        // already-used all produce the exact same response, so a wrong
+        // guess can't be used to narrow down a real invite.
+        if (!consumeAndValidateInvite(inviteCode, inviteSecret)) {
+          return sendJson(res, 403, { error: 'That invite is invalid, expired, or has already been used.' })
+        }
+        await addTrustedPeer({
+          deviceId: fromDeviceId,
+          deviceName: fromDeviceName || 'Unknown Device',
+          publicKeyPem: fromPublicKeyPem,
+          pairedAt: Date.now()
+        })
+        // Informational only -- nothing for this device's user to
+        // click or decide, since generating and sharing the invite
+        // already was the decision.
+        sendToRenderer('pairing:invite-completed', { deviceId: fromDeviceId, deviceName: fromDeviceName || 'Unknown Device' })
+        return sendJson(res, 200, { deviceId: identity.deviceId, deviceName: identity.deviceName, publicKeyPem: identity.publicKeyPem })
       }
 
       // -------- Finalize (this device is the original responder) --------
@@ -2643,6 +2474,223 @@ typedIpc.handle('devices:listPendingIncoming', async () => {
 // signed pairing request to a discovered peer, and immediately computes
 // its own copy of the human verification code (it already has both
 // public keys at this point: its own, and the peer's from discovery).
+// NEW: invite-based pairing -- generates a shareable string (embedding
+// a single-use code+secret and this device's real LAN address) that
+// works without either device needing mDNS discovery to succeed at
+// all. See devicePairing.ts's own note on the security reasoning.
+typedIpc.handle('devices:generateInvite', async () => {
+  const invite = createPairingInvite()
+  const inviteString = `BHQ1:${invite.code}:${invite.secret}:${getLocalLanAddress()}:${pairingServerActualPort || PREFERRED_PAIRING_PORT}`
+  return { success: true, inviteString, expiresInMinutes: 10 }
+})
+
+// NEW: the receiving half -- parses a shareable invite string, connects
+// DIRECTLY to the embedded address (skipping discovery entirely), and
+// completes pairing in one round-trip if the invite is valid. No
+// separate local confirmation step needed here either: pasting an
+// invite someone personally sent you, from a specific device you meant
+// to pair with, is itself the decision.
+typedIpc.handle('devices:pairViaInvite', async (_event: any, inviteString: string) => {
+  const parts = (inviteString || '').trim().split(':')
+  if (parts.length !== 5 || parts[0] !== 'BHQ1') {
+    return { success: false, error: "That doesn't look like a valid Branch HQ invite." }
+  }
+  const [, code, secret, host, portStr] = parts
+  const port = Number(portStr)
+  if (!code || !secret || !host || !port || Number.isNaN(port)) {
+    return { success: false, error: 'That invite looks incomplete or corrupted.' }
+  }
+
+  const identity = await getDeviceIdentity()
+  const nonce = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const result = await postSignedToPeer(host, port, '/pairing/invite-request', {
+    fromDeviceId: identity.deviceId,
+    fromDeviceName: identity.deviceName,
+    fromPublicKeyPem: identity.publicKeyPem,
+    inviteCode: code,
+    inviteSecret: secret,
+    nonce
+  })
+
+  if (!result.ok) {
+    return { success: false, error: result.data?.error || 'Could not reach that device -- check the invite is still valid and both devices can reach each other on the network.' }
+  }
+
+  const { deviceId, deviceName, publicKeyPem } = result.data
+  if (!deviceId || !publicKeyPem) {
+    return { success: false, error: 'The other device responded, but not with a valid identity -- pairing was not completed.' }
+  }
+  await addTrustedPeer({ deviceId, deviceName: deviceName || 'Unknown Device', publicKeyPem, pairedAt: Date.now() })
+  return { success: true, deviceName: deviceName || 'Unknown Device' }
+})
+
+// NEW: worldwide (non-LAN) pairing, via an explicitly user-configured
+// relay -- see settingsStore.ts's relayServerUrl and
+// relay-server/README.md for the full reasoning. Reuses the exact same
+// invite code+secret mechanism and Ed25519 signing already built for
+// LAN pairing -- the only thing that changes is the TRANSPORT: instead
+// of a direct HTTP POST to a LAN IP, both devices connect out to the
+// same relay over WebSocket and exchange the identical signed payloads
+// through it. The relay itself never needs to understand any of this
+// content -- see the relay server's own file for that reasoning.
+typedIpc.handle('devices:generateWorldwideInvite', async () => {
+  const settings = await getSettings()
+  if (!settings.relayServerUrl) {
+    return { success: false, error: 'Set a relay server URL in Settings first -- worldwide pairing needs one to actually connect two devices that aren\'t on the same network.' }
+  }
+
+  const identity = await getDeviceIdentity()
+  const invite = createPairingInvite()
+
+  try {
+    const socket = new WebSocket(settings.relayServerUrl)
+    await new Promise<void>((resolve, reject) => {
+      socket.once('open', () => resolve())
+      socket.once('error', (err) => reject(err))
+    })
+    socket.send(JSON.stringify({ type: 'register', code: invite.code }))
+
+    // Stays open in the background listening for a redemption -- this
+    // IPC call itself returns immediately once the invite string is
+    // ready to share, it doesn't block on someone actually using it.
+    socket.on('message', async (raw: any) => {
+      try {
+        const msg = JSON.parse(raw.toString())
+        if (msg.type !== 'relay') return
+        const { fromDeviceId, fromDeviceName, fromPublicKeyPem, inviteSecret, nonce, signature } = msg.payload || {}
+        if (!fromDeviceId || !fromPublicKeyPem || !inviteSecret || !signature) return
+
+        const payload = JSON.stringify({ fromDeviceId, fromPublicKeyPem, inviteSecret, nonce })
+        if (!verifySignature(fromPublicKeyPem, payload, signature)) return
+        if (!consumeAndValidateInvite(invite.code, inviteSecret)) return
+
+        await addTrustedPeer({
+          deviceId: fromDeviceId,
+          deviceName: fromDeviceName || 'Unknown Device',
+          publicKeyPem: fromPublicKeyPem,
+          pairedAt: Date.now()
+        })
+
+        // Respond with this device's own identity, signed, so the
+        // other side can complete pairing on its end too.
+        const myNonce = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+        const myPayload = JSON.stringify({ deviceId: identity.deviceId, publicKeyPem: identity.publicKeyPem, nonce: myNonce })
+        socket.send(JSON.stringify({
+          type: 'relay',
+          payload: {
+            deviceId: identity.deviceId,
+            deviceName: identity.deviceName,
+            publicKeyPem: identity.publicKeyPem,
+            nonce: myNonce,
+            signature: signPayload(identity.privateKeyPem, myPayload)
+          }
+        }))
+
+        sendToRenderer('pairing:invite-completed', { deviceId: fromDeviceId, deviceName: fromDeviceName || 'Unknown Device' })
+        socket.close()
+      } catch {
+        // A malformed relayed message is just ignored -- the relay
+        // itself can't produce one (it only ever forwards verbatim),
+        // so this would only happen from a genuinely broken or
+        // adversarial peer, not a real usage pattern to recover from.
+      }
+    })
+
+    // Matches the invite's own TTL -- if nobody redeems it in time,
+    // stop listening rather than holding the connection open forever.
+    setTimeout(() => { try { socket.close() } catch {} }, 10 * 60 * 1000)
+  } catch (err: any) {
+    return { success: false, error: `Could not reach the relay server: ${err.message}` }
+  }
+
+  const inviteString = `BHQW1:${invite.code}:${invite.secret}:${settings.relayServerUrl}`
+  return { success: true, inviteString, expiresInMinutes: 10 }
+})
+
+typedIpc.handle('devices:redeemWorldwideInvite', async (_event: any, inviteString: string) => {
+  const raw = (inviteString || '').trim()
+  const firstColon = raw.indexOf(':')
+  const secondColon = raw.indexOf(':', firstColon + 1)
+  const thirdColon = raw.indexOf(':', secondColon + 1)
+  if (firstColon === -1 || secondColon === -1 || thirdColon === -1) {
+    return { success: false, error: "That doesn't look like a valid worldwide invite." }
+  }
+  const prefix = raw.slice(0, firstColon)
+  const code = raw.slice(firstColon + 1, secondColon)
+  const secret = raw.slice(secondColon + 1, thirdColon)
+  // NEW: the relay URL is everything after the third colon, taken as
+  // one piece rather than split further -- a real wss:// URL contains
+  // its own colons (wss://host:port), which a naive full split would
+  // have broken apart incorrectly.
+  const relayUrl = raw.slice(thirdColon + 1)
+  if (prefix !== 'BHQW1' || !code || !secret || !relayUrl) {
+    return { success: false, error: "That doesn't look like a valid worldwide invite." }
+  }
+
+  const identity = await getDeviceIdentity()
+
+  try {
+    const socket = new WebSocket(relayUrl)
+    await new Promise<void>((resolve, reject) => {
+      socket.once('open', () => resolve())
+      socket.once('error', (err) => reject(err))
+    })
+
+    const result = await new Promise<{ success: boolean; deviceName?: string; error?: string }>((resolve) => {
+      const timeout = setTimeout(() => {
+        resolve({ success: false, error: 'Timed out waiting for the other device -- check the invite is still valid.' })
+        try { socket.close() } catch {}
+      }, 15000)
+
+      socket.on('message', async (rawMsg: any) => {
+        try {
+          const msg = JSON.parse(rawMsg.toString())
+          if (msg.type === 'matched') {
+            const nonce = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+            const payload = JSON.stringify({ fromDeviceId: identity.deviceId, fromPublicKeyPem: identity.publicKeyPem, inviteSecret: secret, nonce })
+            socket.send(JSON.stringify({
+              type: 'relay',
+              payload: {
+                fromDeviceId: identity.deviceId,
+                fromDeviceName: identity.deviceName,
+                fromPublicKeyPem: identity.publicKeyPem,
+                inviteSecret: secret,
+                nonce,
+                signature: signPayload(identity.privateKeyPem, payload)
+              }
+            }))
+          } else if (msg.type === 'relay') {
+            const { deviceId, deviceName, publicKeyPem, nonce, signature } = msg.payload || {}
+            if (!deviceId || !publicKeyPem || !signature) return
+            const peerPayload = JSON.stringify({ deviceId, publicKeyPem, nonce })
+            if (!verifySignature(publicKeyPem, peerPayload, signature)) {
+              clearTimeout(timeout)
+              resolve({ success: false, error: 'The other device responded with an invalid signature -- pairing was not completed.' })
+              return
+            }
+            await addTrustedPeer({ deviceId, deviceName: deviceName || 'Unknown Device', publicKeyPem, pairedAt: Date.now() })
+            clearTimeout(timeout)
+            resolve({ success: true, deviceName: deviceName || 'Unknown Device' })
+            try { socket.close() } catch {}
+          } else if (msg.type === 'error') {
+            clearTimeout(timeout)
+            resolve({ success: false, error: msg.message || 'The relay rejected this invite.' })
+          }
+        } catch {
+          // A malformed message from the relay/peer -- let the timeout
+          // above handle it rather than resolving on bad data.
+        }
+      })
+
+      socket.send(JSON.stringify({ type: 'join', code }))
+    })
+
+    return result
+  } catch (err: any) {
+    return { success: false, error: `Could not reach the relay server: ${err.message}` }
+  }
+})
+
 typedIpc.handle('devices:initiatePairing', async (_event: any, targetDeviceId: string) => {
   const target = listDiscoveredDevices().find(d => d.deviceId === targetDeviceId)
   if (!target) return { success: false, error: 'That device is no longer visible on the network.' }

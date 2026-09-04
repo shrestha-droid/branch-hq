@@ -1,5 +1,4 @@
 import { useEffect, useState, useRef } from 'react'
-import { getWebContainer, buildFileSystemTree } from '../lib/webcontainer'
 import { Loader2, TerminalSquare, Globe, FileText, Download, Wrench, ChevronDown, ChevronUp } from 'lucide-react'
 
 interface SandboxPreviewProps {
@@ -34,21 +33,16 @@ interface DocumentResult {
   data: Uint8Array
 }
 
+interface SandboxWebviewConfig {
+  preloadPath: string
+  src: string
+  partition: string
+}
+
 // Mirrors MAX_SELF_HEAL_ROUNDS in index.ts -- the main process enforces
 // the real cap; this is just so the UI doesn't keep retrying past it
 // client-side either.
 const MAX_SELF_HEAL_ROUNDS = 2
-
-// Known-fatal build/runtime error signatures actually seen this session.
-// A match here means the run is not going to recover on its own -- these
-// are build-breaking, not transient warnings.
-const FATAL_ERROR_PATTERNS = [
-  /Failed to resolve import/i,
-  /No matching export/i,
-  /SyntaxError/i,
-  /Pre-transform error/i,
-  /Internal server error/i,
-]
 
 export default function SandboxPreview({ files, conversationId, agentKey, instructions, onFilesHealed, auditId, onVerificationOutcome }: SandboxPreviewProps) {
   const [status, setStatus] = useState<'booting' | 'installing' | 'starting' | 'ready' | 'error' | 'healing'>('booting')
@@ -68,9 +62,6 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
   const logsEndRef = useRef<HTMLDivElement>(null)
   const runIdRef = useRef<number>(0)
 
-  const devProcessRef = useRef<any>(null)
-  const installProcessRef = useRef<any>(null)
-  const unsubscribeServerReadyRef = useRef<(() => void) | null>(null)
   const healingRef = useRef(false)
   const justHealedRef = useRef(false)
   const hasTriggeredHealForThisRunRef = useRef(false)
@@ -95,23 +86,66 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
   // though it was only ever a matter of a few more seconds.
   const [backendExpected, setBackendExpected] = useState(false)
   const [backendReady, setBackendReady] = useState(false)
+  // NEW: set only for a backend-only native run (direct-chat-to-Dwight-
+  // alone) -- distinct from `url`, which drives the actual iframe.
+  // There's no visual preview for a backend-only response, so this is
+  // used purely to render an honest "confirmed running, nothing to
+  // show" message instead of either an iframe or an infinite
+  // "Awaiting server URL..." wait.
+  const [backendOnlyUrl, setBackendOnlyUrl] = useState<string | null>(null)
+
+  // NEW: the renderer-side half of the COOP/COEP architectural fix.
+  // getWebContainer()/buildFileSystemTree() no longer run in this
+  // component at all -- they moved to sandbox-webview-entry.ts, which
+  // runs inside an isolated <webview> pointed at its own session
+  // partition (sandboxSession in index.ts). This component's job now is
+  // just to mount that webview, hand it files/mode to run, and relay
+  // its log/ready/error/document-ready reports back into the same UI
+  // state this component already used to manage directly. Native mode
+  // (below) is completely untouched by this -- it never needed
+  // WebContainers or this isolation in the first place.
+  const [sandboxConfig, setSandboxConfig] = useState<SandboxWebviewConfig | null>(null)
+  const webviewContainerRef = useRef<HTMLDivElement>(null)
+  const webviewElRef = useRef<any>(null)
+  const webviewDomReadyRef = useRef(false)
+  const pendingRunRef = useRef<{ files: Record<string, string>; mode: 'webapp' | 'document' } | null>(null)
+  // NEW: cleanup for the CURRENT run's ipc-message listener specifically
+  // -- distinct from the webview element itself, which persists across
+  // runs (self-heal reruns included) so the actual WebContainer boot
+  // inside it doesn't have to restart from scratch every time. The
+  // listener still needs fresh closures every run (it reads
+  // conversationId/agentKey/instructions/healAttempt via
+  // attemptSelfHeal, all of which can change between runs), so it's
+  // torn down and reattached each run even though the webview it's
+  // attached to is not -- the same pattern native mode already uses for
+  // its own per-run listeners via nativeUnsubscribersRef, applied here.
+  const webviewListenerCleanupRef = useRef<(() => void) | null>(null)
+  // NEW: true component-lifetime mount status, distinct from the `let
+  // mounted` local declared fresh inside the per-run effect below.
+  // Needed because the persistent webview's dom-ready listener survives
+  // across multiple effect invocations (multiple runs), so it can't
+  // rely on any single run's local `mounted` closure -- that would go
+  // stale and permanently false the moment the SECOND run's effect
+  // cleanup fired, even though the component itself never actually
+  // unmounted.
+  const isComponentMountedRef = useRef(true)
+
+  useEffect(() => {
+    isComponentMountedRef.current = true
+    return () => { isComponentMountedRef.current = false }
+  }, [])
 
   useEffect(() => {
     // @ts-ignore
     window.api.detectRuntime().then((r: any) => setNativeAvailable(r.available)).catch(() => setNativeAvailable(false))
+    // @ts-ignore
+    window.api.getSandboxWebviewConfig().then(setSandboxConfig).catch(() => setSandboxConfig(null))
   }, [])
-
-  // NEW: remembers what was actually installed last time. The generated
-  // application code changes on almost every run, but the dependency
-  // list (hardcoded by the scaffolder) almost never does -- reinstalling
-  // identical packages from scratch every single time is very likely the
-  // single biggest cost in how long a run takes to start.
-  const lastInstalledPackageJsonRef = useRef<string | null>(null)
 
   // FIXED: confirmed real misrouting -- relying only on parsing
   // package.json's content meant a Riley generation could, for reasons
   // not fully pinned down, fail this check and get dispatched through
-  // bootNative() instead of runDocumentScript() -- trying to npm
+  // bootNative() instead of the sandbox webview -- trying to npm
   // install document-generation dependencies (pdfkit, docx) as if they
   // were a Vite frontend, which is exactly what a real failure showed.
   // agentKey is a second, independent signal already available as a
@@ -164,15 +198,24 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
     }
   }, [status])
 
-  const teardownPrevious = async () => {
-    unsubscribeServerReadyRef.current?.()
-    unsubscribeServerReadyRef.current = null
-
-    try { await devProcessRef.current?.kill?.() } catch { /* already gone, fine */ }
-    devProcessRef.current = null
-
-    try { await installProcessRef.current?.kill?.() } catch { /* already gone, fine */ }
-    installProcessRef.current = null
+  // NEW: replaces the old teardownPrevious, which killed direct
+  // WebContainer process handles this component used to hold
+  // (devProcessRef/installProcessRef) before that logic moved into the
+  // isolated sandbox webview. This tears down the webview ELEMENT
+  // itself -- called when truly switching away from webcontainer mode
+  // (into native mode, or on real component unmount), not on every
+  // single run within webcontainer mode, since the whole point of the
+  // persistent webview is letting the WebContainer boot inside it
+  // survive across self-heal reruns.
+  const teardownSandboxWebview = () => {
+    webviewListenerCleanupRef.current?.()
+    webviewListenerCleanupRef.current = null
+    pendingRunRef.current = null
+    webviewDomReadyRef.current = false
+    if (webviewElRef.current) {
+      try { webviewElRef.current.remove() } catch { /* already gone, fine */ }
+      webviewElRef.current = null
+    }
   }
 
   // Real processes need real teardown too -- otherwise switching
@@ -274,14 +317,16 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
     hasTriggeredHealForThisRunRef.current = false
     errorHistoryRef.current = []
 
-    // NEW: confirmed real gap -- catches errors reported by the
-    // injected script in the scaffolded index.html (see
-    // injectFrontendBoilerplate), the only way to know about a runtime
-    // error happening inside the iframe after the page loads. Covers
-    // both native and WebContainer modes, since both load an iframe
-    // pointing at real content. A fresh closure over attemptSelfHeal
-    // each time this effect runs (a new generation) avoids a stale
-    // reference to state that changes between runs, like healAttempt.
+    // NEW: catches errors reported by the injected script in the
+    // scaffolded index.html (see injectFrontendBoilerplate) for NATIVE
+    // mode specifically -- native's preview iframe is still a direct
+    // child of this window, so window.parent.postMessage(...) from it
+    // still lands here exactly as before. The WebContainer path's
+    // equivalent now happens one level further away (inside the
+    // sandbox webview's own page, whose iframe's parent is THAT page,
+    // not this one) -- sandbox-webview-entry.ts has its own copy of
+    // this exact listener for that reason, relaying onward via
+    // bridge.reportError instead.
     const handleRuntimeErrorMessage = (event: MessageEvent) => {
       if (event.data?.type !== 'branch-hq-runtime-error') return
       if (!mounted || currentRunId !== runIdRef.current) return
@@ -290,212 +335,103 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
     }
     window.addEventListener('message', handleRuntimeErrorMessage)
 
-    async function bootWebApp() {
-      try {
-        await teardownPrevious()
-        if (!mounted || currentRunId !== runIdRef.current) return
+    // NEW: replaces the old bootWebApp()/runDocumentScript(), which
+    // called getWebContainer()/buildFileSystemTree() directly in this
+    // component. That logic now lives entirely in
+    // sandbox-webview-entry.ts, running inside its own isolated
+    // <webview> -- this function's only job is mounting that webview
+    // (once, reused across runs) and handing it this run's files/mode.
+    // No WebContainer calls happen here anymore, so unlike the function
+    // it replaces, this doesn't need to be async at all.
+    function bootSandboxWebview(mode: 'webapp' | 'document') {
+      if (!mounted || currentRunId !== runIdRef.current) return
+      if (!sandboxConfig) {
+        addLog('Error: Sandbox runtime configuration was not available.')
+        setStatus('error')
+        return
+      }
 
-        setStatus('booting')
-        setUrl(null)
-        addLog('System: Booting WebAssembly Container...')
-        const wc = await getWebContainer()
+      setStatus('booting')
+      setUrl(null)
+      setDocumentResult(null)
+      addLog('System: Booting WebAssembly Container (isolated sandbox)...')
 
-        if (!mounted || currentRunId !== runIdRef.current) return
+      const runPayload = { files, mode }
 
-        addLog('System: Mounting virtual filesystem...')
-        const tree = buildFileSystemTree(files)
-        await wc.mount(tree)
+      // NEW: fresh listener every run (closures need this run's
+      // attemptSelfHeal/healAttempt/etc.), even though the webview
+      // element itself is reused across runs -- see
+      // webviewListenerCleanupRef's own note above for why.
+      webviewListenerCleanupRef.current?.()
 
-        // NEW: only reinstall if the actual dependency list changed.
-        // Mounting doesn't touch node_modules (the tree never includes
-        // it), so a prior install genuinely survives across runs in the
-        // same WebContainer session -- this just stops paying for a
-        // reinstall of packages that are already sitting there.
-        const currentPackageJson = files['package.json'] || ''
-        const depsUnchanged = lastInstalledPackageJsonRef.current === currentPackageJson
+      if (!webviewElRef.current) {
+        const container = webviewContainerRef.current
+        if (!container) return
 
-        if (depsUnchanged) {
-          addLog('System: Dependencies unchanged since last run -- skipping npm install.')
-        } else {
-          setStatus('installing')
-          addLog('System: Running npm install (dependencies changed since last run)...')
-          const installProcess = await wc.spawn('npm', ['install'])
-          installProcessRef.current = installProcess
+        // @ts-ignore -- WebviewTag isn't part of the default DOM/React
+        // typings this project has configured; matches the existing
+        // convention here of ts-ignoring the untyped window.api surface.
+        const webview = document.createElement('webview') as any
+        webview.src = sandboxConfig.src
+        webview.partition = sandboxConfig.partition
+        webview.preload = sandboxConfig.preloadPath
+        webview.style.cssText = 'width:100%;height:100%;border:none;'
+        webview.setAttribute('allowpopups', 'true')
 
-          const installLogTail: string[] = []
-          installProcess.output.pipeTo(new WritableStream({
-            write(data) {
-              if (mounted) {
-                const line = data.trim()
-                addLog(line)
-                installLogTail.push(line)
-              }
-            }
-          }))
-
-          const installExitCode = await installProcess.exit
-          if (installExitCode !== 0) {
-            if (!mounted || currentRunId !== runIdRef.current) return
-            return attemptSelfHeal(`npm install failed:\n${installLogTail.slice(-60).join('\n')}`)
-          }
-          lastInstalledPackageJsonRef.current = currentPackageJson
-        }
-
-        if (!mounted || currentRunId !== runIdRef.current) return
-
-        setStatus('starting')
-        addLog('System: Starting dev server...')
-        const devProcess = await wc.spawn('npm', ['run', 'dev'])
-        devProcessRef.current = devProcess
-
-        const runLogTail: string[] = []
-        devProcess.output.pipeTo(new WritableStream({
-          write(data) {
-            if (!mounted) return
-            const line = data.trim()
-            addLog(line)
-            runLogTail.push(line)
-
-            // NEW: watch the live output for known-fatal build errors.
-            // Vite keeps the process running even after logging one of
-            // these, so there's no exit code to check here -- pattern
-            // matching on the stream is the only signal available.
-            if (currentRunId === runIdRef.current && !hasTriggeredHealForThisRunRef.current) {
-              const isFatal = FATAL_ERROR_PATTERNS.some(pattern => pattern.test(line))
-              if (isFatal) {
-                attemptSelfHeal(`The app failed to build/run with this error:\n${runLogTail.slice(-60).join('\n')}`)
-              }
-            }
-          }
-        }))
-
-        const unsubscribe = wc.on('server-ready', (port: number, previewUrl: string) => {
-          if (mounted && currentRunId === runIdRef.current && !hasTriggeredHealForThisRunRef.current) {
-            addLog(`System: Server ready on port ${port}`)
-            setUrl(previewUrl)
-            setStatus('ready')
-            reportExecutionSuccess()
+        // Fires exactly once, the first time this webview's guest page
+        // finishes loading -- forwards whatever run is pending at that
+        // moment. Doesn't touch attemptSelfHeal/etc., so it's safe to
+        // leave attached for the webview's whole lifetime without going
+        // stale, unlike the ipc-message listener below.
+        webview.addEventListener('dom-ready', () => {
+          webviewDomReadyRef.current = true
+          if (pendingRunRef.current) {
+            webview.send('sandbox-webview:run', pendingRunRef.current)
+            pendingRunRef.current = null
           }
         })
-        unsubscribeServerReadyRef.current = unsubscribe
 
-      } catch (err: any) {
-        if (mounted) {
-          setStatus('error')
-          addLog(`Error: ${err.message || 'Execution failed'}`)
+        webviewElRef.current = webview
+        container.appendChild(webview)
+      }
+
+      const handleIpcMessage = (event: any) => {
+        // Uses isComponentMountedRef, not the per-run `mounted` local --
+        // this listener is torn down and replaced every run anyway (see
+        // above), so staleness across runs isn't a concern here; this
+        // check only needs to catch true component unmount.
+        if (!isComponentMountedRef.current) return
+        switch (event.channel) {
+          case 'sandbox-webview:log':
+            addLog(event.args[0])
+            break
+          case 'sandbox-webview:ready':
+            setUrl(event.args[0])
+            setStatus('ready')
+            reportExecutionSuccess()
+            break
+          case 'sandbox-webview:error':
+            addLog(`Error: ${event.args[0]}`)
+            attemptSelfHeal(event.args[0])
+            break
+          case 'sandbox-webview:document-ready': {
+            const { name, data } = event.args[0]
+            setDocumentResult({ name, data })
+            setStatus('ready')
+            reportExecutionSuccess()
+            break
+          }
         }
       }
-    }
+      webviewElRef.current.addEventListener('ipc-message', handleIpcMessage)
+      webviewListenerCleanupRef.current = () => {
+        webviewElRef.current?.removeEventListener('ipc-message', handleIpcMessage)
+      }
 
-    async function runDocumentScript() {
-      try {
-        await teardownPrevious()
-        if (!mounted || currentRunId !== runIdRef.current) return
-
-        setStatus('booting')
-        setDocumentResult(null)
-        addLog('System: Booting WebAssembly Container...')
-        const wc = await getWebContainer()
-
-        if (!mounted || currentRunId !== runIdRef.current) return
-
-        addLog('System: Mounting virtual filesystem...')
-        const tree = buildFileSystemTree(files)
-        await wc.mount(tree)
-
-        const currentPackageJson = files['package.json'] || ''
-        const depsUnchanged = lastInstalledPackageJsonRef.current === currentPackageJson
-
-        if (depsUnchanged) {
-          addLog('System: Dependencies unchanged since last run -- skipping npm install.')
-        } else {
-          setStatus('installing')
-          addLog('System: Running npm install (dependencies changed since last run)...')
-          const installProcess = await wc.spawn('npm', ['install'])
-          installProcessRef.current = installProcess
-
-          const installLogTail: string[] = []
-          installProcess.output.pipeTo(new WritableStream({
-            write(data) {
-              if (mounted) {
-                const line = data.trim()
-                addLog(line)
-                installLogTail.push(line)
-              }
-            }
-          }))
-
-          const installExitCode = await installProcess.exit
-          if (installExitCode !== 0) {
-            if (!mounted || currentRunId !== runIdRef.current) return
-            return attemptSelfHeal(`npm install failed:\n${installLogTail.slice(-60).join('\n')}`)
-          }
-          lastInstalledPackageJsonRef.current = currentPackageJson
-        }
-
-        if (!mounted || currentRunId !== runIdRef.current) return
-
-        setStatus('starting')
-        addLog('System: Running the document script...')
-        const runProcess = await wc.spawn('npm', ['run', 'dev'])
-        devProcessRef.current = runProcess
-
-        const runLogTail: string[] = []
-        runProcess.output.pipeTo(new WritableStream({
-          write(data) {
-            if (mounted) {
-              const line = data.trim()
-              addLog(line)
-              runLogTail.push(line)
-            }
-          }
-        }))
-
-        // The document path's failure signal is clean: a non-zero exit
-        // code, unlike the web app path which has no such signal.
-        const runExitCode = await runProcess.exit
-        if (!mounted || currentRunId !== runIdRef.current) return
-
-        if (runExitCode !== 0) {
-          // NEW: widened from 30 to 60 lines. A crash deep inside a
-          // library's own code (like pptxgenjs) can print a long stack
-          // trace -- the actual useful error message can end up further
-          // back than 30 lines caught, meaning self-healing was
-          // sometimes asked to fix something without ever actually
-          // seeing what broke.
-          return attemptSelfHeal(`The document script exited with an error:\n${runLogTail.slice(-60).join('\n')}`)
-        }
-
-        addLog('System: Script finished. Looking for the output file...')
-        const candidateNames = ['output.pdf', 'output.pptx', 'output.docx', 'output.xlsx', 'output.csv', 'output.md']
-        let found: DocumentResult | null = null
-
-        for (const name of candidateNames) {
-          try {
-            const data = await wc.fs.readFile(name)
-            found = { name, data }
-            break
-          } catch {
-            // Not this one -- try the next candidate name.
-          }
-        }
-
-        if (!found) {
-          return attemptSelfHeal('The script finished successfully but produced no output.pdf or output.pptx file. The script must be missing the actual save/write step.')
-        }
-
-        addLog(`System: Found ${found.name} (${(found.data.byteLength / 1024).toFixed(1)} KB)`)
-        if (mounted && currentRunId === runIdRef.current) {
-          setDocumentResult(found)
-          setStatus('ready')
-          reportExecutionSuccess()
-        }
-
-      } catch (err: any) {
-        if (mounted) {
-          setStatus('error')
-          addLog(`Error: ${err.message || 'Execution failed'}`)
-        }
+      if (webviewDomReadyRef.current) {
+        webviewElRef.current.send('sandbox-webview:run', runPayload)
+      } else {
+        pendingRunRef.current = runPayload
       }
     }
 
@@ -503,16 +439,19 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
     // is available, this runs the frontend AND (if one was built
     // alongside it) the backend as real, separate, coordinated
     // processes -- no manual "cd server && npm run dev" needed. Falls
-    // back to WebContainers below whenever a native runtime isn't
+    // back to the sandbox webview below whenever a native runtime isn't
     // available, so nothing breaks on a machine without Node installed.
+    // Entirely untouched by the COOP/COEP fix -- native mode never
+    // needed WebContainers or session isolation in the first place.
     async function bootNative() {
       try {
-        await teardownPrevious()
+        teardownSandboxWebview()
         await teardownNative()
         if (!mounted || currentRunId !== runIdRef.current) return
 
         setStatus('booting')
         setUrl(null)
+        setBackendOnlyUrl(null)
         setActiveMode('native')
         addLog('System: Starting native runtime (real Node process, both frontend and backend if present)...')
 
@@ -545,6 +484,21 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
           addLog(`System: Backend confirmed running at ${data.url}`)
           setBackendReady(true)
         })
+        // NEW: fires only for a backend-only run (a direct-chat-to-
+        // Dwight-alone response, correctly identified as backend-only
+        // now that it's properly prefixed) -- there's no frontend-ready
+        // event ever coming to mark the run complete, so this is what
+        // actually does it. Deliberately does NOT set `url` (there's no
+        // visual preview to show) -- see the render logic below for how
+        // this is displayed honestly instead of just reusing the
+        // iframe-based "ready" state.
+        // @ts-ignore
+        const unsubBackendOnlyComplete = window.api.onSandboxBackendOnlyComplete((data: any) => {
+          if (data.runId !== runId || !mounted || currentRunId !== runIdRef.current) return
+          setBackendOnlyUrl(data.url)
+          setStatus('ready')
+          reportExecutionSuccess()
+        })
         // @ts-ignore
         const unsubError = window.api.onSandboxError((data: any) => {
           if (data.runId !== runId || !mounted || currentRunId !== runIdRef.current) return
@@ -559,7 +513,7 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
           }
         })
 
-        nativeUnsubscribersRef.current = [unsubLog, unsubFrontendReady, unsubBackendReady, unsubError]
+        nativeUnsubscribersRef.current = [unsubLog, unsubFrontendReady, unsubBackendReady, unsubBackendOnlyComplete, unsubError]
 
         // @ts-ignore
         const result = await window.api.startNativeSandbox(runId, files)
@@ -577,10 +531,23 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
 
     if (isDocumentOutput) {
       // Documents are quick, one-shot scripts with no server/port
-      // involved -- no benefit to native here, and WebContainers already
-      // handle this path without hitting any of the service-worker
-      // fragility that only affects the live-preview web-app path.
-      runDocumentScript()
+      // involved -- always the sandbox webview path, regardless of
+      // native availability, same as before.
+      // FIXED: confirmed real bug -- this branch previously called
+      // bootSandboxWebview('document') unconditionally, without
+      // checking whether sandboxConfig (fetched async on mount) had
+      // actually resolved yet. The webapp-fallback branch below always
+      // had this guard correctly; this one didn't. Confirmed via a
+      // real first test: "Error: Sandbox runtime configuration was not
+      // available" fired exactly when this ran before the config
+      // arrived, then the effect re-ran once it did and started
+      // booting for real -- a genuine race, not a WebContainer problem.
+      if (!sandboxConfig) {
+        addLog('System: Waiting for the sandbox runtime configuration...')
+      } else {
+        setActiveMode('webcontainer')
+        bootSandboxWebview('document')
+      }
     } else if (nativeAvailable === null) {
       addLog('System: Checking for a native runtime...')
       // Effect re-runs once detection resolves, since nativeAvailable is
@@ -588,18 +555,28 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
     } else if (nativeAvailable) {
       setActiveMode('native')
       bootNative()
+    } else if (!sandboxConfig) {
+      addLog('System: Waiting for the sandbox runtime configuration...')
+      // Effect re-runs once sandboxConfig resolves, since it's in the
+      // dependency list below.
     } else {
       setActiveMode('webcontainer')
-      bootWebApp()
+      bootSandboxWebview('webapp')
     }
 
     return () => {
       mounted = false
       window.removeEventListener('message', handleRuntimeErrorMessage)
-      teardownPrevious()
       teardownNative()
     }
-  }, [files, nativeAvailable])
+  }, [files, nativeAvailable, sandboxConfig])
+
+  // Real, full teardown of the sandbox webview on actual component
+  // unmount -- distinct from the per-run effect above, which
+  // deliberately does NOT tear the webview down between runs.
+  useEffect(() => {
+    return () => { teardownSandboxWebview() }
+  }, [])
 
   const handleDownload = () => {
     if (!documentResult) return
@@ -667,6 +644,21 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
       <div className="flex flex-col flex-1 overflow-hidden">
 
         <div className="flex-1 bg-white relative">
+          {/* NEW: persistent host for the WebContainer sandbox <webview>.
+              Always mounted (as a base layer, positioned behind whatever
+              status overlay is showing) whenever this run is in
+              webcontainer mode and isn't a document -- unlike the old
+              direct-iframe approach, this element must stay in the DOM
+              continuously across booting/installing/ready, since the
+              running WebContainer instance now lives inside its own
+              guest process, not just in this component's JS memory.
+              Status overlays below fully cover it with an opaque
+              background until status === 'ready', at which point no
+              overlay renders and it shows through untouched. */}
+          {activeMode === 'webcontainer' && !isDocumentOutput && (
+            <div ref={webviewContainerRef} className="absolute inset-0" />
+          )}
+
           {status === 'healing' ? (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-[#101010] text-center px-8">
               <Wrench size={32} className={`animate-pulse ${ACCENT.text}`} />
@@ -697,17 +689,44 @@ export default function SandboxPreview({ files, conversationId, agentKey, instru
                 Running the document script...
               </div>
             )
-          ) : url ? (
-            <iframe
-              src={url}
-              className="w-full h-full border-none"
-              title="Sandbox Preview"
-              sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
-            />
-          ) : status === 'error' ? (
-            <div className="absolute inset-0 flex items-center justify-center bg-[#101010] text-red-400 text-sm px-8 text-center">
-              Failed to start{canSelfHeal ? ' (self-healing already tried)' : ''} -- check the log below.
-            </div>
+          ) : activeMode === 'native' ? (
+            url ? (
+              <iframe
+                src={url}
+                className="w-full h-full border-none"
+                title="Sandbox Preview"
+                sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
+              />
+            ) : backendOnlyUrl ? (
+              // NEW: a backend-only response (direct-chat-to-Dwight-
+              // alone) has no frontend to show -- shown honestly here
+              // instead of either forcing a fake iframe or leaving the
+              // "Awaiting server URL..." placeholder showing forever
+              // even though the run genuinely succeeded.
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-[#101010] text-center px-8">
+                <Globe size={28} className="text-emerald-400 mb-1" />
+                <p className="text-neutral-200 text-sm font-medium">Backend confirmed running at {backendOnlyUrl}</p>
+                <p className="text-neutral-500 text-xs max-w-sm">This response was backend-only -- no frontend was generated, so there's nothing to visually preview. The server is real and reviewed; check the Code tab to see it.</p>
+              </div>
+            ) : status === 'error' ? (
+              <div className="absolute inset-0 flex items-center justify-center bg-[#101010] text-red-400 text-sm px-8 text-center">
+                Failed to start{canSelfHeal ? ' (self-healing already tried)' : ''} -- check the log below.
+              </div>
+            ) : (
+              <div className="absolute inset-0 flex items-center justify-center bg-[#101010] text-neutral-600">
+                Awaiting server URL...
+              </div>
+            )
+          ) : activeMode === 'webcontainer' ? (
+            status === 'ready' ? null : status === 'error' ? (
+              <div className="absolute inset-0 flex items-center justify-center bg-[#101010] text-red-400 text-sm px-8 text-center">
+                Failed to start{canSelfHeal ? ' (self-healing already tried)' : ''} -- check the log below.
+              </div>
+            ) : (
+              <div className="absolute inset-0 flex items-center justify-center bg-[#101010] text-neutral-600">
+                Awaiting server URL...
+              </div>
+            )
           ) : (
             <div className="absolute inset-0 flex items-center justify-center bg-[#101010] text-neutral-600">
               Awaiting server URL...

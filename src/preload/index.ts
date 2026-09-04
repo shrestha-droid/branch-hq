@@ -36,6 +36,15 @@ contextBridge.exposeInMainWorld('api', {
   listTrustedDevices: () => ipcRenderer.invoke('devices:listTrusted'),
   removeTrustedDevice: (deviceId: string) => ipcRenderer.invoke('devices:removeTrusted', deviceId),
   listPendingIncomingPairingRequests: () => ipcRenderer.invoke('devices:listPendingIncoming'),
+  generateInvite: () => ipcRenderer.invoke('devices:generateInvite'),
+  pairViaInvite: (inviteString: string) => ipcRenderer.invoke('devices:pairViaInvite', inviteString),
+  generateWorldwideInvite: () => ipcRenderer.invoke('devices:generateWorldwideInvite'),
+  redeemWorldwideInvite: (inviteString: string) => ipcRenderer.invoke('devices:redeemWorldwideInvite', inviteString),
+  onPairingInviteCompleted: (callback: (data: { deviceId: string; deviceName: string }) => void) => {
+    const listener = (_event: any, data: any) => callback(data)
+    ipcRenderer.on('pairing:invite-completed', listener)
+    return () => ipcRenderer.removeListener('pairing:invite-completed', listener)
+  },
   initiatePairing: (targetDeviceId: string) => ipcRenderer.invoke('devices:initiatePairing', targetDeviceId),
   respondToIncomingPairingRequest: (requestId: string, accept: boolean) =>
     ipcRenderer.invoke('devices:respondToIncomingRequest', { requestId, accept }),
@@ -85,6 +94,15 @@ contextBridge.exposeInMainWorld('api', {
     const listener = (_event: any, data: any) => callback(data)
     ipcRenderer.on('sandbox:backend-ready', listener)
     return () => ipcRenderer.removeListener('sandbox:backend-ready', listener)
+  },
+  // NEW: fires only when a native run has no frontend at all (a
+  // direct-chat-to-Dwight-alone response) -- the backend confirming up
+  // IS the whole run succeeding in that case, since no separate
+  // frontend-ready event is ever coming to signal completion.
+  onSandboxBackendOnlyComplete: (callback: (data: { runId: string; url: string; port: number }) => void) => {
+    const listener = (_event: any, data: any) => callback(data)
+    ipcRenderer.on('sandbox:backend-only-complete', listener)
+    return () => ipcRenderer.removeListener('sandbox:backend-only-complete', listener)
   },
   onSandboxError: (callback: (data: { runId: string; source: string; message: string }) => void) => {
     const listener = (_event: any, data: any) => callback(data)
@@ -163,6 +181,11 @@ declare global {
       listTrustedDevices: () => Promise<Array<{ deviceId: string; deviceName: string; publicKeyPem: string; pairedAt: number }>>;
       removeTrustedDevice: (deviceId: string) => Promise<{ success: boolean }>;
       listPendingIncomingPairingRequests: () => Promise<Array<{ requestId: string; fromDeviceId: string; fromDeviceName: string; verificationCode: string; receivedAt: number }>>;
+      generateInvite: () => Promise<{ success: boolean; inviteString?: string; expiresInMinutes?: number; error?: string }>;
+      pairViaInvite: (inviteString: string) => Promise<{ success: boolean; deviceName?: string; error?: string }>;
+      generateWorldwideInvite: () => Promise<{ success: boolean; inviteString?: string; expiresInMinutes?: number; error?: string }>;
+      redeemWorldwideInvite: (inviteString: string) => Promise<{ success: boolean; deviceName?: string; error?: string }>;
+      onPairingInviteCompleted: (callback: (data: { deviceId: string; deviceName: string }) => void) => () => void;
       initiatePairing: (targetDeviceId: string) => Promise<{ success: boolean; verificationCode?: string; targetDeviceName?: string; error?: string }>;
       respondToIncomingPairingRequest: (requestId: string, accept: boolean) => Promise<{ success: boolean; accepted?: boolean; verificationCode?: string; error?: string }>;
       finalizeOutgoingPairing: (targetDeviceId: string, peerRequestId: string, confirmed: boolean) => Promise<{ success: boolean; error?: string }>;
@@ -175,6 +198,7 @@ declare global {
       onSandboxLog: (callback: (data: { runId: string; source: string; line: string }) => void) => () => void;
       onSandboxFrontendReady: (callback: (data: { runId: string; url: string; port: number }) => void) => () => void;
       onSandboxBackendReady: (callback: (data: { runId: string; url: string; port: number }) => void) => () => void;
+      onSandboxBackendOnlyComplete: (callback: (data: { runId: string; url: string; port: number }) => void) => () => void;
       onSandboxError: (callback: (data: { runId: string; source: string; message: string }) => void) => () => void;
       indexWorkspace: (targetPath?: string) => Promise<{ success: boolean; indexedFiles?: number; error?: string }>;
       writeFiles: (targetDirectory: string, files: Record<string, string>, overwriteConfirmed?: boolean) => Promise<{ success: boolean; writtenFiles?: string[]; skippedFiles?: string[]; error?: string }>;
@@ -186,8 +210,8 @@ declare global {
       clearGithubToken: () => Promise<{ success: boolean }>;
       pushToGithub: (files: Record<string, string>, repoName: string, isPrivate: boolean) => Promise<{ success: boolean; repoUrl?: string; error?: string }>;
       getUsage: (conversationId?: string) => Promise<{ success: boolean; session: { callCount: number; charsIn: number; charsOut: number }; conversation: { callCount: number; charsIn: number; charsOut: number } | null }>;
-      getSettings: () => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; fallbackGeminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string; strictVerification: boolean }>;
-      updateSettings: (partial: Record<string, any>) => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; fallbackGeminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string; strictVerification: boolean }>;
+      getSettings: () => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; fallbackGeminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string; dwightModel: string; enableWebSearch: boolean; masterProfile: string; strictVerification: boolean }>;
+      updateSettings: (partial: Record<string, any>) => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; fallbackGeminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string; dwightModel: string; enableWebSearch: boolean; masterProfile: string; strictVerification: boolean }>;
       exportAuditReport: (conversationId: string) => Promise<{ success: boolean; report?: string; integrityHash?: string; generatedAt?: string; error?: string }>;
       exportClientSummary: (conversationId: string) => Promise<{ success: boolean; summary?: string; generatedAt?: string; error?: string }>;
       getClientFacts: (conversationId: string) => Promise<{ success: boolean; facts?: string; error?: string }>;

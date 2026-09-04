@@ -1,5 +1,6 @@
 import * as fs from 'fs/promises'
 import * as path from 'path'
+import * as crypto from 'crypto'
 import { app } from 'electron'
 import { computeVerificationCode } from './deviceIdentity'
 
@@ -210,4 +211,59 @@ export function markOutgoingAwaitingLocalConfirmation(targetDeviceId: string): v
 
 export function consumePendingOutgoingRequest(targetDeviceId: string): void {
   pendingOutgoing.delete(targetDeviceId)
+}
+
+// NEW: invite-code pairing -- a genuinely simpler alternative to the
+// discovery-based flow above, for when mDNS isn't reliable (some VPNs,
+// guest networks, and router configurations block multicast) or when
+// both devices simply aren't looking at their Devices panel at the same
+// moment. One device generates a shareable invite string (embeds a
+// random code, a random secret, and enough network info to connect
+// directly -- no discovery needed at all) and sends it to the other
+// device through ANY channel they already trust (a text, a Slack DM,
+// read aloud). The security model is different from, but no weaker
+// than, the discovery flow's human-code-comparison: THERE, a human has
+// to compare a code because mere discovery grants no trust at all.
+// HERE, the act of deliberately sharing a high-entropy, single-use,
+// short-lived secret through a channel the two people already trust
+// IS the consent -- equivalent to how installing an app via a link
+// someone personally sent you is treated differently from installing
+// whatever a stranger on the same WiFi is broadcasting. Single-use and
+// short-lived specifically so a leaked or intercepted invite has a
+// small, real window of exposure rather than an indefinite one.
+
+export interface PairingInvite {
+  code: string
+  secret: string
+  createdAt: number
+}
+
+const INVITE_TTL_MS = 10 * 60 * 1000
+
+const activeInvites = new Map<string, PairingInvite>()
+
+export function createPairingInvite(): PairingInvite {
+  const code = crypto.randomBytes(4).toString('hex').toUpperCase()
+  const secret = crypto.randomBytes(16).toString('hex')
+  const invite: PairingInvite = { code, secret, createdAt: Date.now() }
+  activeInvites.set(code, invite)
+  return invite
+}
+
+// Returns true and consumes the invite (strictly single-use) only when
+// the code exists, hasn't expired, and the provided secret matches
+// exactly. Any failure mode (wrong code, wrong secret, expired,
+// already used) returns the same plain false -- deliberately not
+// distinguishing WHY it failed in the response, so a wrong guess can't
+// be used to narrow down a real invite's secret through repeated tries.
+export function consumeAndValidateInvite(code: string, providedSecret: string): boolean {
+  const invite = activeInvites.get(code)
+  if (!invite) return false
+  if (Date.now() - invite.createdAt > INVITE_TTL_MS) {
+    activeInvites.delete(code)
+    return false
+  }
+  if (invite.secret !== providedSecret) return false
+  activeInvites.delete(code)
+  return true
 }

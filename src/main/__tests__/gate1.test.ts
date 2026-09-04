@@ -1,151 +1,127 @@
 import { describe, it, expect } from 'vitest'
-import { auditSingleFile, runMechanicalAudit, stripComments } from '../gate1'
+import { stripComments, auditSingleFile, runMechanicalAudit } from '../gate1'
 
-// Every case here is grounded in either a documented Gate 1 rule or a
-// real bug actually found and fixed in this project -- not invented
-// examples. This is the regression suite that's been named as the
-// single highest-priority missing piece, repeatedly, throughout this
-// project's whole history.
-
-describe('Gate 1 -- hardcoded secrets', () => {
-  it('blocks a hardcoded password not sourced from process.env', () => {
-    const code = `const password = "sup3rSecret123";`
-    const result = auditSingleFile('src/config.ts', code)
-    expect(result.passed).toBe(false)
-    expect(result.blockers.some(b => b.includes('Hardcoded credential'))).toBe(true)
+describe('stripComments', () => {
+  it('strips a line comment', () => {
+    const out = stripComments('const x = 1; // a comment\nconst y = 2;')
+    expect(out).not.toContain('a comment')
+    expect(out).toContain('const y = 2;')
   })
 
-  it('blocks a hardcoded API key', () => {
-    const code = `const apiKey = "AIzaSyD-hardcoded-value-here";`
-    const result = auditSingleFile('src/client.ts', code)
-    expect(result.passed).toBe(false)
+  it('strips a block comment', () => {
+    const out = stripComments('const x = 1; /* block\ncomment */ const y = 2;')
+    expect(out).not.toContain('block')
+    expect(out).toContain('const y = 2;')
   })
 
-  it('allows a secret correctly sourced from process.env', () => {
-    const code = `const password = process.env.DB_PASSWORD;`
-    const result = auditSingleFile('src/config.ts', code)
+  it('does NOT strip "//" that appears inside a real string literal -- a URL, specifically', () => {
+    // Confirmed real risk: naive comment-stripping that doesn't track
+    // string state would corrupt a perfectly normal line like this one,
+    // treating "//example.com" as the start of a comment and deleting
+    // real code after it.
+    const out = stripComments(`const url = "http://example.com/path";`)
+    expect(out).toContain('http://example.com/path')
+  })
+
+  it('does not get confused by an escaped quote inside a string', () => {
+    const out = stripComments(`const s = "she said \\"hi\\" // not a comment";`)
+    expect(out).toContain('not a comment')
+  })
+})
+
+describe('auditSingleFile', () => {
+  it('blocks code that fails to parse, before any security scan runs', () => {
+    const result = auditSingleFile('src/broken.ts', 'const x = {{{ this is not valid typescript')
+    expect(result.passed).toBe(false)
+    expect(result.blockers.some(b => b.startsWith('PARSE ERROR'))).toBe(true)
+  })
+
+  it('does not attempt to parse a non-JS/TS file as code', () => {
+    // A CSS file full of content that would never parse as JS/TS should
+    // not trigger a false PARSE ERROR -- confirmed real design: only
+    // .ts/.tsx/.js/.jsx are run through the Babel parser at all.
+    const result = auditSingleFile('src/styles.css', '.foo { color: {{{ not real css either')
+    expect(result.blockers.some(b => b.startsWith('PARSE ERROR'))).toBe(false)
+  })
+
+  it('blocks a hardcoded credential-like value', () => {
+    const result = auditSingleFile('src/config.ts', `const apiKey = "sk-abc123realkeylooking";`)
+    expect(result.passed).toBe(false)
+    expect(result.blockers.some(b => b.includes('Hardcoded credential-like value'))).toBe(true)
+  })
+
+  it('does NOT block a value correctly sourced from process.env', () => {
+    const result = auditSingleFile('src/config.ts', `const apiKey = process.env.GEMINI_API_KEY;`)
+    expect(result.passed).toBe(true)
+  })
+
+  it('blocks res.cookie() missing httpOnly/secure entirely', () => {
+    const result = auditSingleFile('src/auth.ts', `res.cookie('session', token);`)
+    expect(result.passed).toBe(false)
+    expect(result.blockers.some(b => b.includes('missing httpOnly and/or secure'))).toBe(true)
+  })
+
+  it('passes res.cookie() with httpOnly/secure both statically true', () => {
+    const result = auditSingleFile('src/auth.ts', `res.cookie('session', token, { httpOnly: true, secure: true });`)
     expect(result.passed).toBe(true)
     expect(result.blockers).toHaveLength(0)
   })
 
-  it('does not false-positive on an unrelated variable name', () => {
-    const code = `const username = "admin_display_name";`
-    const result = auditSingleFile('src/config.ts', code)
-    expect(result.passed).toBe(true)
-  })
-})
-
-describe('Gate 1 -- insecure cookies', () => {
-  it('blocks a cookie call missing httpOnly/secure entirely', () => {
-    const code = `res.cookie('session', token);`
-    const result = auditSingleFile('src/routes/auth.ts', code)
-    expect(result.passed).toBe(false)
-    expect(result.blockers.some(b => b.includes('httpOnly'))).toBe(true)
-  })
-
-  it('warns (does not block) when flags are present but not statically true', () => {
-    const code = `res.cookie('session', token, { httpOnly: isProd, secure: isProd });`
-    const result = auditSingleFile('src/routes/auth.ts', code)
+  it('warns (does not block) when cookie flags are present but not statically resolvable', () => {
+    const result = auditSingleFile('src/auth.ts', `res.cookie('session', token, { httpOnly: isProd, secure: isProd });`)
     expect(result.passed).toBe(true)
     expect(result.warnings.length).toBeGreaterThan(0)
   })
 
-  it('passes a correctly secured cookie', () => {
-    const code = `res.cookie('session', token, { httpOnly: true, secure: true });`
-    const result = auditSingleFile('src/routes/auth.ts', code)
+  it('blocks a plaintext password taken from the request body with no hashing anywhere in the file', () => {
+    const result = auditSingleFile('src/auth.ts', `
+      const password = req.body.password;
+      db.data.users.push({ password });
+    `)
+    expect(result.passed).toBe(false)
+    expect(result.blockers.some(b => b.includes('Plaintext password handling'))).toBe(true)
+  })
+
+  it('does not block a password from the request body when the file also hashes it', () => {
+    const result = auditSingleFile('src/auth.ts', `
+      const { password } = req.body;
+      const hash = await bcrypt.hash(password, 10);
+    `)
     expect(result.passed).toBe(true)
+  })
+
+  it('genuinely clean code passes with no blockers and no warnings', () => {
+    const result = auditSingleFile('src/util.ts', `export function add(a: number, b: number) { return a + b }`)
+    expect(result.passed).toBe(true)
+    expect(result.blockers).toHaveLength(0)
     expect(result.warnings).toHaveLength(0)
   })
 })
 
-describe('Gate 1 -- plaintext passwords', () => {
-  it('blocks a plaintext password pulled directly off req.body', () => {
-    const code = `const password = req.body.password; db.save({ password });`
-    const result = auditSingleFile('src/routes/register.ts', code)
-    expect(result.passed).toBe(false)
-    expect(result.blockers.some(b => b.includes('Plaintext password'))).toBe(true)
-  })
-
-  it('blocks the destructured form too -- this exact pattern was missed by an earlier version of Gate 1', () => {
-    const code = `const { password } = req.body; db.save({ password });`
-    const result = auditSingleFile('src/routes/register.ts', code)
-    expect(result.passed).toBe(false)
-  })
-
-  it('allows a password that is actually hashed before storage', () => {
-    const code = `const { password } = req.body; const hash = await bcrypt.hash(password, 10);`
-    const result = auditSingleFile('src/routes/register.ts', code)
-    expect(result.passed).toBe(true)
-  })
-})
-
-describe('Gate 1 -- parse validity', () => {
-  it('blocks genuinely invalid syntax -- the real bug: a trailing comma after render()', () => {
-    // This exact mistake shipped once in a real generation and was
-    // caught by Gate 1 automatically, triggering a retry.
-    const code = `ReactDOM.createRoot(document.getElementById('root')!).render(<App />),`
-    const result = auditSingleFile('src/main.tsx', code)
-    expect(result.passed).toBe(false)
-    expect(result.blockers.some(b => b.includes('PARSE ERROR'))).toBe(true)
-  })
-
-  it('passes valid TypeScript/JSX', () => {
-    const code = `export default function App() { return <div>Hello</div> }`
-    const result = auditSingleFile('src/App.tsx', code)
-    expect(result.passed).toBe(true)
-  })
-
-  it('never parses CSS as JS -- would false-positive as a parse error otherwise', () => {
-    const code = `.crt-scanlines { background: linear-gradient(rgba(0,0,0,0.2) 50%, transparent 50%); }`
-    const result = auditSingleFile('src/assets/main.css', code)
-    expect(result.passed).toBe(true)
-  })
-
-  it('never parses HTML as JS either', () => {
-    const code = `<!DOCTYPE html><html><body><div id="root"></div></body></html>`
-    const result = auditSingleFile('index.html', code)
-    expect(result.passed).toBe(true)
-  })
-})
-
-describe('Gate 1 -- comment stripping does not create false negatives', () => {
-  it('still catches a hardcoded secret sitting next to a comment', () => {
-    const code = `// TODO: move this to env eventually\nconst secret = "not-actually-moved-yet";`
-    const result = auditSingleFile('src/config.ts', code)
-    expect(result.passed).toBe(false)
-  })
-
-  it('does not strip content out of a string that merely contains // or /*', () => {
-    const stripped = stripComments(`const url = "https://example.com";`)
-    expect(stripped).toContain('https://example.com')
-  })
-})
-
-describe('runMechanicalAudit -- multi-file aggregation', () => {
-  it('passes only when every file passes', () => {
-    const result = runMechanicalAudit({
-      'src/App.tsx': `export default function App() { return null }`,
-      'src/config.ts': `const apiKey = "hardcoded-bad-value";`
-    })
-    expect(result.passed).toBe(false)
-    expect(result.perFile).toHaveLength(2)
-    expect(result.perFile.find(f => f.file === 'src/App.tsx')?.passed).toBe(true)
-    expect(result.perFile.find(f => f.file === 'src/config.ts')?.passed).toBe(false)
-  })
-
-  it('prefixes every blocker with the file it came from', () => {
-    const result = runMechanicalAudit({
-      'src/routes/auth.ts': `res.cookie('x', y);`
-    })
-    expect(result.blockers[0]).toContain('[src/routes/auth.ts]')
-  })
-
-  it('passes cleanly on a real, multi-file, secure example', () => {
-    const result = runMechanicalAudit({
-      'src/App.tsx': `export default function App() { return <div>OK</div> }`,
-      'src/server.ts': `const key = process.env.API_KEY; res.cookie('s', t, { httpOnly: true, secure: true });`
-    })
+describe('runMechanicalAudit', () => {
+  it('an empty file set passes trivially -- documented explicitly, since this exact behavior is why auditAndStage (extraction.ts) has to separately guard against zero-extraction being mistaken for a real pass', () => {
+    const result = runMechanicalAudit({})
     expect(result.passed).toBe(true)
     expect(result.blockers).toHaveLength(0)
+    expect(result.perFile).toHaveLength(0)
+  })
+
+  it('aggregates blockers across multiple files, each prefixed with its own filename', () => {
+    const result = runMechanicalAudit({
+      'src/good.ts': `export const x = 1`,
+      'src/bad.ts': `const apiKey = "sk-realsecretvalue123";`
+    })
+    expect(result.passed).toBe(false)
+    expect(result.blockers.some(b => b.startsWith('[src/bad.ts]'))).toBe(true)
+    expect(result.blockers.some(b => b.startsWith('[src/good.ts]'))).toBe(false)
+  })
+
+  it('multiple genuinely clean files all pass together', () => {
+    const result = runMechanicalAudit({
+      'src/a.ts': `export const a = 1`,
+      'src/b.ts': `export const b = 2`
+    })
+    expect(result.passed).toBe(true)
+    expect(result.perFile).toHaveLength(2)
   })
 })

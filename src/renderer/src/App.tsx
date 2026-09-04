@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import ChatInterface from './components/ChatInterface'
 import SandboxPreview from './components/SandboxPreview'
 import SettingsModal from './components/SettingsModal'
-import { Code2, FileCode, X, CheckCircle2, Play, HardDriveDownload, Loader2, AlertTriangle, Activity, ShieldCheck, Maximize2, Minimize2, Download, GitBranch, BookOpen, Laptop, Wifi, Check, Trash2 } from 'lucide-react'
+import { Code2, FileCode, X, CheckCircle2, Play, HardDriveDownload, Loader2, AlertTriangle, Activity, ShieldCheck, Maximize2, Minimize2, Download, GitBranch, BookOpen, Laptop, Wifi, Check, Trash2, UserCircle, Link, Globe } from 'lucide-react'
 
 const ACCENT = {
   text: 'text-[#409cff]',
@@ -103,7 +103,33 @@ export default function App() {
     peerRequestId?: string
   } | null>(null)
   const [devicesStatusMessage, setDevicesStatusMessage] = useState<string | null>(null)
+
+  // NEW: "Your Profile" -- global standing context about who's actually
+  // running Branch HQ, unlike Project Knowledge which is scoped per
+  // conversation. No conversationId dependency at all, so unlike
+  // Project Knowledge this is genuinely usable the instant the app
+  // opens -- see settingsStore.ts's masterProfile field.
+  const [masterProfileModalOpen, setMasterProfileModalOpen] = useState(false)
+  const [masterProfileText, setMasterProfileText] = useState('')
+  const [isSavingMasterProfile, setIsSavingMasterProfile] = useState(false)
+  const [masterProfileSaveStatus, setMasterProfileSaveStatus] = useState<string | null>(null)
   const [isPairingInFlight, setIsPairingInFlight] = useState(false)
+  // NEW: invite-based pairing state -- see devicePairing.ts for the
+  // simpler flow this drives, distinct from the discovery-based one
+  // above.
+  const [generatedInvite, setGeneratedInvite] = useState<string | null>(null)
+  const [isGeneratingInvite, setIsGeneratingInvite] = useState(false)
+  const [inviteInputText, setInviteInputText] = useState('')
+  const [isRedeemingInvite, setIsRedeemingInvite] = useState(false)
+  // NEW: worldwide (non-LAN) pairing state -- see index.ts's
+  // devices:generateWorldwideInvite/redeemWorldwideInvite for the
+  // relay-mediated flow this drives.
+  const [relayServerUrl, setRelayServerUrl] = useState('')
+  const [isSavingRelayUrl, setIsSavingRelayUrl] = useState(false)
+  const [generatedWorldwideInvite, setGeneratedWorldwideInvite] = useState<string | null>(null)
+  const [isGeneratingWorldwideInvite, setIsGeneratingWorldwideInvite] = useState(false)
+  const [worldwideInviteInputText, setWorldwideInviteInputText] = useState('')
+  const [isRedeemingWorldwideInvite, setIsRedeemingWorldwideInvite] = useState(false)
   const [pushStatus, setPushStatus] = useState<string | null>(null)
   const [isIndexing, setIsIndexing] = useState(false)
   // NEW: files that already exist at the target path -- shown as a
@@ -174,11 +200,21 @@ export default function App() {
       setOutgoingPairing(null)
       setDevicesStatusMessage(`${data.deviceName} cancelled the pairing.`)
     })
+    // NEW: fires on the INVITE-GENERATING device once someone redeems
+    // it -- purely informational, nothing to click or confirm, since
+    // sharing the invite already was this device's consent.
+    // @ts-ignore
+    const unsubInviteCompleted = window.api.onPairingInviteCompleted((data: any) => {
+      setTrustedDevices(prev => [...prev.filter(p => p.deviceId !== data.deviceId), { deviceId: data.deviceId, deviceName: data.deviceName, pairedAt: Date.now() }])
+      setGeneratedInvite(null)
+      setDevicesStatusMessage(`${data.deviceName} used your invite -- paired.`)
+    })
     return () => {
       unsubIncoming?.()
       unsubPeerConfirmed?.()
       unsubCompleted?.()
       unsubCancelled?.()
+      unsubInviteCompleted?.()
     }
   }, [])
 
@@ -422,6 +458,30 @@ export default function App() {
     }
   }
 
+  // NEW: loaded once on mount -- global, so there's no "which
+  // conversation" question the way Project Knowledge has.
+  useEffect(() => {
+    // @ts-ignore
+    window.api.getSettings().then((s: any) => {
+      setMasterProfileText(s.masterProfile || '')
+      setRelayServerUrl(s.relayServerUrl || '')
+    }).catch(() => {})
+  }, [])
+
+  const handleSaveMasterProfile = async () => {
+    setIsSavingMasterProfile(true)
+    setMasterProfileSaveStatus(null)
+    try {
+      // @ts-ignore
+      await window.api.updateSettings({ masterProfile: masterProfileText })
+      setMasterProfileSaveStatus('Saved -- every project will use this from now on.')
+    } catch (err: any) {
+      setMasterProfileSaveStatus(`Error: ${err.message}`)
+    } finally {
+      setIsSavingMasterProfile(false)
+    }
+  }
+
   const refreshDiscoveredDevices = async () => {
     try {
       // @ts-ignore
@@ -466,6 +526,114 @@ export default function App() {
       }
     } catch (err: any) {
       setDevicesStatusMessage(`Error: ${err.message}`)
+    }
+  }
+
+  const handleSaveRelayUrl = async () => {
+    setIsSavingRelayUrl(true)
+    setDevicesStatusMessage(null)
+    try {
+      // @ts-ignore
+      await window.api.updateSettings({ relayServerUrl: relayServerUrl.trim() })
+      setDevicesStatusMessage(relayServerUrl.trim() ? 'Relay server saved -- worldwide pairing is now available.' : 'Relay server cleared -- worldwide pairing is unavailable until one is set again.')
+    } catch (err: any) {
+      setDevicesStatusMessage(`Error: ${err.message}`)
+    } finally {
+      setIsSavingRelayUrl(false)
+    }
+  }
+
+  const handleGenerateWorldwideInvite = async () => {
+    setIsGeneratingWorldwideInvite(true)
+    setDevicesStatusMessage(null)
+    try {
+      // @ts-ignore
+      const res = await window.api.generateWorldwideInvite()
+      if (res.success) {
+        setGeneratedWorldwideInvite(res.inviteString || null)
+      } else {
+        setDevicesStatusMessage(res.error || 'Could not generate a worldwide invite.')
+      }
+    } catch (err: any) {
+      setDevicesStatusMessage(`Error: ${err.message}`)
+    } finally {
+      setIsGeneratingWorldwideInvite(false)
+    }
+  }
+
+  const handleCopyWorldwideInvite = () => {
+    if (!generatedWorldwideInvite) return
+    navigator.clipboard?.writeText(generatedWorldwideInvite)
+    setDevicesStatusMessage('Copied -- send it to the other device through anywhere you already trust.')
+  }
+
+  const handleRedeemWorldwideInvite = async () => {
+    if (!worldwideInviteInputText.trim()) return
+    setIsRedeemingWorldwideInvite(true)
+    setDevicesStatusMessage(null)
+    try {
+      // @ts-ignore
+      const res = await window.api.redeemWorldwideInvite(worldwideInviteInputText.trim())
+      if (res.success) {
+        setWorldwideInviteInputText('')
+        setDevicesStatusMessage(`Paired with ${res.deviceName}.`)
+        // @ts-ignore
+        const trusted = await window.api.listTrustedDevices()
+        setTrustedDevices(trusted)
+      } else {
+        setDevicesStatusMessage(res.error || 'Could not pair using that invite.')
+      }
+    } catch (err: any) {
+      setDevicesStatusMessage(`Error: ${err.message}`)
+    } finally {
+      setIsRedeemingWorldwideInvite(false)
+    }
+  }
+
+  const handleGenerateInvite = async () => {
+    setIsGeneratingInvite(true)
+    setDevicesStatusMessage(null)
+    try {
+      // @ts-ignore
+      const res = await window.api.generateInvite()
+      if (res.success) {
+        setGeneratedInvite(res.inviteString || null)
+      } else {
+        setDevicesStatusMessage(res.error || 'Could not generate an invite.')
+      }
+    } catch (err: any) {
+      setDevicesStatusMessage(`Error: ${err.message}`)
+    } finally {
+      setIsGeneratingInvite(false)
+    }
+  }
+
+  const handleCopyInvite = () => {
+    if (!generatedInvite) return
+    navigator.clipboard?.writeText(generatedInvite)
+    setDevicesStatusMessage('Copied -- send it to the other device through anywhere you already trust (text, Slack, etc).')
+  }
+
+  const handleRedeemInvite = async () => {
+    if (!inviteInputText.trim()) return
+    setIsRedeemingInvite(true)
+    setDevicesStatusMessage(null)
+    try {
+      // @ts-ignore
+      const res = await window.api.pairViaInvite(inviteInputText.trim())
+      if (res.success) {
+        setInviteInputText('')
+        setDevicesStatusMessage(`Paired with ${res.deviceName}.`)
+        // @ts-ignore
+        const trusted = await window.api.listTrustedDevices()
+        setTrustedDevices(trusted)
+      } else {
+        setDevicesStatusMessage(res.error || 'Could not pair using that invite.')
+      }
+    } catch (err: any) {
+      setDevicesStatusMessage(`Error: ${err.message}`)
+    } finally {
+      setIsRedeemingInvite(false)
     }
   }
 
@@ -602,6 +770,14 @@ export default function App() {
           >
             <BookOpen size={13} />
             Project Knowledge
+          </button>
+          <button
+            onClick={() => { setMasterProfileModalOpen(true); setMasterProfileSaveStatus(null) }}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-neutral-500 hover:text-white hover:bg-white/[0.06] text-xs font-medium rounded-md transition-colors"
+            title="Standing info about who's running Branch HQ -- applies to every project, not just this one"
+          >
+            <UserCircle size={13} />
+            Your Profile
           </button>
           <button
             onClick={handleOpenDevicesModal}
@@ -906,6 +1082,57 @@ export default function App() {
         </div>
       )}
 
+      {masterProfileModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4">
+          <div className="bg-[#2c2c2e] border border-white/[0.08] rounded-2xl w-full max-w-lg p-5 backdrop-blur-2xl">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <UserCircle size={16} className="text-white" />
+                <h3 className="text-sm font-medium text-white">Your Profile</h3>
+              </div>
+              <button onClick={() => setMasterProfileModalOpen(false)} className="text-neutral-500 hover:text-white">
+                <X size={16} />
+              </button>
+            </div>
+
+            <p className="text-xs text-neutral-400 mb-3 leading-relaxed">
+              Who's actually running Branch HQ -- you or your agency. Applies to every project, not just the current one (unlike Project Knowledge, which is scoped to one project's client). Useful for standing conventions, tone, or defaults you always want -- if this ever conflicts with a specific project's own Client Facts, the project's facts win.
+            </p>
+
+            <textarea
+              value={masterProfileText}
+              onChange={(e) => setMasterProfileText(e.target.value)}
+              placeholder={'e.g.\nRunning a freelance/agency web development business\nPrefer clean, minimal UI over dense/busy layouts by default\nBased in [location] -- default to that timezone/locale unless a project says otherwise'}
+              rows={10}
+              className="w-full bg-black/30 border border-white/[0.06] rounded-lg px-3 py-2.5 text-xs text-neutral-200 placeholder-neutral-600 focus:outline-none focus:border-white/20 resize-none font-mono"
+            />
+
+            {masterProfileSaveStatus && (
+              <p className={`text-xs mt-2 ${masterProfileSaveStatus.startsWith('Saved') ? 'text-emerald-400' : 'text-red-400'}`}>
+                {masterProfileSaveStatus}
+              </p>
+            )}
+
+            <div className="flex justify-end gap-2 mt-4">
+              <button
+                onClick={() => setMasterProfileModalOpen(false)}
+                className="px-3 py-1.5 text-xs text-neutral-300 hover:text-white transition-colors"
+              >
+                Close
+              </button>
+              <button
+                onClick={handleSaveMasterProfile}
+                disabled={isSavingMasterProfile}
+                className={`flex items-center justify-center gap-2 px-4 py-2 ${ACCENT.bg} ${ACCENT.bgHover} text-white text-xs font-medium rounded-lg disabled:opacity-50 transition-colors`}
+              >
+                {isSavingMasterProfile ? <Loader2 size={14} className="animate-spin" /> : null}
+                {isSavingMasterProfile ? 'Saving...' : 'Save'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {devicesModalOpen && (
         <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4">
           <div className="bg-[#2c2c2e] border border-white/[0.08] rounded-2xl w-full max-w-lg p-5 backdrop-blur-2xl max-h-[85vh] overflow-y-auto">
@@ -1017,6 +1244,134 @@ export default function App() {
             {devicesStatusMessage && (
               <p className="text-xs text-neutral-400 mb-3">{devicesStatusMessage}</p>
             )}
+
+            {/* NEW: invite-based pairing -- simpler than discovery,
+                works even when mDNS isn't cooperating, and doesn't
+                need both devices' panels open at the same time. See
+                devicePairing.ts for the security reasoning. */}
+            <div className="bg-black/20 border border-white/[0.06] rounded-lg p-3 mb-4">
+              <label className="text-[11px] font-medium text-neutral-500 uppercase tracking-wide flex items-center gap-1.5 mb-2">
+                <Link size={11} />
+                Invite (easier -- no discovery needed)
+              </label>
+
+              {generatedInvite ? (
+                <>
+                  <p className="text-[10px] text-neutral-500 mb-1.5">Send this to the other device however you already trust (text, Slack, read aloud) -- valid 10 minutes, works once:</p>
+                  <div className="flex items-center gap-2">
+                    <code className="flex-1 bg-black/30 border border-white/[0.06] rounded-md px-2.5 py-1.5 text-[10px] text-neutral-300 font-mono truncate">{generatedInvite}</code>
+                    <button
+                      onClick={handleCopyInvite}
+                      className="px-2.5 py-1.5 text-[11px] bg-white/10 hover:bg-white/20 text-neutral-200 rounded-md transition-colors shrink-0"
+                    >
+                      Copy
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <button
+                  onClick={handleGenerateInvite}
+                  disabled={isGeneratingInvite}
+                  className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs bg-white/10 hover:bg-white/20 disabled:opacity-50 text-neutral-200 rounded-md transition-colors"
+                >
+                  {isGeneratingInvite ? <Loader2 size={13} className="animate-spin" /> : <Link size={13} />}
+                  Generate an invite for this device
+                </button>
+              )}
+
+              <div className="flex items-center gap-2 mt-2.5">
+                <input
+                  type="text"
+                  value={inviteInputText}
+                  onChange={(e) => setInviteInputText(e.target.value)}
+                  placeholder="Paste an invite from another device..."
+                  className="flex-1 bg-black/30 border border-white/[0.06] rounded-md px-2.5 py-1.5 text-[11px] text-neutral-200 placeholder-neutral-600 font-mono focus:outline-none focus:border-white/20"
+                />
+                <button
+                  onClick={handleRedeemInvite}
+                  disabled={isRedeemingInvite || !inviteInputText.trim()}
+                  className="px-2.5 py-1.5 text-[11px] bg-white/10 hover:bg-white/20 disabled:opacity-30 text-neutral-200 rounded-md transition-colors shrink-0"
+                >
+                  {isRedeemingInvite ? <Loader2 size={12} className="animate-spin" /> : 'Pair'}
+                </button>
+              </div>
+            </div>
+
+            {/* NEW: worldwide pairing -- entirely opt-in, gated behind
+                a relay server the person explicitly configures
+                themselves. See relay-server/README.md for what
+                running one involves and what it can/can't see. */}
+            <div className="bg-black/20 border border-white/[0.06] rounded-lg p-3 mb-4">
+              <label className="text-[11px] font-medium text-neutral-500 uppercase tracking-wide flex items-center gap-1.5 mb-2">
+                <Globe size={11} />
+                Worldwide (opt-in -- needs a relay server)
+              </label>
+
+              <p className="text-[10px] text-neutral-500 mb-2 leading-relaxed">
+                Pair with a device that isn't on this network. Needs a relay server you (or whoever you're pairing with) points both devices at -- the relay only ever sees pairing codes and signatures, never your actual project work. See relay-server/README.md.
+              </p>
+
+              <div className="flex items-center gap-2 mb-2.5">
+                <input
+                  type="text"
+                  value={relayServerUrl}
+                  onChange={(e) => setRelayServerUrl(e.target.value)}
+                  placeholder="wss://your-relay.example.com"
+                  className="flex-1 bg-black/30 border border-white/[0.06] rounded-md px-2.5 py-1.5 text-[11px] text-neutral-200 placeholder-neutral-600 font-mono focus:outline-none focus:border-white/20"
+                />
+                <button
+                  onClick={handleSaveRelayUrl}
+                  disabled={isSavingRelayUrl}
+                  className="px-2.5 py-1.5 text-[11px] bg-white/10 hover:bg-white/20 disabled:opacity-50 text-neutral-200 rounded-md transition-colors shrink-0"
+                >
+                  {isSavingRelayUrl ? <Loader2 size={12} className="animate-spin" /> : 'Save'}
+                </button>
+              </div>
+
+              {!relayServerUrl.trim() ? (
+                <p className="text-[10px] text-neutral-600 italic">Set a relay server above to enable worldwide invites.</p>
+              ) : (
+                <>
+                  {generatedWorldwideInvite ? (
+                    <div className="flex items-center gap-2 mb-2.5">
+                      <code className="flex-1 bg-black/30 border border-white/[0.06] rounded-md px-2.5 py-1.5 text-[10px] text-neutral-300 font-mono truncate">{generatedWorldwideInvite}</code>
+                      <button
+                        onClick={handleCopyWorldwideInvite}
+                        className="px-2.5 py-1.5 text-[11px] bg-white/10 hover:bg-white/20 text-neutral-200 rounded-md transition-colors shrink-0"
+                      >
+                        Copy
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={handleGenerateWorldwideInvite}
+                      disabled={isGeneratingWorldwideInvite}
+                      className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs bg-white/10 hover:bg-white/20 disabled:opacity-50 text-neutral-200 rounded-md transition-colors mb-2.5"
+                    >
+                      {isGeneratingWorldwideInvite ? <Loader2 size={13} className="animate-spin" /> : <Globe size={13} />}
+                      Generate a worldwide invite
+                    </button>
+                  )}
+
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={worldwideInviteInputText}
+                      onChange={(e) => setWorldwideInviteInputText(e.target.value)}
+                      placeholder="Paste a worldwide invite..."
+                      className="flex-1 bg-black/30 border border-white/[0.06] rounded-md px-2.5 py-1.5 text-[11px] text-neutral-200 placeholder-neutral-600 font-mono focus:outline-none focus:border-white/20"
+                    />
+                    <button
+                      onClick={handleRedeemWorldwideInvite}
+                      disabled={isRedeemingWorldwideInvite || !worldwideInviteInputText.trim()}
+                      className="px-2.5 py-1.5 text-[11px] bg-white/10 hover:bg-white/20 disabled:opacity-30 text-neutral-200 rounded-md transition-colors shrink-0"
+                    >
+                      {isRedeemingWorldwideInvite ? <Loader2 size={12} className="animate-spin" /> : 'Pair'}
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
 
             {/* Discovered, unpaired devices on the network */}
             <label className="text-[11px] font-medium text-neutral-500 uppercase tracking-wide flex items-center gap-1.5 mb-1.5">

@@ -25,6 +25,7 @@
     "@electron-toolkit/preload": "^3.0.2",
     "@electron-toolkit/utils": "^4.0.0",
     "@supabase/supabase-js": "^2.112.4",
+    "@types/ws": "^8.18.1",
     "@webcontainer/api": "^1.6.4",
     "better-sqlite3": "^13.0.3",
     "bonjour-service": "^1.4.4",
@@ -35,6 +36,7 @@
     "pdf-parse": "^2.4.5",
     "pixi.js": "^8.20.1",
     "react-markdown": "^10.1.0",
+    "ws": "^8.21.3",
     "zustand": "^5.0.15"
   },
   "devDependencies": {
