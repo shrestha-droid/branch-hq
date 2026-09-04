@@ -223,7 +223,7 @@ declare global {
       updateSettings: (partial: Record<string, any>) => Promise<{ modelProvider: 'gemini' | 'local'; geminiModel: string; fallbackGeminiModel: string; localModelBaseUrl: string; localModelName: string; localEmbeddingModelName: string; defaultTargetDir: string; michaelModel: string; jimModel: string; dwightModel: string; pamModel: string; rileyModel: string; enableWebSearch: boolean; masterProfile: string; relayServerUrl: string; strictVerification: boolean }>;
       exportAuditReport: (conversationId: string) => Promise<{ success: boolean; report?: string; integrityHash?: string; generatedAt?: string; error?: string }>;
       exportClientSummary: (conversationId: string) => Promise<{ success: boolean; summary?: string; generatedAt?: string; error?: string }>;
-      getStagedFiles: (conversationId: string) => Promise<{ success: boolean; files?: Record<string, string> | null; error?: string }>;
+      getStagedFiles: (conversationId: string) => Promise<{ success: boolean; files?: Record<string, string> | null; agentKey?: 'jim' | 'dwight' | 'riley'; instructions?: string; auditId?: string | null; error?: string }>;
       getClientFacts: (conversationId: string) => Promise<{ success: boolean; facts?: string; error?: string }>;
       setClientFacts: (conversationId: string, facts: string) => Promise<{ success: boolean; error?: string }>;
       getModelOverrides: (conversationId: string) => Promise<{ success: boolean; overrides?: Record<string, string>; error?: string }>;

@@ -26,6 +26,22 @@ import { app } from 'electron'
 interface StagedFilesRecord {
   conversationId: string
   files: Record<string, string>
+  // FIXED: confirmed real regression -- this store originally only
+  // carried `files`, so selectConversation (which reads from here) could
+  // only ever pass files + conversationId to onCodeGenerated, never the
+  // agentKey/instructions/auditId self-heal actually needs. handleSend's
+  // own onCodeGenerated call (right when a generation finishes) DOES
+  // carry all of that correctly -- but if anything re-triggers
+  // selectConversation afterward (even just clicking the same
+  // already-active conversation in the sidebar again), it would
+  // overwrite that correct, complete context with this incomplete one,
+  // silently breaking self-heal for a run that had genuinely just
+  // succeeded. Persisting the same context here that handleSend already
+  // has closes that gap -- selectConversation and a fresh generation now
+  // both hand onCodeGenerated the same complete shape.
+  agentKey?: 'jim' | 'dwight' | 'riley'
+  instructions?: string
+  auditId?: string | null
   updatedAt: number
 }
 
@@ -49,13 +65,15 @@ async function persist(): Promise<void> {
   await fs.writeFile(STAGED_FILES_PATH(), JSON.stringify(cache, null, 2), 'utf-8')
 }
 
-export async function getStagedFiles(conversationId: string): Promise<Record<string, string> | null> {
+export async function getStagedFiles(conversationId: string): Promise<{ files: Record<string, string>; agentKey?: 'jim' | 'dwight' | 'riley'; instructions?: string; auditId?: string | null } | null> {
   const all = await load()
-  return all[conversationId]?.files || null
+  const record = all[conversationId]
+  if (!record) return null
+  return { files: record.files, agentKey: record.agentKey, instructions: record.instructions, auditId: record.auditId }
 }
 
-export async function setStagedFiles(conversationId: string, files: Record<string, string>): Promise<void> {
+export async function setStagedFiles(conversationId: string, files: Record<string, string>, context?: { agentKey?: 'jim' | 'dwight' | 'riley'; instructions?: string; auditId?: string | null }): Promise<void> {
   const all = await load()
-  all[conversationId] = { conversationId, files, updatedAt: Date.now() }
+  all[conversationId] = { conversationId, files, agentKey: context?.agentKey, instructions: context?.instructions, auditId: context?.auditId, updatedAt: Date.now() }
   await persist()
 }

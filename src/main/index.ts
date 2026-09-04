@@ -753,8 +753,8 @@ typedIpc.handle('audit:exportClientSummary', async (_event: any, conversationId:
 // nothing has ever successfully completed for this conversation yet.
 typedIpc.handle('stagedFiles:get', async (_event: any, conversationId: string) => {
   try {
-    const files = await getStagedFiles(conversationId)
-    return { success: true, files }
+    const staged = await getStagedFiles(conversationId)
+    return { success: true, files: staged?.files || null, agentKey: staged?.agentKey, instructions: staged?.instructions, auditId: staged?.auditId }
   } catch (err: any) {
     return { success: false, error: err.message }
   }
@@ -905,7 +905,7 @@ typedIpc.handle('agent:invoke', async (_event: any, { conversationId, agentName,
       })
 
       const directChatFiles = prefixStageableFiles(stageableFiles, agentName)
-      if (directChatFiles) await setStagedFiles(conversationId, directChatFiles)
+      if (directChatFiles) await setStagedFiles(conversationId, directChatFiles, { agentKey: agentName, instructions: prompt, auditId: auditRecord.id })
 
       return { success: true, messages: newMessages, files: directChatFiles, agentKey: agentName, instructions: prompt, auditId: auditRecord.id }
     }
@@ -1433,7 +1433,11 @@ typedIpc.handle('ai:invoke', async (_event: any, { conversationId, prompt }: { c
     // conversation mid-generation (or on app reload) had no reliable
     // record to load from and would guess using an individual agent's
     // own, possibly-still-in-progress message instead.
-    await setStagedFiles(conversationId, mergedFiles)
+    await setStagedFiles(conversationId, mergedFiles, {
+      agentKey: healTargetAgentKey || 'jim',
+      instructions: healTargetInstructions,
+      auditId: healTargetAuditId
+    })
 
     return {
       success: true,
@@ -1536,7 +1540,7 @@ typedIpc.handle('heal:invoke', async (_event: any, {
     await recordLesson(agentKey, errorLog)
 
     const healedFiles = prefixStageableFiles(stageableFiles, agentKey)
-    if (healedFiles) await setStagedFiles(conversationId, healedFiles)
+    if (healedFiles) await setStagedFiles(conversationId, healedFiles, { agentKey, instructions: previousInstructions, auditId: auditRecord.id })
 
     return { success: true, messages: newMessages, files: healedFiles, agentKey, instructions: previousInstructions, auditId: auditRecord.id }
   } catch (error: any) {

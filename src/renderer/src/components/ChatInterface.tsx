@@ -212,9 +212,24 @@ export default function ChatInterface({ onCodeGenerated, onClearPreview, onOpenS
         // @ts-ignore
         const staged = await window.api.getStagedFiles(id)
         if (staged.success && staged.files && Object.keys(staged.files).length > 0 && onCodeGenerated) {
+          // FIXED: confirmed real regression -- this previously only
+          // passed files + conversationId, never agentKey/instructions/
+          // auditId. handleSend's own onCodeGenerated call (right when a
+          // generation finishes) DOES carry all of that -- but if
+          // selectConversation ever ran again afterward for any reason
+          // (even just clicking the same already-active conversation in
+          // the sidebar), it would silently overwrite that correct,
+          // complete context with this incomplete one, breaking
+          // self-heal for a run that had genuinely just succeeded.
+          // stagedFilesStore now persists the same context handleSend
+          // already has, so both paths hand onCodeGenerated the same
+          // complete shape.
           onCodeGenerated({
             files: staged.files,
             conversationId: id,
+            agentKey: staged.agentKey,
+            instructions: staged.instructions,
+            auditId: staged.auditId,
             suggestedFolderName: slugifyForFolder(data.conversation?.title || '', id)
           })
         } else {

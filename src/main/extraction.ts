@@ -268,6 +268,21 @@ function getEncryptionKey(): Buffer {
 // write (never reused), and the auth tag from AES-GCM is stored and
 // verified on read, so any tampering with the encrypted file on disk is
 // detected rather than silently accepted.
+// FIXED: confirmed real, significant bug -- read()/write() were
+// previously declared async (returning Promise<T | null> / Promise<void>),
+// even though every operation inside them was already genuinely
+// synchronous (fs.readFileSync/writeFileSync, never the async fs.promises
+// versions) -- the async keyword did nothing the code actually needed.
+// The real problem: LowSync (which this is meant to be used with, and
+// is exactly what got generated here) requires its adapter's read()/write()
+// to return the raw value directly, not a Promise. LowSync.read() calling
+// this adapter's read() got back a Promise object -- which IS an object,
+// just one with no .services (or any schema field) on it -- so db.data
+// ended up silently holding a Promise instead of real data, with every
+// route reading from it seeing an object that looks populated but has
+// none of the actual fields. Removing async (there was never any real
+// asynchronous work happening here to begin with) makes the declared
+// type finally match what the implementation already, correctly, did.
 export class EncryptedJSONFile<T> {
   #filename: string
   #key: Buffer
@@ -277,7 +292,7 @@ export class EncryptedJSONFile<T> {
     this.#key = getEncryptionKey()
   }
 
-  async read(): Promise<T | null> {
+  read(): T | null {
     if (!fs.existsSync(this.#filename)) return null
     const raw = fs.readFileSync(this.#filename, 'utf-8')
     if (!raw.trim()) return null
@@ -288,7 +303,7 @@ export class EncryptedJSONFile<T> {
     return JSON.parse(decrypted.toString('utf-8'))
   }
 
-  async write(data: T): Promise<void> {
+  write(data: T): void {
     const iv = crypto.randomBytes(16)
     const cipher = crypto.createCipheriv(ALGORITHM, this.#key, iv)
     const plaintext = Buffer.from(JSON.stringify(data), 'utf-8')
